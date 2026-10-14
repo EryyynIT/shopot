@@ -5,3 +5,27 @@ edition = "2021"
 rust-version = "1.88"
 
 [dependencies]
+iced = { version = "0.14", default-features = false, features = [
+    "tiny-skia",
+    "crisp",
+    "thread-pool",
+    "linux-theme-detection",
+    "x11",
+    "wayland",
+    "fira-sans",
+    "tokio",
+    "lazy",
+    "markdown",
+    "qr_code",
+    "svg",
+    "image",
+] }
+tokio = { version = "1", default-features = false, features = ["sync", "time", "macros"] }
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+futures-core = "0.3"
+
+[dev-dependencies]
+futures-util = "0.3"
+iced_test = "0.14"
+png = "0.17"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "test-util"] }
