@@ -2,3 +2,4 @@
 
 pub mod core_link;
 pub mod model;
+pub mod ui;
