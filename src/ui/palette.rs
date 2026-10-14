@@ -123,6 +123,18 @@ pub fn chat_row(selected: bool) -> impl Fn(&Theme, button::Status) -> button::St
     }
 }
 
+/// Акцентная полоса слева у выбранного чата (GUI_UI.md §1).
+pub fn chat_bar(selected: bool) -> impl Fn(&Theme) -> container::Style {
+    move |_| container::Style {
+        background: if selected {
+            Some(Background::Color(ACCENT))
+        } else {
+            None
+        },
+        ..Default::default()
+    }
+}
+
 /// Длинный текст без пузыря: без фона и рамки.
 pub fn no_bubble(_: &Theme) -> container::Style {
     container::Style {

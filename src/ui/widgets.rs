@@ -11,8 +11,14 @@ use crate::model::store::Contact;
 use crate::ui::palette;
 use crate::ui::{time_hm, ChatIn, Message};
 
-/// Строка сайдбара: точка presence, имя, бейдж непрочитанных.
+/// Строка сайдбара: акцентная полоса выбранного, точка presence,
+/// имя, бейдж непрочитанных.
 pub fn contact_row(contact: &Contact, unread: u32, selected: bool) -> Element<'_, Message> {
+    let bar = container(text(""))
+        .width(Length::Fixed(3.0))
+        .height(Length::Fill)
+        .style(palette::chat_bar(selected));
+
     let dot = text(if contact.online { "●" } else { "○" })
         .size(12)
         .color(if contact.online {
@@ -35,7 +41,7 @@ pub fn contact_row(contact: &Contact, unread: u32, selected: bool) -> Element<'_
         })
         .width(Length::Fill);
 
-    let mut cells = row![dot, name].spacing(8);
+    let mut cells = row![bar, dot, name].spacing(8);
     if has_unread {
         cells = cells.push(
             container(text(unread.to_string()).size(11))
