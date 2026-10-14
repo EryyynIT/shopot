@@ -93,6 +93,18 @@ impl Scene {
                         text: "есть минута?".into(),
                     },
                 ),
+                (
+                    // Жё и Шё в кадре — проверка кириллицы жирных глифов
+                    // на скриншоте (GUI_DEV.md §3).
+                    Duration::from_millis(450),
+                    LinkEvent::IMsg {
+                        cid: Cid(1),
+                        name: "Аня".into(),
+                        msg_id: MsgId(1004),
+                        ts_ms: crate::core_link::now_ms(),
+                        text: "Жёсткий дедлайн. Шёпотом: переждём.".into(),
+                    },
+                ),
             ],
             flip_presence: Some(Duration::from_secs(8)),
             reply_delay_ms: 700,
