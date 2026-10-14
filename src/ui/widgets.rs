@@ -5,30 +5,34 @@ use iced::alignment::Horizontal;
 use iced::widget::{button, container, row, text};
 use iced::{Element, Length, Padding};
 
+use crate::model::cid::Cid;
 use crate::model::feed::FeedItem;
 use crate::model::msg::SendState;
-use crate::model::store::Contact;
 use crate::ui::palette;
 use crate::ui::{time_hm, ChatIn, Message};
 
 /// Строка сайдбара: акцентная полоса выбранного, точка presence,
-/// имя, бейдж непрочитанных.
-pub fn contact_row(contact: &Contact, unread: u32, selected: bool) -> Element<'_, Message> {
+/// имя, бейдж непрочитанных. Владеет данными — строится внутри lazy.
+pub fn contact_row(
+    cid: Cid,
+    name: &str,
+    online: bool,
+    unread: u32,
+    selected: bool,
+) -> Element<'static, Message> {
     let bar = container(text(""))
         .width(Length::Fixed(3.0))
         .height(Length::Fill)
         .style(palette::chat_bar(selected));
 
-    let dot = text(if contact.online { "●" } else { "○" })
+    let dot = text(if online { "●" } else { "○" })
         .size(12)
-        .color(if contact.online {
-            palette::OK
-        } else {
-            palette::DIM
-        });
+        .color(if online { palette::OK } else { palette::DIM });
 
     let has_unread = unread > 0;
-    let name = text(contact.name.as_str())
+    // to_owned: фрагмент текста должен владеть строкой (Element 'static
+    // для lazy), &str протянул бы заимствование из Store.
+    let name = text(name.to_owned())
         .font(if has_unread || selected {
             palette::bold()
         } else {
@@ -65,7 +69,7 @@ pub fn contact_row(contact: &Contact, unread: u32, selected: bool) -> Element<'_
             })
             .align_y(iced::alignment::Vertical::Center),
     )
-    .on_press(Message::Chat(ChatIn::Select(contact.cid)))
+    .on_press(Message::Chat(ChatIn::Select(cid)))
     .style(palette::chat_row(selected))
     .width(Length::Fill)
     .into()

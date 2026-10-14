@@ -9,7 +9,7 @@ use std::sync::Arc;
 use chrono::Datelike;
 use iced::alignment::{Horizontal, Vertical};
 use iced::keyboard::{self, key::Named};
-use iced::widget::{column, container, operation, row, scrollable, space, text, text_editor};
+use iced::widget::{column, container, lazy, operation, row, scrollable, space, text, text_editor};
 use iced::{Element, Length, Padding, Task};
 
 use crate::core_link::{now_ms, parse_contacts, CoreLink, LinkEvent, Reply, Request};
@@ -230,36 +230,50 @@ fn title_bar() -> Element<'static, Message> {
 
 fn sidebar<L: CoreLink>(state: &State<L>) -> Element<'_, Message> {
     let selected = state.store.selected();
-    let mut list = column![].spacing(2);
-    let mut any = false;
-    for contact in state.store.contacts() {
-        any = true;
-        let unread = state
-            .store
-            .thread(contact.cid)
-            .map(|t| t.unread)
-            .unwrap_or(0);
-        list = list.push(widgets::contact_row(
-            contact,
-            unread,
-            selected == Some(contact.cid),
-        ));
-    }
-    if !any {
-        list = list.push(
-            container(
-                text("Пока контактов нет. Создайте код приглашения или вставьте чужой.")
-                    .size(12)
-                    .color(palette::DIM),
+    // Снимок строк + ключ ленивости: список перестраивается только при
+    // изменении состава/статусов (GUI_DEV.md §3 — список чатов lazy).
+    let rows: Vec<(Cid, String, bool, u32, bool)> = state
+        .store
+        .contacts()
+        .map(|c| {
+            let unread = state.store.thread(c.cid).map(|t| t.unread).unwrap_or(0);
+            (
+                c.cid,
+                c.name.clone(),
+                c.online,
+                unread,
+                selected == Some(c.cid),
             )
-            .padding(Padding {
-                top: 8.0,
-                right: 4.0,
-                bottom: 8.0,
-                left: 4.0,
-            }),
-        );
-    }
+        })
+        .collect();
+
+    let list: Element<'static, Message> = if rows.is_empty() {
+        container(
+            text("Пока контактов нет. Создайте код приглашения или вставьте чужой.")
+                .size(12)
+                .color(palette::DIM),
+        )
+        .padding(Padding {
+            top: 8.0,
+            right: 4.0,
+            bottom: 8.0,
+            left: 4.0,
+        })
+        .into()
+    } else {
+        let key: Vec<(i64, u32, bool, bool)> = rows
+            .iter()
+            .map(|(cid, _, online, unread, chosen)| (cid.0, *unread, *online, *chosen))
+            .collect();
+        lazy(key, move |_| {
+            let mut list = column![].spacing(2);
+            for (cid, name, online, unread, chosen) in &rows {
+                list = list.push(widgets::contact_row(*cid, name, *online, *unread, *chosen));
+            }
+            list
+        })
+        .into()
+    };
 
     container(list)
         .width(Length::Fixed(260.0))
