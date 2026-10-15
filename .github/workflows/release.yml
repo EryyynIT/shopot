@@ -31,8 +31,9 @@ jobs:
             shopot-gui-*.tar.gz
             SHA256SUMS
           body: |
-            Первый релиз клиента: знакомство по одноразовому коду с QR,
-            переписка с честными статусами доставки, блокировка контактов.
+            First release of the client: meet by one-time invite codes with a
+            QR, chat with honest delivery statuses, block contacts.
 
-            Демон собирается отдельно из [shopot-core](https://github.com/Puxxalwl/shopot-core)
-            (Zig 0.17.0) — путь сборки и запуск в README внутри архива.
+            The daemon builds separately from
+            [shopot-core](https://github.com/Puxxalwl/shopot-core) (Zig 0.17.0)
+            — build and run steps are in the README inside the archive.
