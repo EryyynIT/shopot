@@ -3,7 +3,7 @@
 //! состояний. Никаких цветов мимо этого модуля.
 
 use iced::border::Radius;
-use iced::widget::{button, container, text, text_editor};
+use iced::widget::{button, container, qr_code, text, text_editor, text_input};
 use iced::{Background, Border, Color, Theme};
 
 /// Основной фон окна.
@@ -177,6 +177,105 @@ pub fn button_accent(_: &Theme, status: button::Status) -> button::Style {
             width: 0.0,
             radius: Radius::from(8.0),
         },
+        ..Default::default()
+    }
+}
+
+/// Кнопка второстепенного действия: прозрачная с рамкой.
+pub fn button_dim(_: &Theme, status: button::Status) -> button::Style {
+    let hovered = matches!(status, button::Status::Hovered);
+    button::Style {
+        background: hovered.then_some(Background::Color(RAISE)),
+        text_color: TEXT,
+        border: Border {
+            color: LINE,
+            width: 1.0,
+            radius: Radius::from(8.0),
+        },
+        ..Default::default()
+    }
+}
+
+/// Прозрачная кнопка (имя контакта в шапке чата): ховер — поднятие.
+pub fn button_plain(_: &Theme, status: button::Status) -> button::Style {
+    let hovered = matches!(status, button::Status::Hovered);
+    button::Style {
+        background: hovered.then_some(Background::Color(RAISE)),
+        text_color: TEXT,
+        border: Border {
+            color: LINE,
+            width: 0.0,
+            radius: Radius::from(6.0),
+        },
+        ..Default::default()
+    }
+}
+
+/// Строка меню по правой кнопке: прозрачная, ховер — поднятие.
+pub fn button_menu(_: &Theme, status: button::Status) -> button::Style {
+    let hovered = matches!(status, button::Status::Hovered);
+    button::Style {
+        background: hovered.then_some(Background::Color(RAISE)),
+        text_color: TEXT,
+        border: Border {
+            color: LINE,
+            width: 0.0,
+            radius: Radius::from(6.0),
+        },
+        ..Default::default()
+    }
+}
+
+/// Тёмная подложка оверлея (GUI_UI.md §1).
+pub fn backdrop(_: &Theme) -> container::Style {
+    container::Style {
+        background: Some(Background::Color(Color::from_rgba8(0x0A, 0x0C, 0x0E, 0.65))),
+        ..Default::default()
+    }
+}
+
+/// Панель оверлея (диалог, карточка, меню).
+pub fn dialog(_: &Theme) -> container::Style {
+    container::Style {
+        background: Some(Background::Color(PANEL)),
+        border: Border {
+            color: LINE,
+            width: 1.0,
+            radius: Radius::from(8.0),
+        },
+        ..Default::default()
+    }
+}
+
+/// Однострочное поле ввода (код приглашения в диалоге).
+pub fn input(_: &Theme, status: text_input::Status) -> text_input::Style {
+    let focused = matches!(status, text_input::Status::Focused { .. });
+    text_input::Style {
+        background: Background::Color(Color::from_rgb8(0x2A, 0x30, 0x38)),
+        border: Border {
+            color: if focused { ACCENT } else { LINE },
+            width: 1.0,
+            radius: Radius::from(10.0),
+        },
+        icon: MUTED,
+        placeholder: DIM,
+        value: TEXT,
+        selection: Color::from_rgba8(0x4C, 0xC2, 0xFF, 0.30),
+    }
+}
+
+/// QR-код: тёмные модули на белом — читается камерой с экрана.
+pub fn qr(_: &Theme) -> qr_code::Style {
+    qr_code::Style {
+        cell: Color::BLACK,
+        background: Color::WHITE,
+    }
+}
+
+/// Невидимая кнопка-подложка оверлея: только ловит клик мимо панели.
+pub fn button_invisible(_: &Theme, _: button::Status) -> button::Style {
+    button::Style {
+        background: None,
         ..Default::default()
     }
 }

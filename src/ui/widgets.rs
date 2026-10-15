@@ -1,15 +1,15 @@
 //! Виджет-компоненты: не знают про протокол, читают только Store
-//! и производные данные (GUI_UI.md §2).
+//! и переданные данные (GUI_UI.md §2).
 
 use iced::alignment::Horizontal;
-use iced::widget::{button, container, row, text};
+use iced::widget::{button, column, container, qr_code, row, space, text, text_input};
 use iced::{Element, Length, Padding};
 
 use crate::model::cid::Cid;
 use crate::model::feed::FeedItem;
 use crate::model::msg::SendState;
 use crate::ui::palette;
-use crate::ui::{time_hm, ChatIn, Message};
+use crate::ui::{time_hm, ChatIn, InviteView, MeetIn, MenuView, Message};
 
 /// Строка сайдбара: акцентная полоса у самого края карточки, точка
 /// presence, имя, бейдж непрочитанных. Высота карточки фиксированная —
@@ -243,4 +243,233 @@ fn group_with_footer(
         }))
         .align_x(Horizontal::Right)
         .into()
+}
+
+// ---------- оверлеи (GUI_UI.md §1, спринт S2) ----------
+
+/// Подложка оверлея: клик мимо панели закрывает её.
+pub fn backdrop(on_close: Message) -> Element<'static, Message> {
+    container(
+        button(
+            iced::widget::space::Space::new()
+                .width(Length::Fill)
+                .height(Length::Fill),
+        )
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .style(palette::button_invisible)
+        .on_press(on_close),
+    )
+    .width(Length::Fill)
+    .height(Length::Fill)
+    .style(palette::backdrop)
+    .into()
+}
+
+/// Инвайт-диалог: мой код (эллипсис + QR + копирование) и чужой код.
+/// Возвращаемый Element заимствует view — оверлей не lazy.
+pub fn invite_panel(view: &InviteView) -> Element<'_, Message> {
+    let mut body = column![text("Приглашение")
+        .size(14)
+        .font(palette::bold())
+        .color(palette::TEXT),]
+    .spacing(10);
+
+    body = body.push(text("Мой код").size(11).color(palette::DIM));
+    body = body.push(match (&view.code, &view.error) {
+        (Some(code), _) => text(crate::ui::elided_code(code))
+            .size(11)
+            .color(palette::TEXT),
+        (None, None) => text("Код выдаётся…").size(11).color(palette::DIM),
+        (None, Some(_)) => text("Код не выдан.").size(11).color(palette::ERR),
+    });
+
+    if view.code.is_some() {
+        let copy = button(
+            text("Скопировать код")
+                .size(12)
+                .font(palette::bold())
+                .color(palette::BG),
+        )
+        .padding(Padding {
+            top: 8.0,
+            right: 14.0,
+            bottom: 8.0,
+            left: 14.0,
+        })
+        .style(palette::button_accent)
+        .on_press(Message::Meet(MeetIn::CopyCode));
+
+        let actions = match &view.qr {
+            Some(data) => row![
+                copy,
+                space::Space::new().width(Length::Fill),
+                qr_code::QRCode::new(data)
+                    .total_size(120)
+                    .style(palette::qr),
+            ]
+            .spacing(12)
+            .align_y(iced::alignment::Vertical::Center),
+            None => row![copy],
+        };
+        body = body.push(actions);
+        body = body.push(
+            text("Код одноразовый: действует до первого подключения.")
+                .size(10)
+                .color(palette::DIM),
+        );
+    }
+
+    body = body.push(space::Space::new().height(4));
+    body = body
+        .push(text("Вставить чужой код").size(11).color(palette::DIM))
+        .push(
+            row![
+                text_input("Вставьте код приглашения", &view.foreign)
+                    .on_input(|value| Message::Meet(MeetIn::ForeignInput(value)))
+                    .on_submit(Message::Meet(MeetIn::SubmitForeign))
+                    .size(13)
+                    .padding(8)
+                    .style(palette::input)
+                    .width(Length::Fill),
+                button(
+                    text("Добавить")
+                        .size(12)
+                        .font(palette::bold())
+                        .color(palette::BG),
+                )
+                .padding(Padding {
+                    top: 8.0,
+                    right: 14.0,
+                    bottom: 8.0,
+                    left: 14.0,
+                })
+                .style(palette::button_accent)
+                .on_press_maybe(
+                    (!view.submitting && !view.foreign.trim().is_empty())
+                        .then_some(Message::Meet(MeetIn::SubmitForeign)),
+                ),
+            ]
+            .spacing(8)
+            .align_y(iced::alignment::Vertical::Center),
+        );
+
+    if let Some(error) = &view.error {
+        body = body.push(text(error.clone()).size(11).color(palette::ERR));
+    }
+
+    container(body)
+        .width(Length::Fixed(520.0))
+        .padding(16)
+        .style(palette::dialog)
+        .into()
+}
+
+/// Карточка контакта: имя, состояние, блокировка (GUI_UI.md §1).
+/// Отпечатка в API 1.0.0 нет (GET_IDENTITY — только свой) — карточка
+/// показывает имя и действия.
+pub fn contact_card(
+    cid: Cid,
+    name: &str,
+    online: bool,
+    blocked: bool,
+) -> Element<'static, Message> {
+    let (status, color) = if blocked {
+        ("заблокирован", palette::ERR)
+    } else if online {
+        ("в сети", palette::OK)
+    } else {
+        ("не в сети", palette::DIM)
+    };
+    let block_label = if blocked {
+        "Разблокировать"
+    } else {
+        "Заблокировать"
+    };
+
+    container(
+        column![
+            text(name.to_owned())
+                .size(15)
+                .font(palette::bold())
+                .color(palette::TEXT),
+            text(status).size(12).color(color),
+            space::Space::new().height(4),
+            row![
+                button(text(block_label).size(12).color(if blocked {
+                    palette::TEXT
+                } else {
+                    palette::ERR
+                }))
+                .padding(Padding {
+                    top: 8.0,
+                    right: 14.0,
+                    bottom: 8.0,
+                    left: 14.0,
+                })
+                .style(palette::button_dim)
+                .on_press(Message::Meet(MeetIn::ToggleBlock(cid))),
+                space::Space::new().width(Length::Fill),
+                button(text("Закрыть").size(12).color(palette::TEXT))
+                    .padding(Padding {
+                        top: 8.0,
+                        right: 14.0,
+                        bottom: 8.0,
+                        left: 14.0,
+                    })
+                    .style(palette::button_plain)
+                    .on_press(Message::Meet(MeetIn::CloseOverlay)),
+            ]
+            .align_y(iced::alignment::Vertical::Center),
+        ]
+        .spacing(10),
+    )
+    .width(Length::Fixed(420.0))
+    .padding(16)
+    .style(palette::dialog)
+    .into()
+}
+
+/// Меню по правой кнопке на контакте: блок/разблок и информация
+/// (GUI_UI.md §4).
+pub fn context_menu(menu: &MenuView, name: &str, blocked: bool) -> Element<'static, Message> {
+    let label = if blocked {
+        "Разблокировать"
+    } else {
+        "Заблокировать"
+    };
+    container(
+        column![
+            text(name.to_owned()).size(11).color(palette::DIM),
+            button(
+                text(label)
+                    .size(13)
+                    .color(if blocked { palette::TEXT } else { palette::ERR })
+            )
+            .width(Length::Fill)
+            .padding(Padding {
+                top: 6.0,
+                right: 10.0,
+                bottom: 6.0,
+                left: 10.0,
+            })
+            .style(palette::button_menu)
+            .on_press(Message::Meet(MeetIn::ToggleBlock(menu.cid))),
+            button(text("Информация").size(13).color(palette::TEXT))
+                .width(Length::Fill)
+                .padding(Padding {
+                    top: 6.0,
+                    right: 10.0,
+                    bottom: 6.0,
+                    left: 10.0,
+                })
+                .style(palette::button_menu)
+                .on_press(Message::Meet(MeetIn::OpenCard(menu.cid))),
+        ]
+        .spacing(2),
+    )
+    .width(Length::Fixed(180.0))
+    .padding(8)
+    .style(palette::dialog)
+    .into()
 }
