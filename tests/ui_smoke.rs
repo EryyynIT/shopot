@@ -363,6 +363,19 @@ fn right_click_menu_blocks_and_opens_card() {
         Instruction::Expect(Expectation::Text("заблокирован".into())),
     );
 
+    // Разблок из карточки: карточка не закрывается, статус обновляется
+    // в ней же (GUI_STYLE.md §2, честность статусов).
+    let [press, release] = click("Разблокировать");
+    run_instruction(&mut emu, &program, &mut receiver, press);
+    run_instruction(&mut emu, &program, &mut receiver, release);
+    pump(&mut emu, &program, &mut receiver, 500);
+    run_instruction(
+        &mut emu,
+        &program,
+        &mut receiver,
+        Instruction::Expect(Expectation::Text("в сети".into())),
+    );
+
     let [press, release] = click("Закрыть");
     run_instruction(&mut emu, &program, &mut receiver, press);
     run_instruction(&mut emu, &program, &mut receiver, release);
@@ -370,8 +383,8 @@ fn right_click_menu_blocks_and_opens_card() {
 
     let (state, _) = emu.into_state();
     assert!(
-        state.store.contact(Cid(1)).expect("Аня").blocked,
-        "блок через меню дошёл до Store"
+        !state.store.contact(Cid(1)).expect("Аня").blocked,
+        "разблок через карточку дошёл до Store"
     );
 }
 

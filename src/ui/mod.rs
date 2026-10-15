@@ -392,7 +392,12 @@ fn on_meet<L: CoreLink>(state: &mut State<L>, meet: MeetIn) -> Task<Message> {
         }
         MeetIn::ToggleBlock(cid) => {
             let blocked = state.store.contact(cid).is_some_and(|c| c.blocked);
-            state.overlay = Overlay::None;
+            // Меню закрываем сразу; карточка остаётся открытой — статус
+            // «заблокирован/в сети» обновится в ней после ответа ядра
+            // (GUI_STYLE.md §2, честность статусов).
+            if matches!(state.overlay, Overlay::Menu(_)) {
+                state.overlay = Overlay::None;
+            }
             if blocked {
                 request_task(state, Request::Unblock { cid })
             } else {
