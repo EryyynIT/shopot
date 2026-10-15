@@ -360,12 +360,18 @@ impl MockLink {
                     queued: false,
                 })
             }
-            Request::Invite => {
+            Request::Invite { relay, addr } => {
                 let mut state = inner.state.lock().expect("стейт не отравлен");
                 let code: String = (0..80)
                     .map(|_| B64URL[(state.lcg.next() % 64) as usize] as char)
                     .collect();
-                Ok(OkReply::Code(format!("shopot1.{code}@192.168.1.5")))
+                let host = if addr.is_empty() {
+                    "192.168.1.5".to_owned()
+                } else {
+                    addr
+                };
+                let head = if relay { "shopot1r." } else { "shopot1." };
+                Ok(OkReply::Code(format!("{head}{code}@{host}")))
             }
             Request::Add { code } => {
                 if !code.starts_with("shopot1.") && !code.starts_with("shopot://i/") {
@@ -603,7 +609,12 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn invite_code_has_v2_shape() {
         let link = MockLink::new(scene());
-        let reply = link.execute(Request::Invite).await;
+        let reply = link
+            .execute(Request::Invite {
+                relay: false,
+                addr: String::new(),
+            })
+            .await;
         let Ok(OkReply::Code(code)) = reply else {
             panic!()
         };

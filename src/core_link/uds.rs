@@ -307,11 +307,12 @@ fn encode_request(request: &Request) -> (Method, Vec<u8>) {
             api::put::str16(&mut payload, "").expect("пустая строка");
             Method::AcceptInvite
         }
-        // name пустой — ядро подставит «shopot»; addr пустой — LAN-анонс.
-        Request::Invite => {
-            api::put::u8(&mut payload, 0);
+        // name пустой — ядро подставит «shopot»; addr пустой — LAN-анонс;
+        // relay=1 требует addr: соединение идёт через релей, peer IP не видит.
+        Request::Invite { relay, addr } => {
+            api::put::u8(&mut payload, u8::from(*relay));
             api::put::str16(&mut payload, "").expect("пустая строка");
-            api::put::str16(&mut payload, "").expect("пустая строка");
+            api::put::str16(&mut payload, addr).expect("адрес короче 65535");
             Method::CreateInvite
         }
         Request::Block { cid } => {
@@ -913,7 +914,16 @@ mod tests {
         };
         let second = {
             let link = Arc::clone(&link);
-            tokio::spawn(async move { CoreLink::execute(&*link, Request::Invite).await })
+            tokio::spawn(async move {
+                CoreLink::execute(
+                    &*link,
+                    Request::Invite {
+                        relay: false,
+                        addr: String::new(),
+                    },
+                )
+                .await
+            })
         };
 
         let (h1, _) = read_frame(&mut stream).await;

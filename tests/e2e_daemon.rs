@@ -129,7 +129,15 @@ async fn invite_message_delivery_two_daemons() {
     );
 
     // A выдаёт инвайт-код, B гасит его — контакт появляется у обоих.
-    let code = match CoreLink::execute(&*link_a, Request::Invite).await {
+    let code = match CoreLink::execute(
+        &*link_a,
+        Request::Invite {
+            relay: false,
+            addr: String::new(),
+        },
+    )
+    .await
+    {
         Ok(OkReply::Code(code)) => code,
         other => panic!("CREATE_INVITE не удался: {other:?}"),
     };

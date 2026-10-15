@@ -36,8 +36,10 @@ pub enum Request {
     SendMsg { cid: Cid, text: String },
     /// Добавить контакт по инвайт-коду (ACCEPT_INVITE).
     Add { code: String },
-    /// Выдать свой инвайт-код (CREATE_INVITE).
-    Invite,
+    /// Выдать свой инвайт-код (CREATE_INVITE). Пустой addr — код для одной
+    /// локальной сети (ядро ждёт LAN-анонс); с адресом — ядро дозванивается
+    /// сразу; relay — адрес трактуется как релей, peer IP не видит.
+    Invite { relay: bool, addr: String },
     /// Заблокировать контакт (BLOCK_CONTACT).
     Block { cid: Cid },
     /// Разблокировать контакт (UNBLOCK_CONTACT).

@@ -265,7 +265,7 @@ fn on_link<L: CoreLink>(state: &mut State<L>, link: LinkIn) -> Task<Message> {
                 }
                 Task::none()
             }
-            (Request::Invite, Ok(OkReply::Code(code))) => {
+            (Request::Invite { .. }, Ok(OkReply::Code(code))) => {
                 state.invite_code = Some(code.clone());
                 if let Overlay::Invite(view) = &mut state.overlay {
                     view.code = Some(code.clone());
@@ -273,7 +273,7 @@ fn on_link<L: CoreLink>(state: &mut State<L>, link: LinkIn) -> Task<Message> {
                 }
                 Task::none()
             }
-            (Request::Invite, Err(err)) => {
+            (Request::Invite { .. }, Err(err)) => {
                 if let Overlay::Invite(view) = &mut state.overlay {
                     view.error = Some(err.user_text());
                 }
@@ -355,7 +355,13 @@ fn on_meet<L: CoreLink>(state: &mut State<L>, meet: MeetIn) -> Task<Message> {
                     }
                     Task::none()
                 }
-                None => request_task(state, Request::Invite),
+                None => request_task(
+                    state,
+                    Request::Invite {
+                        relay: false,
+                        addr: String::new(),
+                    },
+                ),
             }
         }
         MeetIn::CopyCode => {
