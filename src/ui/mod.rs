@@ -840,7 +840,7 @@ fn title_bar<L: CoreLink>(state: &State<L>) -> Element<'static, Message> {
     let (label, color) = if state.link.is_stub() {
         ("режим: заглушка", palette::DIM)
     } else if state.link_up {
-        ("ядро: API 1.0.0", palette::DIM)
+        ("ядро: UDS", palette::DIM)
     } else {
         ("ядро: нет связи", palette::ERR)
     };
