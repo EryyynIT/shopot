@@ -9,7 +9,9 @@ use std::sync::Arc;
 use chrono::Datelike;
 use iced::alignment::{Horizontal, Vertical};
 use iced::keyboard::{self, key::Named};
-use iced::widget::{column, container, lazy, operation, row, scrollable, space, text, text_editor};
+use iced::widget::{
+    button, column, container, lazy, operation, row, scrollable, space, text, text_editor,
+};
 use iced::{Element, Length, Padding, Task};
 
 use crate::core_link::{now_ms, parse_contacts, CoreLink, LinkEvent, Reply, Request};
@@ -218,6 +220,7 @@ fn title_bar() -> Element<'static, Message> {
     )
     .width(Length::Fill)
     .height(Length::Fixed(32.0))
+    .align_y(Vertical::Center)
     .padding(Padding {
         top: 0.0,
         right: 12.0,
@@ -307,23 +310,31 @@ fn main_pane<L: CoreLink>(state: &State<L>) -> Element<'_, Message> {
 
     let header = container(
         row![
-            text(name)
-                .size(13)
-                .font(palette::bold())
-                .color(palette::TEXT),
+            column![
+                text(name)
+                    .size(14)
+                    .font(palette::bold())
+                    .color(palette::TEXT),
+                text(if online {
+                    "защищённая сессия"
+                } else {
+                    "сессия не установлена"
+                })
+                .size(10)
+                .color(if online { palette::OK } else { palette::DIM }),
+            ]
+            .spacing(1),
             space::Space::new().width(Length::Fill),
-            text(if online {
-                "● сессия"
-            } else {
-                "○ нет связи"
-            })
-            .size(11)
-            .color(if online { palette::OK } else { palette::DIM }),
+            text(if online { "●" } else { "○" })
+                .size(12)
+                .color(if online { palette::OK } else { palette::DIM }),
         ]
+        .spacing(8)
         .align_y(Vertical::Center),
     )
     .width(Length::Fill)
-    .height(Length::Fixed(36.0))
+    .height(Length::Fixed(48.0))
+    .align_y(Vertical::Center)
     .padding(Padding {
         top: 0.0,
         right: 12.0,
@@ -334,9 +345,18 @@ fn main_pane<L: CoreLink>(state: &State<L>) -> Element<'_, Message> {
 
     let feed = feed_view(state, cid);
 
-    column![header, feed, composer(state)]
+    // Зазор слева: рамка шапки не должна прилегать к рамке сайдбара —
+    // иначе читается как двойная линия (правка осмотра окна).
+    container(column![header, feed, composer(state)])
         .width(Length::Fill)
         .height(Length::Fill)
+        .padding(Padding {
+            top: 0.0,
+            right: 0.0,
+            bottom: 0.0,
+            left: 4.0,
+        })
+        .style(palette::root)
         .into()
 }
 
@@ -368,43 +388,55 @@ fn feed_view<L: CoreLink>(state: &State<L>, cid: Cid) -> Element<'_, Message> {
 }
 
 fn composer<L: CoreLink>(state: &State<L>) -> Element<'_, Message> {
+    let empty = state.composer.text().trim().is_empty();
+    // Авторост: базовая строка 48 px, до 5 строк (128 px) — GUI_UI.md §1.
+    let lines = state.composer.text().lines().count().clamp(1, 5) as f32;
+    let editor_height = 48.0 + (lines - 1.0) * 20.0;
+
     let editor = text_editor(&state.composer)
         .id(state.composer_id.clone())
-        .height(Length::Fixed(96.0))
+        .height(Length::Fixed(editor_height))
+        .size(14)
+        .placeholder("Сообщение… · Enter — отправить, Shift+Enter — перенос строки")
         .padding(Padding {
-            top: 8.0,
-            right: 0.0,
-            bottom: 8.0,
-            left: 0.0,
+            top: 10.0,
+            right: 12.0,
+            bottom: 10.0,
+            left: 12.0,
         })
         .on_action(|action| Message::Chat(ChatIn::Edit(action)))
-        .key_binding(key_binding);
+        .key_binding(key_binding)
+        .style(palette::editor);
+
+    let send = button(
+        text("Отправить")
+            .size(12)
+            .font(palette::bold())
+            .color(palette::BG),
+    )
+    .padding(Padding {
+        top: 10.0,
+        right: 14.0,
+        bottom: 10.0,
+        left: 14.0,
+    })
+    .style(palette::button_accent)
+    .on_press_maybe((!empty).then_some(Message::Chat(ChatIn::Send)));
 
     container(
-        row![
-            editor,
-            container(
-                text("Enter — отправить · Shift+Enter — перенос")
-                    .size(11)
-                    .color(palette::DIM)
-            )
-            .align_y(Vertical::Bottom)
-            .padding(Padding {
-                top: 0.0,
-                right: 4.0,
-                bottom: 8.0,
-                left: 0.0
-            }),
-        ]
-        .align_y(Vertical::Center)
-        .padding(Padding {
-            top: 0.0,
-            right: 12.0,
-            bottom: 0.0,
-            left: 12.0,
-        }),
+        iced::widget::Row::new()
+            .push(container(editor).width(Length::Fill))
+            .push(send)
+            .spacing(8)
+            .align_y(Vertical::Bottom),
     )
     .width(Length::Fill)
+    .padding(Padding {
+        top: 8.0,
+        right: 12.0,
+        bottom: 8.0,
+        left: 12.0,
+    })
     .style(palette::root)
     .into()
 }
