@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use crate::core_link::HistoryMsg;
 use crate::model::cid::Cid;
 use crate::model::feed::{self, FeedItem};
-use crate::model::msg::{CoreMsgId, Msg, MsgId, SendState};
+use crate::model::msg::{CoreMsgId, Dir, Msg, MsgId, SendState};
 use crate::model::settings::Settings;
 
 /// Контакт.
@@ -15,6 +15,15 @@ pub struct Contact {
     pub name: String,
     pub online: bool,
     pub blocked: bool,
+}
+
+/// Совпадение поиска по загруженной ленте (Ctrl+F, S6).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SearchHit {
+    pub id: MsgId,
+    pub ts_ms: i64,
+    pub mine: bool,
+    pub body: String,
 }
 
 /// Состояние защищённой сессии с контактом. Ядро отдельного события сессии
@@ -385,6 +394,31 @@ impl Store {
         thread.msgs = fresh;
         thread.msgs.extend(old);
     }
+
+    /// Поиск по загруженной ленте чата (Ctrl+F, S6): регистр не важен,
+    /// служебные строки ядра не участвуют. Ядро не спрашивается —
+    /// серверный поиск появится со своим спринтом.
+    pub fn search_loaded(&self, cid: Cid, query: &str) -> Vec<SearchHit> {
+        let needle = query.trim().to_lowercase();
+        if needle.is_empty() {
+            return Vec::new();
+        }
+        let Some(thread) = self.threads.get(&cid) else {
+            return Vec::new();
+        };
+        thread
+            .msgs
+            .iter()
+            .filter(|m| !matches!(m.dir, Dir::Sys))
+            .filter(|m| m.body.to_lowercase().contains(&needle))
+            .map(|m| SearchHit {
+                id: m.id,
+                ts_ms: m.ts_ms,
+                mine: matches!(m.dir, Dir::Out),
+                body: m.body.clone(),
+            })
+            .collect()
+    }
 }
 
 #[cfg(test)]
@@ -656,6 +690,29 @@ mod tests {
         store.load_history(Cid(1), 0, &[]);
         assert!(store.history_requested(Cid(1)));
         assert!(!store.has_more_history(Cid(1)));
+    }
+
+    /// Ctrl+F по загруженному: регистр не важен, sys-строки не ищутся.
+    #[test]
+    fn search_loaded_matches_substring_case_insensitive() {
+        let mut store = Store::new();
+        store.replace_contacts(vec![contact(1, "Аня", true)]);
+        store.push_incoming(Cid(1), "Аня", MsgId(1), 1000, "Привет, мир".into());
+        store.push_outgoing(Cid(1), 2000, "привет из дома".into());
+        store.push_sys(Cid(1), 2500, "Аня подключилась".into());
+        store.push_incoming(Cid(1), "Аня", MsgId(2), 3000, "как дела?".into());
+
+        let hits = store.search_loaded(Cid(1), "ПРИВЕТ");
+        assert_eq!(hits.len(), 2, "регистр не важен, sys не ищется");
+        assert_eq!(hits[0].ts_ms, 1000, "порядок ленты");
+        assert!(!hits[0].mine);
+        assert!(hits[1].mine);
+
+        // Часть слова тоже находится.
+        assert_eq!(store.search_loaded(Cid(1), "дел").len(), 1);
+        // Пустой запрос и неизвестный чат — пустой результат.
+        assert!(store.search_loaded(Cid(1), "  ").is_empty());
+        assert!(store.search_loaded(Cid(9), "привет").is_empty());
     }
 
     #[test]
