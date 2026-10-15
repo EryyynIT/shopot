@@ -383,10 +383,187 @@ async fn addr_invite_message_two_daemons() {
     .await;
 }
 
+/// S6: критерий приёмки «перезапуск GUI и демона — лента восстанавливается».
+/// Переписка двух демонов, kill+restart демона A, GET_HISTORY отдаёт
+/// переписку из зашифрованного лога с теми же msg_id и флагами.
+#[tokio::test(flavor = "multi_thread")]
+async fn history_survives_daemon_restart() {
+    let Ok(bin) = std::env::var("SHOPOT_BIN") else {
+        eprintln!("SHOPOT_BIN не задан — e2e против демона пропущен");
+        return;
+    };
+
+    let mut a = spawn_daemon("hist-a");
+    let b = spawn_daemon("hist-b");
+    let sock_a = wait_socket(&a.1).await;
+    let sock_b = wait_socket(&b.1).await;
+
+    let link_a = std::sync::Arc::new(UdsLink::with_config(
+        sock_a.clone(),
+        Duration::from_millis(100),
+        false,
+    ));
+    let link_b = std::sync::Arc::new(UdsLink::with_config(
+        sock_b,
+        Duration::from_millis(100),
+        false,
+    ));
+    let events_a = CoreLink::events(std::sync::Arc::clone(&link_a));
+    let mut events_a = Box::pin(events_a);
+    let events_b = CoreLink::events(std::sync::Arc::clone(&link_b));
+    let mut events_b = Box::pin(events_b);
+    wait_event(&mut events_a, Duration::from_secs(10), |e| {
+        matches!(e, LinkEvent::Resync)
+    })
+    .await;
+    wait_event(&mut events_b, Duration::from_secs(10), |e| {
+        matches!(e, LinkEvent::Resync)
+    })
+    .await;
+
+    // Знакомство: A выдаёт LAN-код, B гасит.
+    let code = match CoreLink::execute(
+        &*link_a,
+        Request::Invite {
+            relay: false,
+            addr: String::new(),
+        },
+    )
+    .await
+    {
+        Ok(OkReply::Code(code)) => code,
+        other => panic!("CREATE_INVITE не удался: {other:?}"),
+    };
+    let cid_b = match CoreLink::execute(&*link_b, Request::Add { code }).await {
+        Ok(OkReply::Added { cid }) => cid,
+        other => panic!("ACCEPT_INVITE не удался: {other:?}"),
+    };
+    let joined = wait_event(&mut events_a, Duration::from_secs(20), |e| {
+        matches!(e, LinkEvent::ContactJoined { .. })
+    })
+    .await;
+    let LinkEvent::ContactJoined { cid: cid_a, .. } = joined else {
+        unreachable!()
+    };
+    wait_event(&mut events_b, Duration::from_secs(20), |e| {
+        matches!(e, LinkEvent::Presence { online: true, .. })
+    })
+    .await;
+
+    // Переписка: B пишет дважды, A отвечает.
+    for text in ["первое до перезапуска", "второе до перезапуска"]
+    {
+        let reply = CoreLink::execute(
+            &*link_b,
+            Request::SendMsg {
+                cid: cid_b,
+                text: text.into(),
+            },
+        )
+        .await;
+        assert!(matches!(reply, Ok(OkReply::Sent { .. })), "{reply:?}");
+        wait_event(
+            &mut events_a,
+            Duration::from_secs(20),
+            |e| matches!(e, LinkEvent::MessageReceived { text: t, .. } if t == text),
+        )
+        .await;
+    }
+    let reply = CoreLink::execute(
+        &*link_a,
+        Request::SendMsg {
+            cid: cid_a,
+            text: "ответ A".into(),
+        },
+    )
+    .await;
+    assert!(matches!(reply, Ok(OkReply::Sent { .. })), "{reply:?}");
+    wait_event(
+        &mut events_b,
+        Duration::from_secs(20),
+        |e| matches!(e, LinkEvent::MessageReceived { text: t, .. } if t == "ответ A"),
+    )
+    .await;
+
+    // Перезапуск демона A: тот же $HOME, свежий serve, свежий линк.
+    // Drop у Daemon добьёт уже мёртвый child — повторный kill безвреден.
+    let _ = a.0.kill();
+    let _ = a.0.wait();
+    let restarted = Proc(
+        Command::new(&bin)
+            .arg("serve")
+            .env("HOME", &a.1)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("демон A перезапущен"),
+    );
+    let link_a2 = std::sync::Arc::new(UdsLink::with_config(
+        sock_a,
+        Duration::from_millis(100),
+        false,
+    ));
+    let events_a2 = CoreLink::events(std::sync::Arc::clone(&link_a2));
+    let mut events_a2 = Box::pin(events_a2);
+    wait_event(&mut events_a2, Duration::from_secs(15), |e| {
+        matches!(e, LinkEvent::Resync)
+    })
+    .await;
+
+    // История у A: обе реплики B и свой ответ, порядок старые → новые.
+    let reply = CoreLink::execute(
+        &*link_a2,
+        Request::History {
+            cid: cid_a,
+            limit: 50,
+        },
+    )
+    .await;
+    let Ok(OkReply::History { total, records }) = reply else {
+        panic!("GET_HISTORY после перезапуска не удался: {reply:?}");
+    };
+    assert_eq!(total, 3, "три записи в логе демона A");
+    let bodies: Vec<&str> = records.iter().map(|r| r.text.as_str()).collect();
+    assert_eq!(
+        bodies,
+        ["первое до перезапуска", "второе до перезапуска", "ответ A"],
+        "порядок старые → новые"
+    );
+    assert!(
+        !records[0].mine && !records[1].mine && records[2].mine,
+        "флаги mine согласованы с направлением"
+    );
+
+    // История у B: его лог зеркалит переписку.
+    let reply = CoreLink::execute(
+        &*link_b,
+        Request::History {
+            cid: cid_b,
+            limit: 50,
+        },
+    )
+    .await;
+    let Ok(OkReply::History { total, records }) = reply else {
+        panic!("GET_HISTORY у B не удался: {reply:?}");
+    };
+    assert_eq!(total, 3, "у B три записи: {records:?}");
+    assert!(
+        records[0].mine && records[1].mine && !records[2].mine,
+        "у B свои две реплики, чужой ответ последним: {records:?}"
+    );
+    assert!(
+        records.iter().all(|r| !r.mine || r.delivered),
+        "свои сообщения подтверждены ACK"
+    );
+
+    drop(restarted);
+}
+
 /// WAN-путь через relay: код с адресом релея, pairing по marker-у.
-/// НЕСТАБИЛЕН на закреплённом ядре acffb0e: pairing иногда не завершается,
-/// первая отправка через свежий relay-сеанс может зависнуть (CORE_FEEDBACK.md
-/// §5). Ручной диагностический прогон: --ignored, не гейт CI.
+/// НЕСТАБИЛЕН: pairing иногда не завершается, первая отправка через свежий
+/// relay-сеанс может зависнуть (CORE_FEEDBACK.md §5). Замер на ядре
+/// 3334fb8 с tail-фиксом: 3 из 8 прогонов (~37%), на acffb0e — ~17%.
+/// Ручной диагностический прогон: --ignored, не гейт CI.
 #[ignore = "relay-путь ядра acffb0e нестабилен — CORE_FEEDBACK.md §5"]
 #[tokio::test(flavor = "multi_thread")]
 async fn relay_invite_message_two_daemons() {
