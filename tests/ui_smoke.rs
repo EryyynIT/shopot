@@ -138,8 +138,89 @@ fn smoke_scenarios() {
 /// Знакомство (S2): инвайт-диалог и блокировка через меню.
 fn meet_scenarios() {
     invite_dialog_cycles_issue_and_add();
+    invite_with_address_and_relay();
     right_click_menu_blocks_and_opens_card();
     escape_closes_overlay();
+}
+
+/// Код с адресом и relay: ядро дозванивается само, peer IP не видит
+/// (CORE-API.md §4.2). Тот же путь, что и у двух разработчиков в разных
+/// городах через релей на VPS.
+fn invite_with_address_and_relay() {
+    let program = app::program(Link::new(Scene::smoke()));
+    let (sender, mut receiver) = mpsc::channel(512);
+    let mut emu = Emulator::new(
+        sender,
+        &program,
+        Mode::Immediate,
+        iced::Size::new(1000.0, 700.0),
+    );
+    run_instruction(
+        &mut emu,
+        &program,
+        &mut receiver,
+        Instruction::Expect(Expectation::Text("Аня".into())),
+    );
+
+    let [press, release] = click("Пригласить");
+    run_instruction(&mut emu, &program, &mut receiver, press);
+    run_instruction(&mut emu, &program, &mut receiver, release);
+    // Форма ждёт, код не выдан.
+    run_instruction(
+        &mut emu,
+        &program,
+        &mut receiver,
+        Instruction::Expect(Expectation::Text("Код появится после выдачи.".into())),
+    );
+
+    // Адрес и relay-галка.
+    let [press, release] = click("host:7777 — необязательно");
+    run_instruction(&mut emu, &program, &mut receiver, press);
+    run_instruction(&mut emu, &program, &mut receiver, release);
+    run_instruction(
+        &mut emu,
+        &program,
+        &mut receiver,
+        Instruction::Interact(Interaction::Keyboard(Keyboard::Typewrite(
+            "192.168.1.5:7777".into(),
+        ))),
+    );
+    let [press, release] = click("через relay — собеседник не увидит ваш IP");
+    run_instruction(&mut emu, &program, &mut receiver, press);
+    run_instruction(&mut emu, &program, &mut receiver, release);
+
+    // Выдача: код отражает relay-режим заглушки.
+    let [press, release] = click("Выдать код");
+    run_instruction(&mut emu, &program, &mut receiver, press);
+    run_instruction(&mut emu, &program, &mut receiver, release);
+    run_instruction(
+        &mut emu,
+        &program,
+        &mut receiver,
+        Instruction::Expect(Expectation::Text("Скопировать код".into())),
+    );
+
+    let (state, _) = emu.into_state();
+    // relay-код не кэшируется как LAN: следующее открытие снова форма.
+    assert!(
+        state.invite_code.is_none(),
+        "relay-код не должен попадать в LAN-кэш"
+    );
+    // На экране эллипсис случайного кода, поэтому режим сверяем по состоянию.
+    if let shopot_gui::ui::Overlay::Invite(view) = &state.overlay {
+        assert!(view.relay, "галка relay в форме выданного кода");
+        let code = view.code.as_deref().expect("код выдан");
+        assert!(
+            code.starts_with("shopot1r."),
+            "код relay-режима от заглушки: {code}"
+        );
+        assert!(
+            code.ends_with("@192.168.1.5:7777"),
+            "адрес попал в код: {code}"
+        );
+    } else {
+        panic!("диалог приглашения должен остаться открытым");
+    }
 }
 
 /// contacts → сайдбар populated: имя, статус «в сети», счётчик сессий.
@@ -272,7 +353,10 @@ fn invite_dialog_cycles_issue_and_add() {
     run_instruction(&mut emu, &program, &mut receiver, press);
     run_instruction(&mut emu, &program, &mut receiver, release);
 
-    // Код выдан ядром (заглушка): панель копирования и QR на месте.
+    // Код выдаётся по кнопке: сначала форма, потом ответ заглушки.
+    let [press, release] = click("Выдать код");
+    run_instruction(&mut emu, &program, &mut receiver, press);
+    run_instruction(&mut emu, &program, &mut receiver, release);
     run_instruction(
         &mut emu,
         &program,
@@ -414,11 +498,12 @@ fn escape_closes_overlay() {
     let [press, release] = click("Пригласить");
     run_instruction(&mut emu, &program, &mut receiver, press);
     run_instruction(&mut emu, &program, &mut receiver, release);
+    // Оверлей открыт: форма вместо мгновенного кода.
     run_instruction(
         &mut emu,
         &program,
         &mut receiver,
-        Instruction::Expect(Expectation::Text("Скопировать код".into())),
+        Instruction::Expect(Expectation::Text("Код появится после выдачи.".into())),
     );
 
     run_instruction(
