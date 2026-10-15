@@ -26,13 +26,15 @@ use crate::model::store::Store;
 /// Лимит тела SEND_MESSAGE (str16 ≤ 4096, CORE-API.md §4.3).
 const MAX_BODY: usize = 4096;
 
-/// Сообщения приложения: канал ядра, действия чата, знакомство, настройки.
+/// Сообщения приложения: канал ядра, действия чата, знакомство, настройки,
+/// окно.
 #[derive(Debug, Clone)]
 pub enum Message {
     Link(LinkIn),
     Chat(ChatIn),
     Meet(MeetIn),
     Settings(SettingsIn),
+    Window(WindowIn),
 }
 
 /// Ответы и события core_link. Не протекают в виджеты: update пишет
@@ -97,6 +99,16 @@ pub enum SettingsIn {
     ToggleCompact(bool),
     /// Кнопка масштаба: +шаг или −шаг (границы удерживает Store).
     ChangeFontScale(f32),
+}
+
+/// События окна и глобальные команды: фокус для правила уведомлений,
+/// выход по Ctrl+Q (GUI_UI.md §4).
+#[derive(Debug, Clone)]
+pub enum WindowIn {
+    /// Окно получило/потеряло фокус.
+    Focus(bool),
+    /// Закрыть приложение.
+    Exit,
 }
 
 /// Оверлей поверх главного окна (GUI_UI.md §3); звонок появится в S7.
@@ -187,6 +199,19 @@ pub fn update<L: CoreLink>(state: &mut State<L>, message: Message) -> Task<Messa
         Message::Chat(chat) => on_chat(state, chat),
         Message::Meet(meet) => on_meet(state, meet),
         Message::Settings(settings) => on_settings(state, settings),
+        Message::Window(window) => on_window(state, window),
+    }
+}
+
+/// События окна: фокус — данные для правила уведомлений, выход —
+/// завершение рантайма iced.
+fn on_window<L: CoreLink>(state: &mut State<L>, window: WindowIn) -> Task<Message> {
+    match window {
+        WindowIn::Focus(focused) => {
+            state.window_focused = focused;
+            Task::none()
+        }
+        WindowIn::Exit => iced::exit(),
     }
 }
 
