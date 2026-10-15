@@ -49,6 +49,16 @@ jobs:
             Extract and run `./run.sh` — it creates your identity on first
             start, launches the daemon in the background and opens the client.
 
+            What's new in v0.1.1:
+
+            - desktop notifications for incoming messages, with a "hide
+              text" privacy setting on by default; the chat open in the
+              focused window does not notify
+            - settings panel: compact feed (no bubbles, everything
+              left-aligned), font scale 80–150%
+            - keyboard control: Ctrl+1..9 opens a chat by its position in
+              the list, Ctrl+Q quits, Escape closes any dialog
+
             The daemon is built from the pinned
             [shopot-core](https://github.com/Puxxalwl/shopot-core) submodule
             (Zig 0.17.0). Building from source is covered in the README inside
