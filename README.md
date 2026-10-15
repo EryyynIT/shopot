@@ -15,15 +15,19 @@ statuses, no fake delivery receipts.
 
 ## Status
 
-Early development. The client currently talks to a built-in mock of the core
-link (deterministic demo scenes); the real shopot-core daemon transport over
-a Unix domain socket lands in a later sprint. Nothing here is production-ready
+Early development. The client talks to a real `shopot serve` daemon over its
+binary frame API 1.0.0 on a Unix domain socket (`$HOME/.shopot/api.sock`);
+`--mock` runs a built-in demo scene instead. Nothing here is production-ready
 yet.
 
 Done so far:
 
+- typed core link: binary frame codec, request correlation, events, reconnect
+  with resync; an e2e test runs invite → message → delivery ACK against two
+  real daemons (gated by `SHOPOT_BIN`)
 - contacts list with presence dots and unread badges
-- message feed with day separators, system events and per-group send status
+- message feed with day separators, system events and honest send statuses
+  (sending → sent / queued / delivered / failed)
 - auto-growing composer with a send button
 - headless UI tests (`iced_test`) plus unit tests; CI runs fmt, clippy, tests
   and a release build on every push
@@ -40,7 +44,13 @@ cargo run --release
 
 shopot itself is the client; the engine — encrypted P2P transport, sessions,
 storage — lives in [shopot-core](https://github.com/Puxxalwl/shopot-core) by
-[puxxalwl](https://github.com/Puxxalwl).
+[puxxalwl](https://github.com/Puxxalwl). The pinned API contract is vendored
+as the `core` git submodule (binary protocol spec:
+`core/zig/docs/CORE-API.md`); build the daemon with Zig 0.17.0:
+
+```sh
+cd core/zig && zig build -Doptimize=ReleaseSafe
+```
 
 ## License
 
