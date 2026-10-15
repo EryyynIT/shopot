@@ -81,7 +81,7 @@ impl LinkError {
                 "Неверный код. Скопируйте строку целиком — она начинается с shopot://i/.".into()
             }
             Self::Kernel(api::Status::TooManyInvites) => {
-                "Активных приглашений уже четыре. Отзовите старое — новые не выдаются.".into()
+                "Активных приглашений уже четыре. Перезапустите shopot serve — реестр приглашений хранится в памяти демона.".into()
             }
             Self::Kernel(api::Status::TooBig) => {
                 "Сообщение слишком длинное — лимит 4096 байт.".into()
@@ -202,4 +202,22 @@ pub(crate) async fn take_events(
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Совет в тексте ошибки обязан быть выполнимым в GUI (TEXT_STYLE §3):
+    /// отзыва инвайтов в API 1.0.0 нет, перезапуск демона — есть.
+    #[test]
+    fn too_many_invites_advises_restart_not_revoke() {
+        let err = LinkError::Kernel(api::Status::TooManyInvites);
+        let text = err.user_text();
+        assert!(
+            text.contains("Перезапустите"),
+            "совет должен быть выполнимым: {text}"
+        );
+        assert!(!text.contains("Отзовите"), "отзыва в API нет: {text}");
+    }
 }
