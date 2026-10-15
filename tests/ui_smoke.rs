@@ -26,12 +26,8 @@ fn pump<P: iced_test::program::Program + 'static>(
 ) {
     let deadline = Instant::now() + Duration::from_millis(ms);
     while Instant::now() < deadline {
-        match receiver.try_recv() {
-            Ok(event) => match event {
-                Event::Action(action) => emu.perform(program, action),
-                Event::Ready | Event::Failed(_) => {}
-            },
-            Err(_) => {}
+        if let Ok(Event::Action(action)) = receiver.try_recv() {
+            emu.perform(program, action);
         }
         std::thread::sleep(Duration::from_millis(5));
     }
