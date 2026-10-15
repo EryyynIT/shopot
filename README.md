@@ -34,6 +34,12 @@ Requires a stable Rust toolchain.
 cargo run --release
 ```
 
+## The core
+
+shopot itself is the client; the engine — encrypted P2P transport, sessions,
+storage — lives in [shopot-core](https://github.com/Puxxalwl/shopot-core) by
+[puxxalwl](https://github.com/Puxxalwl).
+
 ## License
 
 [MIT](LICENSE)
