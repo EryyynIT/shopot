@@ -16,7 +16,7 @@ use tokio::sync::mpsc;
 use tokio::time;
 
 use crate::core_link::api::Status;
-use crate::core_link::{CoreLink, LinkError, LinkEvent, OkReply, Reply, Request};
+use crate::core_link::{CoreLink, HistoryMsg, LinkError, LinkEvent, OkReply, Reply, Request};
 use crate::model::cid::Cid;
 use crate::model::msg::CoreMsgId;
 use crate::model::store::Contact;
@@ -40,6 +40,9 @@ pub struct Scene {
     pub reply_delay_ms: u64,
     /// Реплики автоответа по кругу; в тестах — детерминированные.
     pub replies: Vec<String>,
+    /// Что ядро «помнит» по контактам: ответ на GET_HISTORY. ts задан
+    /// при конструировании сцены — для демо-сцены это «вчера».
+    pub history: HashMap<i64, Vec<HistoryMsg>>,
 }
 
 #[derive(Debug, Clone)]
@@ -117,6 +120,7 @@ impl Scene {
             flip_presence: Some(Duration::from_secs(8)),
             reply_delay_ms: 700,
             replies: demo_replies(),
+            history: demo_history(),
         }
     }
 
@@ -142,8 +146,54 @@ impl Scene {
             flip_presence: None,
             reply_delay_ms: 100,
             replies: vec!["принято".into()],
+            history: HashMap::new(),
         }
     }
+}
+
+/// Вчерашняя переписка для демо-сцены: у Ани — диалог с доставкой,
+/// у Бориса — одно своё офлайн-сообщение без ACK.
+fn demo_history() -> HashMap<i64, Vec<HistoryMsg>> {
+    let day = 24 * 60 * 60 * 1000;
+    let yesterday = crate::core_link::now_ms() - day;
+    HashMap::from([
+        (
+            1,
+            vec![
+                HistoryMsg {
+                    mine: false,
+                    delivered: false,
+                    msg_id: core_id(900),
+                    ts_ms: yesterday,
+                    text: "слушай, ты вчера был на созвоне?".into(),
+                },
+                HistoryMsg {
+                    mine: true,
+                    delivered: true,
+                    msg_id: core_id(901),
+                    ts_ms: yesterday + 60_000,
+                    text: "был. договорились о сроках".into(),
+                },
+                HistoryMsg {
+                    mine: false,
+                    delivered: false,
+                    msg_id: core_id(902),
+                    ts_ms: yesterday + 120_000,
+                    text: "отлично, тогда жду макет".into(),
+                },
+            ],
+        ),
+        (
+            2,
+            vec![HistoryMsg {
+                mine: true,
+                delivered: false,
+                msg_id: core_id(910),
+                ts_ms: yesterday + 3_600_000,
+                text: "напиши, как доберёшься".into(),
+            }],
+        ),
+    ])
 }
 
 /// Заглушка [`crate::core_link::CoreLink`].
@@ -266,9 +316,8 @@ impl CoreLink for MockLink {
 
     fn execute(&self, request: Request) -> impl Future<Output = Reply> + Send + 'static {
         let inner = Arc::clone(&self.inner);
-        let reply_delay_ms = self.scene.reply_delay_ms;
-        let scene_replies = self.scene.replies.clone();
-        async move { Self::handle(&inner, request, reply_delay_ms, &scene_replies).await }
+        let scene = Arc::clone(&self.scene);
+        async move { Self::handle(&inner, request, &scene).await }
     }
 
     fn is_stub(&self) -> bool {
@@ -277,12 +326,9 @@ impl CoreLink for MockLink {
 }
 
 impl MockLink {
-    async fn handle(
-        inner: &Arc<Inner>,
-        request: Request,
-        reply_delay_ms: u64,
-        scene_replies: &[String],
-    ) -> Reply {
+    async fn handle(inner: &Arc<Inner>, request: Request, scene: &Scene) -> Reply {
+        let reply_delay_ms = scene.reply_delay_ms;
+        let scene_replies = &scene.replies;
         match request {
             Request::Contacts => {
                 let state = inner.state.lock().expect("стейт не отравлен");
@@ -412,6 +458,21 @@ impl MockLink {
                 }
                 Ok(OkReply::Done)
             }
+            Request::History { cid, limit } => {
+                let known = {
+                    let state = inner.state.lock().expect("стейт не отравлен");
+                    state.contacts.iter().any(|c| c.cid == cid)
+                };
+                if !known {
+                    return Err(LinkError::Kernel(Status::NoContact));
+                }
+                // Семантика ядра: окно новейших записей, старые → новые.
+                let all = scene.history.get(&cid.0);
+                let total = all.map_or(0, |h| h.len() as u32);
+                let skip = all.map_or(0, |h| h.len().saturating_sub(limit as usize));
+                let records = all.map_or_else(Vec::new, |h| h[skip..].to_vec());
+                Ok(OkReply::History { total, records })
+            }
         }
     }
 }
@@ -486,6 +547,7 @@ mod tests {
             flip_presence: None,
             reply_delay_ms: 50,
             replies: demo_replies(),
+            history: HashMap::new(),
         }
     }
 
@@ -654,5 +716,75 @@ mod tests {
             .await;
         assert_eq!(reply, Err(LinkError::Kernel(Status::NoContact)));
         assert_eq!(reply.unwrap_err().user_text(), "Контакт не найден.");
+    }
+
+    /// Окно GET_HISTORY: новейшие `limit` записей, порядок старые → новые,
+    /// total не зависит от окна.
+    #[tokio::test(start_paused = true)]
+    async fn history_returns_newest_window_in_order() {
+        let mut scene = scene();
+        scene.history.insert(
+            1,
+            (0..5)
+                .map(|n| HistoryMsg {
+                    mine: false,
+                    delivered: false,
+                    msg_id: core_id(n),
+                    ts_ms: n as i64 * 1000,
+                    text: format!("строка {n}"),
+                })
+                .collect(),
+        );
+        let link = MockLink::new(scene);
+
+        let reply = link
+            .execute(Request::History {
+                cid: Cid(1),
+                limit: 2,
+            })
+            .await;
+        assert_eq!(
+            reply,
+            Ok(OkReply::History {
+                total: 5,
+                records: vec![record(3, "строка 3"), record(4, "строка 4"),],
+            }),
+            "окно = две новейшие, порядок не перевёрнут"
+        );
+        // Лимит больше размера — отдаётся всё.
+        let reply = link
+            .execute(Request::History {
+                cid: Cid(1),
+                limit: 50,
+            })
+            .await;
+        assert!(matches!(
+            reply,
+            Ok(OkReply::History { total: 5, records }) if records.len() == 5
+        ));
+        // Пустая история — валидный пустой ответ.
+        let reply = link
+            .execute(Request::History {
+                cid: Cid(2),
+                limit: 50,
+            })
+            .await;
+        assert_eq!(
+            reply,
+            Ok(OkReply::History {
+                total: 0,
+                records: vec![]
+            })
+        );
+    }
+
+    fn record(n: u64, text: &str) -> HistoryMsg {
+        HistoryMsg {
+            mine: false,
+            delivered: false,
+            msg_id: core_id(n),
+            ts_ms: n as i64 * 1000,
+            text: text.to_owned(),
+        }
     }
 }

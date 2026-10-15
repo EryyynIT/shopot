@@ -44,6 +44,9 @@ pub enum Request {
     Block { cid: Cid },
     /// Разблокировать контакт (UNBLOCK_CONTACT).
     Unblock { cid: Cid },
+    /// История чата (GET_HISTORY): окно новейших записей, старые → новые.
+    /// Лимит ядра — 200, 0 означает «дефолтные 50».
+    History { cid: Cid, limit: u32 },
 }
 
 /// Ошибка канала с ядром (GUI_DEV.md §2: типизированные варианты).
@@ -100,6 +103,18 @@ impl LinkError {
     }
 }
 
+/// Запись GET_HISTORY: что ядро помнит о сообщении чата (CORE-API.md §4.3).
+/// Сущности разметки ядро отдаёт в tail — клиент их пока не использует.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HistoryMsg {
+    pub mine: bool,
+    /// Пир подтвердил ACK (bit1 flags). Осмысленно только для своих.
+    pub delivered: bool,
+    pub msg_id: CoreMsgId,
+    pub ts_ms: i64,
+    pub text: String,
+}
+
 /// Содержательный ответ при OK. Ошибки — через `Err(LinkError)`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OkReply {
@@ -111,6 +126,11 @@ pub enum OkReply {
     Added { cid: Cid },
     /// CREATE_INVITE: односторонний инвайт-код.
     Code(String),
+    /// GET_HISTORY: всего записей у ядра + окно новейших (старые → новые).
+    History {
+        total: u32,
+        records: Vec<HistoryMsg>,
+    },
     /// У команды нет содержательного ответа (block/unblock).
     Done,
 }

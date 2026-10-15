@@ -22,7 +22,7 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::time::timeout;
 
 use super::api::{self, Header, Kind, Method, Status};
-use super::{CoreLink, LinkError, LinkEvent, OkReply, RecvStream, Reply, Request};
+use super::{CoreLink, HistoryMsg, LinkError, LinkEvent, OkReply, RecvStream, Reply, Request};
 use crate::model::cid::Cid;
 use crate::model::msg::CoreMsgId;
 use crate::model::store::Contact;
@@ -361,6 +361,11 @@ fn encode_request(request: &Request, api2: bool) -> (Method, Vec<u8>) {
             api::put::u32(&mut payload, cid.0 as u32);
             Method::UnblockContact
         }
+        Request::History { cid, limit } => {
+            api::put::u32(&mut payload, cid.0 as u32);
+            api::put::u32(&mut payload, *limit);
+            Method::GetHistory
+        }
     };
     (method, payload)
 }
@@ -397,9 +402,58 @@ fn decode_reply(method: Method, raw: RawReply) -> Reply {
             let code = r.read_str16().map_err(|_| LinkError::BadFrame("code"))?;
             OkReply::Code(String::from_utf8_lossy(code).into_owned())
         }
+        Method::GetHistory => {
+            let mut r = api::Reader::new(&raw.payload);
+            let total = r.read_u32().map_err(|_| LinkError::BadFrame("total"))?;
+            let count = r.read_u32().map_err(|_| LinkError::BadFrame("count"))?;
+            let mut records = Vec::with_capacity(count as usize);
+            for _ in 0..count {
+                let flags = r.read_u8().map_err(|_| LinkError::BadFrame("flags"))?;
+                let mut msg_id = [0u8; 16];
+                msg_id.copy_from_slice(
+                    r.read_bytes(16)
+                        .map_err(|_| LinkError::BadFrame("msg_id"))?,
+                );
+                let ts_ms = r.read_u64().map_err(|_| LinkError::BadFrame("ts"))? as i64;
+                let text = r.read_str16().map_err(|_| LinkError::BadFrame("body"))?;
+                // Entity tail появился в API 2.x (всегда есть, даже пустой
+                // ent_count=0); ядро 1.x запись им не дополняет. Байты
+                // после тела — это tail, иначе запись кончилась.
+                if r.has_more() {
+                    skip_entity_tail(&mut r)?;
+                }
+                records.push(HistoryMsg {
+                    mine: flags & 0b01 != 0,
+                    delivered: flags & 0b10 != 0,
+                    msg_id: CoreMsgId(msg_id),
+                    ts_ms,
+                    text: String::from_utf8_lossy(text).into_owned(),
+                });
+            }
+            OkReply::History { total, records }
+        }
         _ => OkReply::Done,
     };
     Ok(reply)
+}
+
+/// Пропустить entity tail записи (API 2.x):
+/// `[ent_count u8] × {[kind u8][offset u16][len u16][value_len u8][value]}`.
+/// Клиент разметку не рендерит — до своего спринта.
+fn skip_entity_tail(r: &mut api::Reader<'_>) -> Result<(), LinkError> {
+    let count = r.read_u8().map_err(|_| LinkError::BadFrame("ent_count"))?;
+    for _ in 0..count {
+        r.read_u8().map_err(|_| LinkError::BadFrame("ent_kind"))?;
+        r.read_u16()
+            .map_err(|_| LinkError::BadFrame("ent_offset"))?;
+        r.read_u16().map_err(|_| LinkError::BadFrame("ent_len"))?;
+        let value_len = r
+            .read_u8()
+            .map_err(|_| LinkError::BadFrame("ent_value_len"))? as usize;
+        r.read_bytes(value_len)
+            .map_err(|_| LinkError::BadFrame("ent_value"))?;
+    }
+    Ok(())
 }
 
 /// LIST_CONTACTS: count × {cid u32, flags u8, last_seen i64, name str16}.
@@ -955,6 +1009,96 @@ mod tests {
                 .expect("ответ");
             assert_eq!(task.await.expect("задача не паникует"), Ok(OkReply::Done));
         }
+        cleanup(&path);
+    }
+
+    /// GET_HISTORY: записи с entity tail (API 2.x) и без него (API 1.x)
+    /// разбираются одинаково; флаги mine/delivered читаются из bits.
+    #[tokio::test]
+    async fn history_reply_decodes_with_and_without_entity_tail() {
+        let path = temp_socket("history");
+        cleanup(&path);
+        let listener = UnixListener::bind(&path).expect("сокет забинден");
+        let link = Arc::new(UdsLink::with_config(
+            path.clone(),
+            Duration::from_millis(10),
+            false,
+        ));
+        let _events = CoreLink::events(Arc::clone(&link));
+        let (mut stream, _) = listener.accept().await.expect("коннект");
+
+        let task = {
+            let link = Arc::clone(&link);
+            tokio::spawn(async move {
+                CoreLink::execute(
+                    &*link,
+                    Request::History {
+                        cid: Cid(5),
+                        limit: 50,
+                    },
+                )
+                .await
+            })
+        };
+        let (header, payload) = read_frame(&mut stream).await;
+        assert_eq!(header.id, Method::GetHistory as u16);
+        assert_eq!(
+            payload,
+            [5, 0, 0, 0, 50, 0, 0, 0],
+            "payload = cid u32 + limit u32"
+        );
+
+        // Ответ: total=3, count=2; запись 1 — моя доставленная, с tail из
+        // одной сущности; запись 2 — чужая, без tail (ядро 1.x).
+        let mut answer = Vec::new();
+        api::put::u32(&mut answer, 3);
+        api::put::u32(&mut answer, 2);
+        api::put::u8(&mut answer, 0b11);
+        answer.extend_from_slice(&[0x01; 16]);
+        api::put::u64(&mut answer, 1_700_000_000_000);
+        api::put::str16(&mut answer, "моё старое").expect("str16");
+        api::put::u8(&mut answer, 1); // ent_count = 1
+        api::put::u8(&mut answer, 1); // kind
+        api::put::u16(&mut answer, 0); // offset
+        api::put::u16(&mut answer, 4); // len
+        api::put::u8(&mut answer, 4); // value_len
+        answer.extend_from_slice(b"bold");
+        api::put::u8(&mut answer, 0b00);
+        answer.extend_from_slice(&[0x02; 16]);
+        api::put::u64(&mut answer, 1_700_000_005_000);
+        api::put::str16(&mut answer, "чужое").expect("str16");
+        stream
+            .write_all(&response_frame(
+                Method::GetHistory as u16,
+                header.request_id,
+                Status::Ok,
+                &answer,
+            ))
+            .await
+            .expect("ответ отправлен");
+        assert_eq!(
+            task.await.expect("задача не паникует"),
+            Ok(OkReply::History {
+                total: 3,
+                records: vec![
+                    HistoryMsg {
+                        mine: true,
+                        delivered: true,
+                        msg_id: CoreMsgId([0x01; 16]),
+                        ts_ms: 1_700_000_000_000,
+                        text: "моё старое".into(),
+                    },
+                    HistoryMsg {
+                        mine: false,
+                        delivered: false,
+                        msg_id: CoreMsgId([0x02; 16]),
+                        ts_ms: 1_700_000_005_000,
+                        text: "чужое".into(),
+                    },
+                ],
+            }),
+            "tail у первой записи пропущен, вторая читается без tail"
+        );
         cleanup(&path);
     }
 
