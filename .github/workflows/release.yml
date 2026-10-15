@@ -22,7 +22,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Build the daemon (Zig)
-        run: zig build -Doptimize=ReleaseSafe
+        # baseline: артефакт должен идти на любом x86_64, а не только
+        # на CPU раннера (native по умолчанию даёт SIGILL на старых машинах).
+        run: zig build -Doptimize=ReleaseSafe -Dcpu=baseline
         working-directory: core/zig
 
       - name: Build the client (Rust)
