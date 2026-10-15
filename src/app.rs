@@ -90,16 +90,36 @@ fn events_subscription<L: CoreLink>(link: &Arc<L>) -> impl iced::futures::Stream
     CoreLink::events(Arc::clone(link)).map(|event| Message::Link(LinkIn::Event(event)))
 }
 
-/// Esc закрывает оверлей (GUI_UI.md §3). `listen()` отдаёт только события,
-/// которые не съел виджет: привязки композера не задеваются.
+/// Горячие клавиши живого окна (GUI_UI.md §4): Esc — закрыть оверлей,
+/// Ctrl+1..9 — чат по номеру, Ctrl+Q — выход. Ctrl-комбинации — по
+/// физическим клавишам, раскладка не важна. `listen()` отдаёт только
+/// события, которые не съел виджет; пути композера дублированы в
+/// key_binding (headless-эмулятор подписку не получает).
 fn esc_subscription() -> Subscription<Message> {
-    use iced::keyboard::key::Named;
+    use iced::keyboard::key::{Code, Named, Physical};
     use iced::keyboard::{Event as KeyEvent, Key};
     iced::keyboard::listen().filter_map(|event| match event {
         KeyEvent::KeyPressed {
-            key: Key::Named(Named::Escape),
+            key,
+            physical_key,
+            modifiers,
             ..
-        } => Some(Message::Meet(MeetIn::CloseOverlay)),
+        } => {
+            if let Key::Named(Named::Escape) = key {
+                return Some(Message::Meet(MeetIn::CloseOverlay));
+            }
+            if modifiers.control() {
+                if let Physical::Code(code) = physical_key {
+                    if let Some(index) = ui::chat_index(&code) {
+                        return Some(Message::Chat(ui::ChatIn::SelectIndex(index)));
+                    }
+                    if code == Code::KeyQ {
+                        return Some(Message::Window(WindowIn::Exit));
+                    }
+                }
+            }
+            None
+        }
         _ => None,
     })
 }
