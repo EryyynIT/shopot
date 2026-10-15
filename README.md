@@ -1,3 +1,5 @@
+<img src="docs/icon.png" width="72" align="right" alt="shopot icon">
+
 # shopot
 
 [![CI](https://github.com/EryyynIT/shopot/actions/workflows/ci.yml/badge.svg)](https://github.com/EryyynIT/shopot/actions/workflows/ci.yml)
@@ -15,42 +17,58 @@ statuses, no fake delivery receipts.
 
 ## Status
 
-Early development. The client talks to a real `shopot serve` daemon over its
-binary frame API 1.0.0 on a Unix domain socket (`$HOME/.shopot/api.sock`);
-`--mock` runs a built-in demo scene instead. Nothing here is production-ready
-yet.
+First release: **v0.1.0 «Разговор»**. The client talks to a real `shopot serve`
+daemon over its binary frame API 1.0.0 on a Unix domain socket
+(`$HOME/.shopot/api.sock`); `--mock` runs a built-in demo scene instead.
+
+Not production-ready: no message history, files, avatars or calls yet (they
+land in v0.2 and v0.3). OS notifications and full keyboard control are next
+(v0.1.1).
 
 Done so far:
 
 - typed core link: binary frame codec, request correlation, events, reconnect
   with resync; an e2e test runs invite → message → delivery ACK against two
   real daemons (gated by `SHOPOT_BIN`)
+- meeting flow: one-time invite codes with a QR, adding a contact by someone
+  else's code
 - contacts list with presence dots and unread badges
 - message feed with day separators, system events and honest send statuses
   (sending → sent / queued / delivered / failed)
+- contact card and right-click menu with block/unblock; Escape closes any
+  dialog
 - auto-growing composer with a send button
-- headless UI tests (`iced_test`) plus unit tests; CI runs fmt, clippy, tests
-  and a release build on every push
+- headless UI tests (`iced_test`) plus unit tests; CI runs fmt, clippy, tests,
+  a release build and cargo-deny on every push
 
-## Build
+## Build and run
 
-Requires a stable Rust toolchain.
+Requires a stable Rust toolchain and [Zig 0.17.0](https://ziglang.org/) for
+the daemon.
 
 ```sh
+# the engine: build once, init your identity, run the daemon
+cd core/zig && zig build -Doptimize=ReleaseSafe && cd ../..
+./core/zig/zig-out/bin/shopot-zig init
+./core/zig/zig-out/bin/shopot-zig serve
+
+# the client, in another terminal
 cargo run --release
 ```
+
+To meet someone, press «Пригласить» in the sidebar: the dialog shows your
+one-time invite code with a QR — hand it over out of band. To add a contact,
+paste their code into «Вставить чужой код» and press «Добавить»; the chat
+opens once both sides are known to the daemon. Right-click a contact to block
+or unblock them; Escape closes any dialog.
 
 ## The core
 
 shopot itself is the client; the engine — encrypted P2P transport, sessions,
 storage — lives in [shopot-core](https://github.com/Puxxalwl/shopot-core) by
-[puxxalwl](https://github.com/Puxxalwl). The pinned API contract is vendored
+[puxxalwl](https://github.com/puxxalwl). The pinned API contract is vendored
 as the `core` git submodule (binary protocol spec:
-`core/zig/docs/CORE-API.md`); build the daemon with Zig 0.17.0:
-
-```sh
-cd core/zig && zig build -Doptimize=ReleaseSafe
-```
+`core/zig/docs/CORE-API.md`).
 
 ## License
 
