@@ -255,6 +255,13 @@ impl Store {
         }
     }
 
+    /// Ответ BLOCK_CONTACT/UNBLOCK_CONTACT: флаг блокировки контакта.
+    pub fn set_blocked(&mut self, cid: Cid, blocked: bool) {
+        if let Some(contact) = self.contacts.get_mut(&cid) {
+            contact.blocked = blocked;
+        }
+    }
+
     pub fn thread(&self, cid: Cid) -> Option<&Thread> {
         self.threads.get(&cid)
     }
@@ -438,6 +445,20 @@ mod tests {
 
         store.rename_contact(Cid(7), "Настоящее имя");
         assert_eq!(store.contact(Cid(7)).unwrap().name, "Настоящее имя");
+    }
+
+    #[test]
+    fn block_unblock_sets_flag() {
+        let mut store = Store::new();
+        store.replace_contacts(vec![contact(1, "Аня", true)]);
+        assert!(!store.contact(Cid(1)).unwrap().blocked);
+
+        store.set_blocked(Cid(1), true);
+        assert!(store.contact(Cid(1)).unwrap().blocked);
+        store.set_blocked(Cid(1), false);
+        assert!(!store.contact(Cid(1)).unwrap().blocked);
+        // Неизвестный cid молча игнорируется — это данные, не баг.
+        store.set_blocked(Cid(99), true);
     }
 
     #[test]
