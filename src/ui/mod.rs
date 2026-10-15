@@ -1229,3 +1229,60 @@ fn date_label(ts_ms: i64) -> String {
         format!("{} {}", date.day(), MONTHS[date.month0() as usize])
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core_link::mock::{MockLink, Scene};
+    use crate::model::store::Contact;
+
+    fn state() -> State<MockLink> {
+        State::new(Arc::new(MockLink::new(Scene::smoke())))
+    }
+
+    fn contact(cid: i64, name: &str) -> Contact {
+        Contact {
+            cid: Cid(cid),
+            name: name.to_owned(),
+            online: true,
+            blocked: false,
+        }
+    }
+
+    /// Ctrl+1..9 в headless-эмуляторе не вводятся — путь проверяем
+    /// напрямую через update() (привязка композера и подписка ведут в
+    /// тот же ChatIn::SelectIndex).
+    #[test]
+    fn select_index_opens_chat_in_sidebar_order() {
+        let mut state = state();
+        state.store.replace_contacts(vec![
+            contact(1, "Аня"),
+            contact(2, "Борис"),
+            contact(3, "Вера"),
+        ]);
+
+        let _ = update(&mut state, Message::Chat(ChatIn::SelectIndex(2)));
+        assert_eq!(state.store.selected(), Some(Cid(3)));
+        let _ = update(&mut state, Message::Chat(ChatIn::SelectIndex(0)));
+        assert_eq!(state.store.selected(), Some(Cid(1)));
+    }
+
+    #[test]
+    fn select_index_beyond_contacts_is_noop() {
+        let mut state = state();
+        state.store.replace_contacts(vec![contact(1, "Аня")]);
+
+        let _ = update(&mut state, Message::Chat(ChatIn::SelectIndex(5)));
+        assert_eq!(state.store.selected(), None, "лишний номер молчится");
+    }
+
+    #[test]
+    fn chat_index_maps_digit_row() {
+        use iced::keyboard::key::Code;
+        for (code, index) in [(Code::Digit1, 0), (Code::Digit5, 4), (Code::Digit9, 8)] {
+            assert_eq!(chat_index(&code), Some(index));
+        }
+        assert_eq!(chat_index(&Code::Digit0), None, "Ctrl+0 не назначен");
+        assert_eq!(chat_index(&Code::KeyA), None);
+    }
+}

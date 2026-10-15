@@ -129,10 +129,19 @@ fn right_click(text: &str) -> [Instruction; 2] {
 
 #[test]
 fn smoke_scenarios() {
+    // Крюк ui::notify::os_notify: в headless-тестах нет десктопа —
+    // входящие из сцены не должны всплывать уведомлениями ОС.
+    std::env::set_var("SHOPOT_NO_NOTIFY", "1");
     contacts_reply_populates_sidebar();
     incoming_message_counts_unread();
     send_flow_shows_delivered_and_autoreply();
     meet_scenarios();
+    polish_scenarios();
+}
+
+/// Полировка MVP (S3): настройки — приватность, компакт, масштаб; Esc.
+fn polish_scenarios() {
+    settings_overlay_toggles_and_closes();
 }
 
 /// Знакомство (S2): инвайт-диалог и блокировка через меню.
@@ -516,6 +525,79 @@ fn escape_closes_overlay() {
 
     let (state, _) = emu.into_state();
     assert!(state.overlay_closed(), "Esc закрыл инвайт-диалог");
+}
+
+/// Настройки (S3): галки приватности и компакта, кнопки масштаба,
+/// Esc закрывает панель. Значения сверяются по Store — рендер читает
+/// его в том же кадре.
+fn settings_overlay_toggles_and_closes() {
+    let program = app::program(Link::new(Scene::smoke()));
+    let (sender, mut receiver) = mpsc::channel(512);
+    let mut emu = Emulator::new(
+        sender,
+        &program,
+        Mode::Immediate,
+        iced::Size::new(1000.0, 700.0),
+    );
+    run_instruction(
+        &mut emu,
+        &program,
+        &mut receiver,
+        Instruction::Expect(Expectation::Text("Аня".into())),
+    );
+    // Фокус композера: Esc пойдёт через его привязку (подписка в
+    // headless-эмуляторе событий не получает).
+    let [press, release] = click("Аня");
+    run_instruction(&mut emu, &program, &mut receiver, press);
+    run_instruction(&mut emu, &program, &mut receiver, release);
+
+    let [press, release] = click("Настройки");
+    run_instruction(&mut emu, &program, &mut receiver, press);
+    run_instruction(&mut emu, &program, &mut receiver, release);
+    run_instruction(
+        &mut emu,
+        &program,
+        &mut receiver,
+        Instruction::Expect(Expectation::Text("Скрывать текст в уведомлениях".into())),
+    );
+
+    // Приватность: скрытие текста выключаем (по умолчанию включено).
+    let [press, release] = click("Скрывать текст в уведомлениях");
+    run_instruction(&mut emu, &program, &mut receiver, press);
+    run_instruction(&mut emu, &program, &mut receiver, release);
+    // Компактная лента: включаем.
+    let [press, release] = click("Компактная лента — без пузырей, всё слева");
+    run_instruction(&mut emu, &program, &mut receiver, press);
+    run_instruction(&mut emu, &program, &mut receiver, release);
+    // Масштаб: шаг вверх и шаг вниз.
+    let [press, release] = click("Увеличить");
+    run_instruction(&mut emu, &program, &mut receiver, press);
+    run_instruction(&mut emu, &program, &mut receiver, release);
+    let [press, release] = click("Уменьшить");
+    run_instruction(&mut emu, &program, &mut receiver, press);
+    run_instruction(&mut emu, &program, &mut receiver, release);
+
+    run_instruction(
+        &mut emu,
+        &program,
+        &mut receiver,
+        Instruction::Interact(Interaction::Keyboard(Keyboard::Type(Key::Escape))),
+    );
+    pump(&mut emu, &program, &mut receiver, 300);
+
+    let (state, _) = emu.into_state();
+    assert!(state.overlay_closed(), "Esc закрыл панель настроек");
+    let settings = &state.store.settings;
+    assert!(
+        !settings.hide_notification_text,
+        "галка приватности переключена"
+    );
+    assert!(settings.compact, "компактная лента включена");
+    assert!(
+        (settings.font_scale - 1.0).abs() < 1e-6,
+        "масштаб вернулся к 100%, а не {}",
+        settings.font_scale
+    );
 }
 
 /// Скриншот демо-сцены для ручной визуальной приёмки.
