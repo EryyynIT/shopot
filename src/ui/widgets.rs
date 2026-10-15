@@ -151,6 +151,8 @@ pub fn message_group(group: &FeedItem) -> Vec<Element<'static, Message>> {
         Some(match send {
             SendState::Sending => ("отправляю".to_owned(), palette::DIM),
             SendState::Sent => ("отправлено".to_owned(), palette::DIM),
+            SendState::Queued => ("отправится позже".to_owned(), palette::DIM),
+            SendState::Delivered => ("доставлено".to_owned(), palette::OK),
             SendState::Failed(reason) => (format!("не ушло: {reason}"), palette::ERR),
         })
     } else {

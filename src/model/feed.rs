@@ -135,7 +135,7 @@ mod tests {
     use crate::model::msg::{Msg, MsgId, SendState};
 
     fn incoming(id: u64, ts: i64, body: &str) -> Msg {
-        Msg::incoming(MsgId(id), Cid(1), ts, body.to_owned())
+        Msg::incoming(MsgId(id), Cid(1), ts, body.to_owned(), None)
     }
 
     fn outgoing(id: u64, ts: i64, body: &str) -> Msg {

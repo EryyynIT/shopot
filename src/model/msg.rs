@@ -4,10 +4,25 @@ use std::fmt;
 
 use crate::model::cid::Cid;
 
-/// Идентификатор сообщения. Пока ядро не отдаёт `imsg`, клиент
-/// генерирует свои: дедуп и реакции появятся вместе с `imsg`.
+/// Локальный номер строки ленты — ключ UI (привязка ответа к пузырю).
+/// Не путать с [`CoreMsgId`]: настоящий msg_id ядра живёт в `Msg::core_id`.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
 pub struct MsgId(pub u64);
+
+/// msg_id ядра: 16 случайных байт, идентифицируют сообщение глобально
+/// (CORE-API.md §1). У моих сообщений появляется после ответа SEND_MESSAGE,
+/// у чужих — приходит в событии MESSAGE_RECEIVED.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
+pub struct CoreMsgId(pub [u8; 16]);
+
+impl fmt::Display for CoreMsgId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for byte in self.0 {
+            write!(f, "{byte:02x}")?;
+        }
+        Ok(())
+    }
+}
 
 impl fmt::Display for MsgId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -26,12 +41,16 @@ pub enum Dir {
     Sys,
 }
 
-/// Честный статус отправки: три состояния, пока нет outbox ядра.
-/// Никаких «доставлено/прочитано» без квитанции от ядра.
+/// Честный статус отправки — жизненный цикл моего сообщения
+/// по модели доставки ядра (CORE-API.md §6).
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum SendState {
     Sending,
     Sent,
+    /// Ядро положило сообщение в outbox: уйдёт, когда контакт появится.
+    Queued,
+    /// Пир подтвердил ACK — сообщение на его устройстве.
+    Delivered,
     /// Не ушло + причина для пользователя.
     Failed(String),
 }
@@ -44,16 +63,25 @@ pub struct Msg {
     pub ts_ms: i64,
     pub body: String,
     pub send: SendState,
+    /// msg_id ядра, если известен; по нему приходит MESSAGE_DELIVERED.
+    pub core_id: Option<CoreMsgId>,
 }
 
 impl Msg {
-    pub fn incoming(id: MsgId, cid: Cid, ts_ms: i64, body: String) -> Self {
+    pub fn incoming(
+        id: MsgId,
+        cid: Cid,
+        ts_ms: i64,
+        body: String,
+        core_id: Option<CoreMsgId>,
+    ) -> Self {
         Self {
             id,
             dir: Dir::In(cid),
             ts_ms,
             body,
             send: SendState::Sent,
+            core_id,
         }
     }
 
@@ -64,6 +92,7 @@ impl Msg {
             ts_ms,
             body,
             send: SendState::Sending,
+            core_id: None,
         }
     }
 
@@ -74,6 +103,7 @@ impl Msg {
             ts_ms,
             body,
             send: SendState::Sent,
+            core_id: None,
         }
     }
 

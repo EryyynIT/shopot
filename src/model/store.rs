@@ -4,7 +4,7 @@ use std::collections::HashMap;
 
 use crate::model::cid::Cid;
 use crate::model::feed::{self, FeedItem};
-use crate::model::msg::{Msg, MsgId, SendState};
+use crate::model::msg::{CoreMsgId, Msg, MsgId, SendState};
 
 /// Контакт.
 #[derive(Clone, Debug)]
@@ -15,9 +15,8 @@ pub struct Contact {
     pub blocked: bool,
 }
 
-/// Состояние защищённой сессии с контактом. Пока ядро присылает сессию
-/// только текстом sys-строк — разбираем их подписи (I-15); в S5 заменить
-/// на структурированное событие (Q15 бэкенду).
+/// Состояние защищённой сессии с контактом. Ядро отдельного события сессии
+/// не шлёт: сессия = живое соединение, поэтому её определяет PRESENCE.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Session {
     #[default]
@@ -88,8 +87,39 @@ impl Store {
         }
     }
 
-    /// Входящее сообщение. От неизвестного — контакт создаётся (имя из события).
+    /// Входящее сообщение от известного/нового контакта; имя — из события.
+    /// Новые сообщения ядра идут через [`Self::push_incoming_core`].
     pub fn push_incoming(&mut self, cid: Cid, name: &str, msg_id: MsgId, ts_ms: i64, text: String) {
+        self.push_incoming_impl(cid, name, None, msg_id, ts_ms, text);
+    }
+
+    /// Входящее сообщение с настоящим msg_id ядра (событие MESSAGE_RECEIVED).
+    pub fn push_incoming_core(
+        &mut self,
+        cid: Cid,
+        name: &str,
+        core_id: CoreMsgId,
+        ts_ms: i64,
+        text: String,
+    ) {
+        let local = self.next_local_id();
+        self.push_incoming_impl(cid, name, Some(core_id), local, ts_ms, text);
+    }
+
+    fn next_local_id(&mut self) -> MsgId {
+        self.next_msg_id += 1;
+        MsgId(self.next_msg_id)
+    }
+
+    fn push_incoming_impl(
+        &mut self,
+        cid: Cid,
+        name: &str,
+        core_id: Option<CoreMsgId>,
+        msg_id: MsgId,
+        ts_ms: i64,
+        text: String,
+    ) {
         let fresh = !self.contacts.contains_key(&cid);
         if fresh {
             self.order.push(cid);
@@ -107,13 +137,14 @@ impl Store {
         let unread = if self.selected == Some(cid) { 0 } else { 1 };
         let thread = self.threads.entry(cid).or_default();
         thread.unread += unread;
-        thread.msgs.push(Msg::incoming(msg_id, cid, ts_ms, text));
+        thread
+            .msgs
+            .push(Msg::incoming(msg_id, cid, ts_ms, text, core_id));
     }
 
     /// Моё сообщение: сразу `Sending`, идентификатор выдаёт Store.
     pub fn push_outgoing(&mut self, cid: Cid, ts_ms: i64, text: String) -> MsgId {
-        self.next_msg_id += 1;
-        let id = MsgId(self.next_msg_id);
+        let id = self.next_local_id();
         self.threads
             .entry(cid)
             .or_default()
@@ -122,18 +153,13 @@ impl Store {
         id
     }
 
+    /// Служебная строка ядра в ленте (контакт подключился, заблокировал…).
     pub fn push_sys(&mut self, cid: Cid, ts_ms: i64, text: String) {
-        let thread = self.threads.entry(cid).or_default();
-        // Хак до Q15: событие сессии приходит строкой. Подписи — из
-        // демо-сцены/ядра; ложные срабатывания на обычных сообщениях
-        // исключены: push_sys вызывается только для sys-событий.
-        if text.contains("сессия установлена") {
-            thread.session = Session::Up;
-        } else if text.contains("сессия разорвана") || text.contains("сессия закрыта")
-        {
-            thread.session = Session::Down;
-        }
-        thread.msgs.push(Msg::sys(ts_ms, text));
+        self.threads
+            .entry(cid)
+            .or_default()
+            .msgs
+            .push(Msg::sys(ts_ms, text));
     }
 
     /// Состояние сессии с контактом — для подзаголовка шапки чата.
@@ -148,25 +174,84 @@ impl Store {
         self.set_send_state(cid, msg_id, SendState::Sent);
     }
 
+    /// Ответ SEND_MESSAGE: сообщение ушло в сессию, ядровый msg_id привязан.
+    pub fn mark_sent_core(&mut self, cid: Cid, msg_id: MsgId, core_id: CoreMsgId) {
+        if let Some(msg) = self.msg_mut(cid, msg_id) {
+            msg.core_id = Some(core_id);
+            msg.send = SendState::Sent;
+        }
+    }
+
+    /// Ответ SEND_MESSAGE с queued=1: сообщение в outbox, уедет при онлайне.
+    pub fn mark_queued(&mut self, cid: Cid, msg_id: MsgId) {
+        self.set_send_state(cid, msg_id, SendState::Queued);
+    }
+
     pub fn mark_failed(&mut self, cid: Cid, msg_id: MsgId, reason: String) {
         self.set_send_state(cid, msg_id, SendState::Failed(reason));
     }
 
-    fn set_send_state(&mut self, cid: Cid, msg_id: MsgId, send: SendState) {
+    /// Событие MESSAGE_DELIVERED: пир подтвердил получение по msg_id ядра.
+    pub fn mark_delivered(&mut self, cid: Cid, core_id: CoreMsgId) {
         let Some(thread) = self.threads.get_mut(&cid) else {
             return;
         };
         for msg in thread.msgs.iter_mut().rev() {
-            if msg.id == msg_id {
-                msg.send = send;
+            if msg.core_id == Some(core_id) {
+                msg.send = SendState::Delivered;
                 return;
             }
         }
     }
 
+    fn msg_mut(&mut self, cid: Cid, msg_id: MsgId) -> Option<&mut Msg> {
+        self.threads
+            .get_mut(&cid)?
+            .msgs
+            .iter_mut()
+            .rev()
+            .find(|m| m.id == msg_id)
+    }
+
+    fn set_send_state(&mut self, cid: Cid, msg_id: MsgId, send: SendState) {
+        if let Some(msg) = self.msg_mut(cid, msg_id) {
+            msg.send = send;
+        }
+    }
+
+    /// PRESENCE ядра: онлайн-флаг и производная от него сессия.
     pub fn set_presence(&mut self, cid: Cid, online: bool) {
         if let Some(contact) = self.contacts.get_mut(&cid) {
             contact.online = online;
+        }
+        if let Some(thread) = self.threads.get_mut(&cid) {
+            thread.session = if online { Session::Up } else { Session::Down };
+        }
+    }
+
+    /// Контакт появился (CONTACT_JOINED): создаём, не трогая существующего.
+    pub fn ensure_contact(&mut self, cid: Cid, name: &str) -> bool {
+        if self.contacts.contains_key(&cid) {
+            return false;
+        }
+        self.order.push(cid);
+        self.threads.entry(cid).or_default();
+        self.contacts.insert(
+            cid,
+            Contact {
+                cid,
+                name: name.to_owned(),
+                online: false,
+                blocked: false,
+            },
+        );
+        true
+    }
+
+    /// CONTACT_PROFILE: имя контакта обновилось.
+    pub fn rename_contact(&mut self, cid: Cid, name: &str) {
+        if let Some(contact) = self.contacts.get_mut(&cid) {
+            contact.name = name.to_owned();
         }
     }
 
@@ -216,13 +301,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn sys_text_tracks_session_state() {
+    fn presence_drives_session_state() {
         let mut store = Store::default();
-        store.replace_contacts(vec![contact(1, "Аня", true)]);
+        store.replace_contacts(vec![contact(1, "Аня", false)]);
         assert_eq!(store.session(Cid(1)), Session::Unknown);
-        store.push_sys(Cid(1), 1_000, "сессия установлена".into());
+        store.set_presence(Cid(1), true);
         assert_eq!(store.session(Cid(1)), Session::Up);
-        store.push_sys(Cid(1), 2_000, "сессия разорвана".into());
+        store.set_presence(Cid(1), false);
         assert_eq!(store.session(Cid(1)), Session::Down);
     }
 
@@ -288,6 +373,71 @@ mod tests {
         );
         store.mark_sent(Cid(1), id);
         assert_eq!(store.thread(Cid(1)).unwrap().msgs[0].send, SendState::Sent);
+    }
+
+    /// Жизненный цикл по модели доставки ядра (CORE-API.md §6):
+    /// отправка → queued (контакт офлайн) → sent (ушло) → delivered (ACK).
+    #[test]
+    fn delivery_lifecycle_queued_sent_delivered() {
+        let mut store = Store::new();
+        store.replace_contacts(vec![contact(1, "Аня", false)]);
+
+        let id = store.push_outgoing(Cid(1), 1000, "привет".into());
+        store.mark_queued(Cid(1), id);
+        assert_eq!(
+            store.thread(Cid(1)).unwrap().msgs[0].send,
+            SendState::Queued,
+            "офлайн-отправка — это outbox, не ошибка"
+        );
+
+        let core = CoreMsgId([0xAA; 16]);
+        store.mark_sent_core(Cid(1), id, core);
+        assert_eq!(store.thread(Cid(1)).unwrap().msgs[0].send, SendState::Sent);
+        assert_eq!(store.thread(Cid(1)).unwrap().msgs[0].core_id, Some(core));
+
+        store.mark_delivered(Cid(1), core);
+        assert_eq!(
+            store.thread(Cid(1)).unwrap().msgs[0].send,
+            SendState::Delivered
+        );
+    }
+
+    #[test]
+    fn delivered_matches_by_core_id_of_mine_and_theirs() {
+        let mut store = Store::new();
+        store.replace_contacts(vec![contact(1, "Аня", true)]);
+        let mine = CoreMsgId([1; 16]);
+        let theirs = CoreMsgId([2; 16]);
+
+        let id = store.push_outgoing(Cid(1), 1000, "моё".into());
+        store.mark_sent_core(Cid(1), id, mine);
+        store.push_incoming_core(Cid(1), "Аня", theirs, 1100, "чужое".into());
+
+        store.mark_delivered(Cid(1), theirs);
+        assert_eq!(
+            store.thread(Cid(1)).unwrap().msgs[0].send,
+            SendState::Sent,
+            "чужой msg_id не трогает моё"
+        );
+        store.mark_delivered(Cid(1), mine);
+        assert_eq!(
+            store.thread(Cid(1)).unwrap().msgs[0].send,
+            SendState::Delivered
+        );
+    }
+
+    #[test]
+    fn contact_joined_creates_and_profile_renames() {
+        let mut store = Store::new();
+        assert!(store.ensure_contact(Cid(7), "Гость"));
+        assert!(store.contact(Cid(7)).is_some());
+        assert!(
+            !store.ensure_contact(Cid(7), "Дубль"),
+            "существующий не трогаем"
+        );
+
+        store.rename_contact(Cid(7), "Настоящее имя");
+        assert_eq!(store.contact(Cid(7)).unwrap().name, "Настоящее имя");
     }
 
     #[test]
