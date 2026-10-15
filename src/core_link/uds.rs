@@ -1,13 +1,17 @@
-//! UDS-транспорт бинарного API 1.0.0: соединение с демоном `shopot serve`
+//! UDS-транспорт бинарного API: соединение с демоном `shopot serve`
 //! (`$HOME/.shopot/api.sock`), корреляция ответов по request_id, события
 //! в поток, backoff-ресинк при обрыве. Здесь же раскладки payload методов
 //! и событий — структурный слой поверх кодека [`super::api`].
+//!
+//! Версия API демона выясняется на первом SEND_MESSAGE: API 2.x требует
+//! entity tail, API 1.x отвергает лишний байт (BadFrame) — клиент
+//! подстраивается и помнит выбор до конца соединения.
 
 use std::collections::HashMap;
 use std::future::Future;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -56,6 +60,10 @@ struct Inner {
     conn: Mutex<Option<mpsc::Sender<Vec<u8>>>>,
     pending: Pending,
     next_id: AtomicU32,
+    /// Демон говорил на API 2.x (SEND_MESSAGE требует entity tail).
+    /// Сбрасывается при каждом новом соединении — между ними демон
+    /// могли заменить.
+    api2: AtomicBool,
     events_tx: mpsc::Sender<LinkEvent>,
     events_rx: Mutex<Option<mpsc::Receiver<LinkEvent>>>,
 }
@@ -80,6 +88,7 @@ impl UdsLink {
                 conn: Mutex::new(None),
                 pending: Arc::new(Mutex::new(HashMap::new())),
                 next_id: AtomicU32::new(1),
+                api2: AtomicBool::new(false),
                 events_tx,
                 events_rx: Mutex::new(Some(events_rx)),
             }),
@@ -126,6 +135,7 @@ impl Inner {
             match UnixStream::connect(&self.path).await {
                 Ok(stream) => {
                     backoff = self.backoff;
+                    self.api2.store(false, Ordering::Relaxed);
                     let _ = self.events_tx.send(LinkEvent::Resync).await;
                     self.serve(stream).await;
                     let _ = self.events_tx.send(LinkEvent::Down).await;
@@ -219,7 +229,27 @@ impl Inner {
     }
 
     async fn request(&self, request: Request) -> Reply {
-        let (method, payload) = encode_request(&request);
+        let api2 = self.api2.load(Ordering::Relaxed);
+        let (method, payload) = encode_request(&request, api2);
+        let reply = self.roundtrip(method, payload).await;
+
+        // Первый SEND_MESSAGE — зонд версии: API 2.x отвечает BadFrame на
+        // payload без entity tail. Повторяем с хвостом и запоминаем версию
+        // до конца соединения. Иной BadFrame на валидном тексте ядро не
+        // вернёт, ложных срабатываний нет.
+        if method == Method::SendMessage
+            && !api2
+            && reply == Err(LinkError::Kernel(Status::BadFrame))
+        {
+            self.api2.store(true, Ordering::Relaxed);
+            let (method, payload) = encode_request(&request, true);
+            return self.roundtrip(method, payload).await;
+        }
+        reply
+    }
+
+    /// Один запрос-ответ: request_id, кадр, ожидание с таймаутом.
+    async fn roundtrip(&self, method: Method, payload: Vec<u8>) -> Reply {
         let request_id = self.next_id.fetch_add(1, Ordering::Relaxed);
 
         // Лок берём только чтобы клонировать очередь записи: никакие
@@ -292,13 +322,21 @@ fn resolve_pending(pending: &Pending, header: Header, payload: Vec<u8>) {
 }
 
 /// Запрос → метод API + payload (раскладки — CORE-API.md §4).
-fn encode_request(request: &Request) -> (Method, Vec<u8>) {
+/// `api2` — демон выяснен как API 2.x: SEND_MESSAGE дополняется
+/// entity tail (пустой список сущностей).
+fn encode_request(request: &Request, api2: bool) -> (Method, Vec<u8>) {
     let mut payload = Vec::new();
     let method = match request {
         Request::Contacts => Method::ListContacts,
         Request::SendMsg { cid, text } => {
             api::put::u32(&mut payload, cid.0 as u32);
             api::put::str16(&mut payload, text).expect("текст уже проверен на 4096");
+            if api2 {
+                // Entity tail (API 2.x): список сущностей разметки — у
+                // нас их нет. API 1.x лишний байт отвергает, поэтому
+                // хвост ставится только после BadFrame от демона.
+                payload.push(0);
+            }
             Method::SendMessage
         }
         // my_name пустой — ядро подставит «друг».
@@ -606,13 +644,35 @@ mod tests {
 
         let (header, payload) = read_frame(&mut stream).await;
         assert_eq!(header.id, Method::SendMessage as u16);
+        // Первый payload без tail: версия API демона ещё не выяснена.
         let mut r = api::Reader::new(&payload);
         assert_eq!(r.read_u32(), Ok(3));
         assert_eq!(
             r.read_str16().map(|b| std::str::from_utf8(b).unwrap()),
             Ok("привет")
         );
+        assert!(!r.has_more(), "до выяснения версии API tail не ставится");
+        // Ядро API 2.x отвечает BadFrame — зонд версии сработал.
+        stream
+            .write_all(&response_frame(
+                Method::SendMessage as u16,
+                header.request_id,
+                Status::BadFrame,
+                &[],
+            ))
+            .await
+            .expect("ответ отправлен");
 
+        // Повтор с entity tail (ent_count = 0) и успешный ответ.
+        let (header, payload) = read_frame(&mut stream).await;
+        let mut r = api::Reader::new(&payload);
+        assert_eq!(r.read_u32(), Ok(3));
+        assert_eq!(
+            r.read_str16().map(|b| std::str::from_utf8(b).unwrap()),
+            Ok("привет")
+        );
+        assert_eq!(r.read_u8(), Ok(0), "entity tail: ent_count = 0");
+        assert!(!r.has_more(), "после tail payload исчерпан");
         let mut answer = Vec::new();
         answer.extend_from_slice(&[0xAB; 16]);
         api::put::u8(&mut answer, 1);
@@ -631,10 +691,11 @@ mod tests {
                 msg_id: CoreMsgId([0xAB; 16]),
                 queued: true
             }),
-            "queued=1 — сообщение в outbox ядра"
+            "BadFrame без tail → повтор с tail, сообщение ушло"
         );
 
-        // Второй запрос — ядро отвечает машинным кодом.
+        // Второй запрос — версия уже известна, tail ставится сразу,
+        // а ядро отвечает машинным кодом.
         let task = {
             let link = Arc::clone(&link);
             tokio::spawn(async move {
@@ -648,7 +709,11 @@ mod tests {
                 .await
             })
         };
-        let (header, _) = read_frame(&mut stream).await;
+        let (header, payload) = read_frame(&mut stream).await;
+        let mut r = api::Reader::new(&payload);
+        assert_eq!(r.read_u32(), Ok(3));
+        assert!(r.read_str16().is_ok());
+        assert_eq!(r.read_u8(), Ok(0), "версия запомнена: tail сразу");
         stream
             .write_all(&response_frame(
                 Method::SendMessage as u16,
