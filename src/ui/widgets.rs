@@ -11,8 +11,10 @@ use crate::model::msg::SendState;
 use crate::ui::palette;
 use crate::ui::{time_hm, ChatIn, Message};
 
-/// Строка сайдбара: акцентная полоса выбранного, точка presence,
-/// имя, бейдж непрочитанных. Владеет данными — строится внутри lazy.
+/// Строка сайдбара: акцентная полоса у самого края карточки, точка
+/// presence, имя, бейдж непрочитанных. Высота карточки фиксированная —
+/// полоса с Fill тянется ровно на неё, а не распирает весь список
+/// (правка осмотра окна: строки растягивались на всю высоту сайдбара).
 pub fn contact_row(
     cid: Cid,
     name: &str,
@@ -45,7 +47,10 @@ pub fn contact_row(
         })
         .width(Length::Fill);
 
-    let mut cells = row![bar, dot, name].spacing(8);
+    let mut cells = row![bar, dot, name]
+        .spacing(8)
+        .height(Length::Fill)
+        .align_y(iced::alignment::Vertical::Center);
     if has_unread {
         cells = cells.push(
             container(text(unread.to_string()).size(11))
@@ -59,19 +64,16 @@ pub fn contact_row(
         );
     }
 
-    button(
-        cells
-            .padding(Padding {
-                top: 6.0,
-                right: 8.0,
-                bottom: 6.0,
-                left: 8.0,
-            })
-            .align_y(iced::alignment::Vertical::Center),
-    )
+    button(cells.padding(Padding {
+        top: 0.0,
+        right: 10.0,
+        bottom: 0.0,
+        left: 0.0,
+    }))
     .on_press(Message::Chat(ChatIn::Select(cid)))
     .style(palette::chat_row(selected))
     .width(Length::Fill)
+    .height(Length::Fixed(56.0))
     .into()
 }
 
@@ -93,9 +95,10 @@ pub fn date_sep(ts_ms: i64) -> Element<'static, Message> {
     .into()
 }
 
-/// Служебная строка ядра: серым, мелко, по центру.
+/// Служебная строка ядра: цветом WARN — событие важное для безопасности
+/// и не должно сливаться с разделителями дат.
 pub fn sys_line(body: String) -> Element<'static, Message> {
-    container(text(body).size(11).color(palette::DIM))
+    container(text(body).size(11).color(palette::WARN))
         .width(Length::Fill)
         .align_x(Horizontal::Center)
         .padding(Padding {
@@ -107,12 +110,13 @@ pub fn sys_line(body: String) -> Element<'static, Message> {
         .into()
 }
 
-/// Группа сообщений одного автора: метка (имя + время) у первой строки,
-/// статус отправки — под моей группой.
+/// Группа сообщений одного автора: пузыри моей стороны справа, чужие
+/// слева; время и статус отправки — мелкой строкой внутри последнего
+/// пузыря (правка осмотра окна: метка над пузырём жила в другой колонке).
 pub fn message_group(group: &FeedItem) -> Vec<Element<'static, Message>> {
     let FeedItem::Group {
         mine,
-        name,
+        name: _,
         ts_ms,
         bodies,
         send,
@@ -122,73 +126,84 @@ pub fn message_group(group: &FeedItem) -> Vec<Element<'static, Message>> {
         return Vec::new();
     };
 
-    let mut elements = Vec::with_capacity(bodies.len() + 2);
+    let align_x = if *mine {
+        Horizontal::Right
+    } else {
+        Horizontal::Left
+    };
+    let wrap = |inner: iced::Element<'static, Message>| {
+        container(inner)
+            .width(Length::Fill)
+            .align_x(align_x)
+            .padding(Padding {
+                top: 1.0,
+                right: 2.0,
+                bottom: 1.0,
+                left: 2.0,
+            })
+            .into()
+    };
 
-    let author = if *mine { "я".to_owned() } else { name.clone() };
-    elements.push(
-        container(
-            text(format!("{author} {}", time_hm(*ts_ms)))
-                .size(11)
-                .font(palette::bold())
-                .color(palette::DIM),
-        )
-        .width(Length::Fill)
-        .align_x(if *mine {
-            Horizontal::Right
-        } else {
-            Horizontal::Left
-        })
-        .padding(Padding {
-            top: 6.0,
-            right: 2.0,
-            bottom: 0.0,
-            left: 2.0,
-        })
-        .into(),
-    );
-
-    for (_, body) in bodies {
-        // Длинные тексты — без пузыря, на всю ширину (GUI_STYLE.md §2).
-        let long = body.len() > 300;
-        let bubble_style: fn(&iced::Theme) -> iced::widget::container::Style = if long {
-            palette::no_bubble
-        } else if *mine {
-            palette::bubble_mine
-        } else {
-            palette::bubble_theirs
-        };
-        elements.push(
-            container(text(body.to_owned()).size(13).color(palette::TEXT))
-                .max_width(560)
-                .padding(Padding {
-                    top: 4.0,
-                    right: 10.0,
-                    bottom: 4.0,
-                    left: 10.0,
-                })
-                .style(bubble_style)
-                .into(),
-        );
-    }
-
-    if *mine {
-        let (label, color) = match send {
+    // Подвал: время + статус отправки (только у меня) — «часики у галочек».
+    let status = if *mine {
+        Some(match send {
             SendState::Sending => ("отправляю".to_owned(), palette::DIM),
             SendState::Sent => ("отправлено".to_owned(), palette::DIM),
             SendState::Failed(reason) => (format!("не ушло: {reason}"), palette::ERR),
-        };
-        elements.push(
-            container(text(label).size(11).color(color))
-                .width(Length::Fill)
-                .align_x(Horizontal::Right)
-                .padding(Padding {
-                    top: 1.0,
-                    right: 4.0,
-                    bottom: 4.0,
-                    left: 0.0,
-                })
-                .into(),
-        );
+        })
+    } else {
+        None
+    };
+    let footer = || {
+        let mut foot = row![text(time_hm(*ts_ms)).size(10).color(palette::MUTED)].spacing(4.0);
+        if let Some((label, color)) = &status {
+            foot = foot.push(text(label.clone()).size(10).color(*color));
+        }
+        foot
+    };
+
+    let mut elements: Vec<Element<'static, Message>> = Vec::with_capacity(bodies.len());
+    let mut pending_bubble: Option<iced::widget::Column<'static, Message>> = None;
+    let count = bodies.len();
+
+    for (index, (_, body)) in bodies.iter().enumerate() {
+        let last = index + 1 == count;
+        let body_text = text(body.to_owned()).size(14).color(palette::TEXT);
+
+        // Длинные тексты — без пузыря, на всю ширину (GUI_STYLE.md §2).
+        if body.len() > 300 {
+            if let Some(bubble) = pending_bubble.take() {
+                elements.push(wrap(bubble.into()));
+            }
+            let mut block = iced::widget::Column::new()
+                .push(
+                    container(body_text)
+                        .max_width(560)
+                        .padding(Padding {
+                            top: 3.0,
+                            right: 4.0,
+                            bottom: 3.0,
+                            left: 4.0,
+                        })
+                        .style(palette::no_bubble),
+                )
+                .align_x(align_x);
+            if last {
+                block = block.push(footer());
+            }
+            elements.push(wrap(block.into()));
+        } else {
+            let taken = pending_bubble.take().unwrap_or_else(|| {
+                iced::widget::Column::new()
+                    .spacing(2)
+                    .align_x(Horizontal::Right)
+            });
+            pending_bubble = Some(taken.push(body_text));
+        }
+    }
+    if let Some(mut bubble) = pending_bubble.take() {
+        bubble = bubble.push(footer());
+        elements.push(wrap(bubble.into()));
     }
 
     elements
