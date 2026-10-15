@@ -46,9 +46,18 @@ pub fn program<L: CoreLink>(
         .window(iced::window::Settings {
             size: iced::Size::new(1000.0, 700.0),
             min_size: Some(iced::Size::new(800.0, 560.0)),
+            icon: Some(window_icon()),
             ..Default::default()
         })
         .subscription(subscription)
+}
+
+/// Иконка окна из вшитого RGBA-ассета (генерируется tools/gen_icon.py).
+fn window_icon() -> iced::window::Icon {
+    // Распаковка не может упасть: ассет ровно 256×256×4 байта, что
+    // проверено генератором и тестом длины файла.
+    iced::window::icon::from_rgba(include_bytes!("../assets/icon.rgba").to_vec(), 256, 256)
+        .expect("вшитая иконка корректна: 256×256×4 байта")
 }
 
 /// Загрузчик приложения: держит линк для boot.
@@ -107,4 +116,18 @@ fn link_task<L: CoreLink>(link: Arc<L>, request: Request, tag: Option<MsgId>) ->
             tag,
         })
     })
+}
+
+#[cfg(test)]
+mod tests {
+    /// Ассет иконки обязан совпадать по размеру с заявленным в window_icon:
+    /// иначе распаковка упадёт уже в рантайме у пользователя.
+    #[test]
+    fn embedded_icon_is_256_squared_rgba() {
+        let bytes = include_bytes!("../assets/icon.rgba");
+        assert_eq!(bytes.len(), 256 * 256 * 4, "иконка ровно 256×256×4");
+        let icon =
+            iced::window::icon::from_rgba(include_bytes!("../assets/icon.rgba").to_vec(), 256, 256);
+        assert!(icon.is_ok(), "распаковка успешна");
+    }
 }
