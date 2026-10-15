@@ -3,7 +3,7 @@
 //! состояний. Никаких цветов мимо этого модуля.
 
 use iced::border::Radius;
-use iced::widget::{button, container, text};
+use iced::widget::{button, container, text, text_editor};
 use iced::{Background, Border, Color, Theme};
 
 /// Основной фон окна.
@@ -17,6 +17,10 @@ pub const LINE: Color = Color::from_rgb8(0x2A, 0x2F, 0x36);
 /// Основной текст.
 pub const TEXT: Color = Color::from_rgb8(0xCD, 0xD3, 0xDA);
 /// Второстепенный текст: время, подсказки, служебное.
+/// Приглушённый текст: подписи и метки времени внутри пузырей.
+pub const MUTED: Color = Color::from_rgb8(0x9A, 0xA4, 0xB0);
+
+/// Приглушённый текст: хинты, выключенные опции.
 pub const DIM: Color = Color::from_rgb8(0x7D, 0x85, 0x8F);
 /// Единственный акцент (тот же hue, что cyan в TUI).
 pub const ACCENT: Color = Color::from_rgb8(0x4C, 0xC2, 0xFF);
@@ -59,11 +63,11 @@ pub fn panel(_: &Theme) -> container::Style {
 /// Пузырь чужого сообщения.
 pub fn bubble_theirs(_: &Theme) -> container::Style {
     container::Style {
-        background: Some(Background::Color(RAISE)),
+        background: Some(Background::Color(Color::from_rgb8(0x2A, 0x30, 0x38))),
         border: Border {
             color: LINE,
-            width: 0.0,
-            radius: Radius::from(8.0),
+            width: 1.0,
+            radius: Radius::from(10.0),
         },
         ..Default::default()
     }
@@ -72,11 +76,11 @@ pub fn bubble_theirs(_: &Theme) -> container::Style {
 /// Пузырь моего сообщения: фон в полтона к акценту, без заливки акцентом.
 pub fn bubble_mine(_: &Theme) -> container::Style {
     container::Style {
-        background: Some(Background::Color(Color::from_rgb8(0x1E, 0x30, 0x3A))),
+        background: Some(Background::Color(Color::from_rgb8(0x1D, 0x3A, 0x4C))),
         border: Border {
             color: LINE,
             width: 0.0,
-            radius: Radius::from(8.0),
+            radius: Radius::from(10.0),
         },
         ..Default::default()
     }
@@ -139,6 +143,40 @@ pub fn chat_bar(selected: bool) -> impl Fn(&Theme) -> container::Style {
 pub fn no_bubble(_: &Theme) -> container::Style {
     container::Style {
         background: None,
+        ..Default::default()
+    }
+}
+
+/// Поле ввода: фон в тон пузырей, скругление; фокус — акцентная рамка.
+pub fn editor(_: &Theme, status: text_editor::Status) -> text_editor::Style {
+    let focused = matches!(status, text_editor::Status::Focused { .. });
+    text_editor::Style {
+        background: Background::Color(Color::from_rgb8(0x2A, 0x30, 0x38)),
+        border: Border {
+            color: if focused { ACCENT } else { LINE },
+            width: 1.0,
+            radius: Radius::from(10.0),
+        },
+        placeholder: DIM,
+        value: TEXT,
+        selection: Color::from_rgba8(0x4C, 0xC2, 0xFF, 0.30),
+    }
+}
+
+/// Главная кнопка действия: акцентная заливка, тёмный текст.
+pub fn button_accent(_: &Theme, status: button::Status) -> button::Style {
+    let (bg, fg) = match status {
+        button::Status::Disabled => (RAISE, DIM),
+        _ => (ACCENT, BG),
+    };
+    button::Style {
+        background: Some(Background::Color(bg)),
+        text_color: fg,
+        border: Border {
+            color: LINE,
+            width: 0.0,
+            radius: Radius::from(8.0),
+        },
         ..Default::default()
     }
 }
