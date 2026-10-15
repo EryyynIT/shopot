@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 
+use crate::core_link::HistoryMsg;
 use crate::model::cid::Cid;
 use crate::model::feed::{self, FeedItem};
 use crate::model::msg::{CoreMsgId, Msg, MsgId, SendState};
@@ -34,6 +35,12 @@ pub struct Thread {
     pub unread: u32,
     pub draft: String,
     pub session: Session,
+    /// GET_HISTORY уже запрашивался: пустой ответ не перезапрашиваем.
+    pub history_requested: bool,
+    /// Сколько записей ядра загружено в ленту (для окна догрузки).
+    pub history_loaded: u32,
+    /// Сколько записей у ядра всего (total из ответа GET_HISTORY).
+    pub history_total: u32,
 }
 
 /// Проекция ядра для UI. Пересобирается из contacts + событий.
@@ -304,6 +311,80 @@ impl Store {
         }
         items
     }
+
+    /// GET_HISTORY запрошен: пустой ответ не перезапрашиваем при
+    /// повторном открытии чата.
+    pub fn mark_history_requested(&mut self, cid: Cid) {
+        self.threads.entry(cid).or_default().history_requested = true;
+    }
+
+    pub fn history_requested(&self, cid: Cid) -> bool {
+        self.threads.get(&cid).is_some_and(|t| t.history_requested)
+    }
+
+    /// Сколько записей ядра уже загружено в ленту чата.
+    pub fn history_loaded(&self, cid: Cid) -> u32 {
+        self.threads
+            .get(&cid)
+            .map(|t| t.history_loaded)
+            .unwrap_or(0)
+    }
+
+    /// Есть ли в ядре ещё незагруженные сообщения. Потолок окна ядра
+    /// (HISTORY_MAX_LIMIT) останавливает догрузку: глубже окно не растёт.
+    pub fn has_more_history(&self, cid: Cid) -> bool {
+        let Some(thread) = self.threads.get(&cid) else {
+            return false;
+        };
+        thread.history_loaded < thread.history_total
+            && thread.history_loaded < crate::core_link::HISTORY_MAX_LIMIT
+    }
+
+    /// Ответ GET_HISTORY: записи дописываются В НАЧАЛО ленты (окно ядра —
+    /// новейшие, порядок старые → новые). Пересечения с живой лентой и
+    /// внутри партии дедуплицируются по core_id. Свои записи с ACK пира
+    /// восстанавливаются как «доставлено».
+    pub fn load_history(&mut self, cid: Cid, total: u32, records: &[HistoryMsg]) {
+        let known: std::collections::HashSet<CoreMsgId> = self
+            .threads
+            .get(&cid)
+            .map(|t| t.msgs.iter().filter_map(|m| m.core_id).collect())
+            .unwrap_or_default();
+        let mut batch: std::collections::HashSet<CoreMsgId> = std::collections::HashSet::new();
+        let mut fresh: Vec<Msg> = Vec::with_capacity(records.len());
+        for record in records {
+            let core_id = record.msg_id;
+            if known.contains(&core_id) || !batch.insert(core_id) {
+                continue;
+            }
+            let msg = if record.mine {
+                let mut msg =
+                    Msg::outgoing(self.next_local_id(), record.ts_ms, record.text.clone());
+                msg.core_id = Some(core_id);
+                msg.send = if record.delivered {
+                    SendState::Delivered
+                } else {
+                    SendState::Sent
+                };
+                msg
+            } else {
+                Msg::incoming(
+                    self.next_local_id(),
+                    cid,
+                    record.ts_ms,
+                    record.text.clone(),
+                    Some(core_id),
+                )
+            };
+            fresh.push(msg);
+        }
+        let thread = self.threads.entry(cid).or_default();
+        thread.history_loaded += fresh.len() as u32;
+        thread.history_total = thread.history_total.max(total);
+        let old = std::mem::take(&mut thread.msgs);
+        thread.msgs = fresh;
+        thread.msgs.extend(old);
+    }
 }
 
 #[cfg(test)]
@@ -473,6 +554,108 @@ mod tests {
         assert_eq!(store.draft(Cid(2)), "");
         store.set_draft(Cid(1), "".into());
         assert_eq!(store.draft(Cid(1)), "");
+    }
+
+    fn history(id: u8, mine: bool, delivered: bool, ts: i64, text: &str) -> HistoryMsg {
+        HistoryMsg {
+            mine,
+            delivered,
+            msg_id: CoreMsgId([id; 16]),
+            ts_ms: ts,
+            text: text.to_owned(),
+        }
+    }
+
+    /// Перезапуск GUI: лента пуста, GET_HISTORY восстанавливает переписку.
+    /// Свои доставленные — со статусом «доставлено».
+    #[test]
+    fn history_restores_feed_after_restart() {
+        let mut store = Store::new();
+        store.replace_contacts(vec![contact(1, "Аня", true)]);
+        store.load_history(
+            Cid(1),
+            3,
+            &[
+                history(1, false, false, 1000, "старое чужое"),
+                history(2, true, true, 2000, "старое моё"),
+            ],
+        );
+        let thread = store.thread(Cid(1)).unwrap();
+        assert_eq!(thread.msgs.len(), 2);
+        assert_eq!(
+            thread.msgs[0].body, "старое чужое",
+            "порядок старые → новые"
+        );
+        assert_eq!(thread.msgs[1].send, SendState::Delivered);
+        assert_eq!(thread.history_loaded, 2);
+        assert_eq!(thread.history_total, 3);
+        assert!(store.has_more_history(Cid(1)), "total 3 > loaded 2");
+
+        // Догрузка: дубликат уже загруженного отбрасывается, свежее
+        // встаёт перед живой лентой.
+        store.load_history(
+            Cid(1),
+            3,
+            &[
+                history(0, true, false, 500, "самое старое"),
+                history(1, false, false, 1000, "старое чужое"),
+            ],
+        );
+        let msgs = &store.thread(Cid(1)).unwrap().msgs;
+        assert_eq!(
+            msgs.iter().map(|m| m.body.as_str()).collect::<Vec<_>>(),
+            ["самое старое", "старое чужое", "старое моё"]
+        );
+        assert_eq!(store.thread(Cid(1)).unwrap().history_loaded, 3);
+        assert!(!store.has_more_history(Cid(1)), "всё загружено");
+    }
+
+    /// Пересечение окна догрузки с сообщениями, пришедшими живьём:
+    /// дедупликация по core_id, статусы живых не трогаются.
+    #[test]
+    fn history_dedupes_against_live_messages() {
+        let mut store = Store::new();
+        store.replace_contacts(vec![contact(1, "Аня", true)]);
+        let core = CoreMsgId([7; 16]);
+        let live = store.push_outgoing(Cid(1), 3000, "живое моё".into());
+        store.mark_sent_core(Cid(1), live, core);
+
+        store.load_history(Cid(1), 1, &[history(7, true, false, 3000, "живое моё")]);
+        let msgs = &store.thread(Cid(1)).unwrap().msgs;
+        assert_eq!(msgs.len(), 1, "дубликат ядра не добавлен");
+        assert_eq!(msgs[0].id, live, "живая строка сохранена");
+        assert_eq!(msgs[0].send, SendState::Sent, "статус не перезаписан");
+        assert_eq!(store.thread(Cid(1)).unwrap().history_loaded, 0);
+        assert_eq!(store.history_loaded(Cid(1)), 0);
+    }
+
+    /// Потолок окна ядра: loaded == 200 при большем total — догрузки нет.
+    #[test]
+    fn history_pagination_stops_at_kernel_window_cap() {
+        let mut store = Store::new();
+        store.replace_contacts(vec![contact(1, "Аня", true)]);
+        let records: Vec<HistoryMsg> = (0..200u8)
+            .map(|n| history(n, false, false, i64::from(n), "текст"))
+            .collect();
+        store.load_history(Cid(1), 500, &records);
+        assert_eq!(store.history_loaded(Cid(1)), 200);
+        assert!(
+            !store.has_more_history(Cid(1)),
+            "глубже окна ядра GUI не грузит: total 500, loaded 200"
+        );
+    }
+
+    /// Пустой ответ не перезапрашивается при каждом открытии чата.
+    #[test]
+    fn empty_history_is_not_rerequested() {
+        let mut store = Store::new();
+        store.replace_contacts(vec![contact(1, "Аня", true)]);
+        assert!(!store.history_requested(Cid(1)));
+        store.mark_history_requested(Cid(1));
+        assert!(store.history_requested(Cid(1)));
+        store.load_history(Cid(1), 0, &[]);
+        assert!(store.history_requested(Cid(1)));
+        assert!(!store.has_more_history(Cid(1)));
     }
 
     #[test]

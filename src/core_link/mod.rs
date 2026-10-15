@@ -26,6 +26,10 @@ pub fn now_ms() -> i64 {
     chrono::Utc::now().timestamp_millis()
 }
 
+/// Потолок окна GET_HISTORY на стороне ядра; больше — TOO_BIG
+/// (CORE-API.md §4.3). Пагинация GUI выше этого окна не поднимается.
+pub const HISTORY_MAX_LIMIT: u32 = 200;
+
 /// Команда ядру; одна команда = один метод API 1.0.0.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Request {
