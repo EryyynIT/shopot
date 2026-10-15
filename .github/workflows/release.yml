@@ -1,6 +1,6 @@
 name: release
 
-# Артефакты релиза: тег v* → сборка, пакет, файлы на странице Release.
+# Артефакты релиза: тег v* → клиент + демон одним архивом, один шаг запуска.
 on:
   push:
     tags: ["v*"]
@@ -13,27 +13,41 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: recursive
       - uses: dtolnay/rust-toolchain@stable
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.0
       - uses: Swatinem/rust-cache@v2
-      - run: cargo build --release
+
+      - name: Build the daemon (Zig)
+        run: zig build -Doptimize=ReleaseSafe
+        working-directory: core/zig
+
+      - name: Build the client (Rust)
+        run: cargo build --release
 
       - name: Package
         run: |
           mkdir -p pkg
           cp target/release/shopot-gui pkg/
-          cp README.md README.ru.md LICENSE pkg/
-          tar -czf "shopot-gui-${GITHUB_REF_NAME}-x86_64-linux-gnu.tar.gz" -C pkg .
-          sha256sum shopot-gui-*.tar.gz > SHA256SUMS
+          cp core/zig/zig-out/bin/shopot-zig pkg/
+          cp run.sh README.md README.ru.md LICENSE pkg/
+          tar -czf "shopot-${GITHUB_REF_NAME}-x86_64-linux-gnu.tar.gz" -C pkg .
+          sha256sum shopot-*.tar.gz > SHA256SUMS
 
       - uses: softprops/action-gh-release@v2
         with:
           files: |
-            shopot-gui-*.tar.gz
+            shopot-*.tar.gz
             SHA256SUMS
           body: |
-            First release of the client: meet by one-time invite codes with a
-            QR, chat with honest delivery statuses, block contacts.
+            One archive: the client and the daemon for Linux x86_64.
+            Extract and run `./run.sh` — it creates your identity on first
+            start, launches the daemon in the background and opens the client.
 
-            The daemon builds separately from
-            [shopot-core](https://github.com/Puxxalwl/shopot-core) (Zig 0.17.0)
-            — build and run steps are in the README inside the archive.
+            The daemon is built from the pinned
+            [shopot-core](https://github.com/Puxxalwl/shopot-core) submodule
+            (Zig 0.17.0). Building from source is covered in the README inside
+            the archive.
