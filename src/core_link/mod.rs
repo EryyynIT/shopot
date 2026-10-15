@@ -132,7 +132,7 @@ mod tests {
 
     #[test]
     fn contact_line_roundtrip() {
-        let contacts = vec![
+        let contacts = [
             Contact {
                 cid: Cid(1),
                 name: "Аня".into(),
