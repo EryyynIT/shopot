@@ -1,6 +1,7 @@
 //! UI: Elm-архитектура — один State, update() как единственное место
 //! мутаций, view() — чистая функция над Store (GUI_DEV.md §3).
 
+pub mod notify;
 pub mod palette;
 pub mod widgets;
 
@@ -152,6 +153,10 @@ pub struct State<L: CoreLink> {
     /// список живых инвайтов, повторное открытие диалога не тратит слот.
     /// Тратится при CONTACT_JOINED — код одноразовый (CORE-API.md §4.2).
     pub invite_code: Option<String>,
+    /// В фокусе ли окно: открытый в фокусе чат не уведомляет
+    /// (GUI_UI.md §4). Подписку окна обслуживает main; по умолчанию
+    /// считаем окно в фокусе.
+    pub window_focused: bool,
 }
 
 impl<L: CoreLink> State<L> {
@@ -166,6 +171,7 @@ impl<L: CoreLink> State<L> {
             overlay: Overlay::None,
             cursor: Point::ORIGIN,
             invite_code: None,
+            window_focused: true,
         }
     }
 
@@ -219,12 +225,26 @@ fn on_link<L: CoreLink>(state: &mut State<L>, link: LinkIn) -> Task<Message> {
                 let opened = state.store.selected() == Some(cid);
                 state
                     .store
-                    .push_incoming_core(cid, &name, msg_id, ts_ms, text);
-                if opened {
+                    .push_incoming_core(cid, &name, msg_id, ts_ms, text.clone());
+                let mut task = if opened {
                     scroll_feed(state)
                 } else {
                     Task::none()
+                };
+                // Уведомление ОС: открытый в фокусе чат молчит (GUI_UI.md §4).
+                if notify::should_notify(state.store.selected(), state.window_focused, cid) {
+                    let title = state
+                        .store
+                        .contact(cid)
+                        .map(|c| c.name.clone())
+                        .unwrap_or_else(|| name.clone());
+                    let body = notify::notification_body(
+                        &text,
+                        state.store.settings.hide_notification_text,
+                    );
+                    task = Task::batch([task, notify::os_notify(title, body)]);
                 }
+                task
             }
             LinkEvent::MessageDelivered { cid, msg_id } => {
                 state.store.mark_delivered(cid, msg_id);
