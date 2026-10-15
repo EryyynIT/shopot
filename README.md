@@ -69,11 +69,20 @@ cd core/zig && zig build -Doptimize=ReleaseSafe && cd ../..
 cargo run --release
 ```
 
-To meet someone, press «Пригласить» in the sidebar: the dialog shows your
-one-time invite code with a QR — hand it over out of band. To add a contact,
-paste their code into «Вставить чужой код» and press «Добавить»; the chat
-opens once both sides are known to the daemon. Right-click a contact to block
-or unblock them; Escape closes any dialog.
+To meet someone, press «Пригласить» in the sidebar and press «Выдать код»:
+you get a one-time invite code with a QR — hand it over out of band. To add
+a contact, paste their code into «Вставить чужой код» and press «Добавить»;
+the chat opens once both sides are known to the daemon. Right-click a contact
+to block or unblock them; Escape closes any dialog.
+
+Meeting across the internet (different networks, different cities): a code
+without an address only works inside one LAN. The daemon prints
+«слушаю 0.0.0.0:PORT» on start — forward that port on your router, then type
+your public `host:port` into «Адрес» before issuing: the peer's daemon dials
+you directly. The «через relay» checkbox routes the
+connection through a `shopot relay` server so the peer never sees your IP;
+on the pinned daemon build this path is experimental — the address code is
+the reliable one.
 
 ## The core
 
