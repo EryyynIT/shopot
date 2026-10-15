@@ -166,7 +166,7 @@ pub fn editor(_: &Theme, status: text_editor::Status) -> text_editor::Style {
 /// Главная кнопка действия: акцентная заливка, тёмный текст.
 pub fn button_accent(_: &Theme, status: button::Status) -> button::Style {
     let (bg, fg) = match status {
-        button::Status::Disabled => (RAISE, DIM),
+        button::Status::Disabled => (RAISE, MUTED),
         _ => (ACCENT, BG),
     };
     button::Style {

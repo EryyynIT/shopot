@@ -18,6 +18,7 @@ use crate::core_link::{now_ms, parse_contacts, CoreLink, LinkEvent, Reply, Reque
 use crate::model::cid::Cid;
 use crate::model::feed::FeedItem;
 use crate::model::msg::MsgId;
+use crate::model::store::Session;
 use crate::model::store::Store;
 
 /// Сообщения приложения: канал ядра и локальные действия чата.
@@ -315,13 +316,14 @@ fn main_pane<L: CoreLink>(state: &State<L>) -> Element<'_, Message> {
                     .size(14)
                     .font(palette::bold())
                     .color(palette::TEXT),
-                text(if online {
-                    "защищённая сессия"
-                } else {
-                    "сессия не установлена"
-                })
-                .size(10)
-                .color(if online { palette::OK } else { palette::DIM }),
+                {
+                    let (label, color) = match state.store.session(cid) {
+                        Session::Up => ("защищённая сессия", palette::OK),
+                        Session::Down => ("сессия не установлена", palette::WARN),
+                        Session::Unknown => ("состояние сессии неизвестно", palette::MUTED),
+                    };
+                    text(label).size(10).color(color)
+                },
             ]
             .spacing(1),
             space::Space::new().width(Length::Fill),
@@ -380,7 +382,14 @@ fn feed_view<L: CoreLink>(state: &State<L>, cid: Cid) -> Element<'_, Message> {
         }
     }
 
-    scrollable(list)
+    // Контент прижат к низу: короткая переписка не повисает в пустоте
+    // над композером; при переполнении контейнер растёт и скроллится.
+    let anchored = container(list)
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .align_y(Vertical::Bottom);
+
+    scrollable(anchored)
         .id(state.feed_id.clone())
         .width(Length::Fill)
         .height(Length::Fill)
