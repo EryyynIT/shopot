@@ -29,3 +29,7 @@ futures-util = "0.3"
 iced_test = "0.14"
 png = "0.17"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "test-util"] }
+
+# Артефакт релиза — не таскать debug-символы (23 МБ → ~10 МБ).
+[profile.release]
+strip = true
