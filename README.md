@@ -17,13 +17,13 @@ statuses, no fake delivery receipts.
 
 ## Status
 
-First release: **v0.1.0 «Разговор»**. The client talks to a real `shopot serve`
-daemon over its binary frame API 1.0.0 on a Unix domain socket
-(`$HOME/.shopot/api.sock`); `--mock` runs a built-in demo scene instead.
+Current release: **v0.1.1** — the polish pass over v0.1.0 «Разговор». The
+client talks to a real `shopot serve` daemon over its binary frame API 1.0.0
+on a Unix domain socket (`$HOME/.shopot/api.sock`); `--mock` runs a built-in
+demo scene instead.
 
 Not production-ready: no message history, files, avatars or calls yet (they
-land in v0.2 and v0.3). OS notifications and full keyboard control are next
-(v0.1.1).
+land in v0.2 and v0.3).
 
 Done so far:
 
@@ -31,12 +31,18 @@ Done so far:
   with resync; an e2e test runs invite → message → delivery ACK against two
   real daemons (gated by `SHOPOT_BIN`)
 - meeting flow: one-time invite codes with a QR, adding a contact by someone
-  else's code
+  else's code; LAN, address and relay codes
 - contacts list with presence dots and unread badges
 - message feed with day separators, system events and honest send statuses
-  (sending → sent / queued / delivered / failed)
+  (sending → sent / queued / delivered / failed); compact feed mode
 - contact card and right-click menu with block/unblock; Escape closes any
   dialog
+- desktop notifications with a hide-text privacy setting on by default; the
+  chat open in the focused window stays silent
+- settings panel: notification text privacy, compact feed, font scale
+  (80–150%)
+- keyboard control: Ctrl+1..9 jumps to a chat by its position in the list,
+  Ctrl+Q quits, Escape closes any dialog
 - auto-growing composer with a send button
 - headless UI tests (`iced_test`) plus unit tests; CI runs fmt, clippy, tests,
   a release build and cargo-deny on every push
@@ -47,7 +53,7 @@ Releases ship one archive with the client, the daemon and a launcher for
 Linux x86_64 — no toolchains needed:
 
 ```sh
-tar -xzf shopot-v0.1.0-x86_64-linux-gnu.tar.gz
+tar -xzf shopot-v0.1.1-x86_64-linux-gnu.tar.gz
 cd shopot && ./run.sh
 ```
 
@@ -74,6 +80,12 @@ you get a one-time invite code with a QR — hand it over out of band. To add
 a contact, paste their code into «Вставить чужой код» and press «Добавить»;
 the chat opens once both sides are known to the daemon. Right-click a contact
 to block or unblock them; Escape closes any dialog.
+
+Everything is reachable from the keyboard: Ctrl+1..9 opens the Nth chat from
+the list, Ctrl+Q quits, Escape closes any dialog. Incoming messages pop up
+as desktop notifications (`notify-send`) with the sender's name; the text is
+hidden unless you allow it in «Настройки» — the gear button in the title
+bar, which also holds the compact feed toggle and the font scale.
 
 Meeting across the internet (different networks, different cities): a code
 without an address only works inside one LAN. The daemon prints
