@@ -111,8 +111,10 @@ pub fn sys_line(body: String) -> Element<'static, Message> {
 }
 
 /// Группа сообщений одного автора: пузыри моей стороны справа, чужие
-/// слева; время и статус отправки — мелкой строкой внутри последнего
-/// пузыря (правка осмотра окна: метка над пузырём жила в другой колонке).
+/// слева; тексты в пузыре — по левому краю; время и статус — строкой
+/// под пузырём, у его правой кромки. Fill-распорок в цепочке группы
+/// нет ни одной: они протягивают ширину ближайшего ограничителя и
+/// распахивают пузырь (правка по замерам пробы раскладки).
 pub fn message_group(group: &FeedItem) -> Vec<Element<'static, Message>> {
     let FeedItem::Group {
         mine,
@@ -154,16 +156,33 @@ pub fn message_group(group: &FeedItem) -> Vec<Element<'static, Message>> {
     } else {
         None
     };
-    let footer = || {
+    let footer = || -> iced::Element<'static, Message> {
         let mut foot = row![text(time_hm(*ts_ms)).size(10).color(palette::MUTED)].spacing(4.0);
         if let Some((label, color)) = &status {
             foot = foot.push(text(label.clone()).size(10).color(*color));
         }
-        foot
+        foot.into()
+    };
+
+    let bubble_style: fn(&iced::Theme) -> iced::widget::container::Style = if *mine {
+        palette::bubble_mine
+    } else {
+        palette::bubble_theirs
+    };
+    let bubble = |col: iced::widget::Column<'static, Message>| {
+        container(col)
+            .max_width(560)
+            .padding(Padding {
+                top: 5.0,
+                right: 10.0,
+                bottom: 5.0,
+                left: 10.0,
+            })
+            .style(bubble_style)
     };
 
     let mut elements: Vec<Element<'static, Message>> = Vec::with_capacity(bodies.len());
-    let mut pending_bubble: Option<iced::widget::Column<'static, Message>> = None;
+    let mut pending: Option<iced::widget::Column<'static, Message>> = None;
     let count = bodies.len();
 
     for (index, (_, body)) in bodies.iter().enumerate() {
@@ -172,39 +191,54 @@ pub fn message_group(group: &FeedItem) -> Vec<Element<'static, Message>> {
 
         // Длинные тексты — без пузыря, на всю ширину (GUI_STYLE.md §2).
         if body.len() > 300 {
-            if let Some(bubble) = pending_bubble.take() {
-                elements.push(wrap(bubble.into()));
+            if let Some(col) = pending.take() {
+                elements.push(wrap(bubble(col).into()));
             }
-            let mut block = iced::widget::Column::new()
-                .push(
-                    container(body_text)
-                        .max_width(560)
-                        .padding(Padding {
-                            top: 3.0,
-                            right: 4.0,
-                            bottom: 3.0,
-                            left: 4.0,
-                        })
-                        .style(palette::no_bubble),
-                )
-                .align_x(align_x);
+            let block = iced::widget::Column::new().push(
+                container(body_text)
+                    .max_width(560)
+                    .padding(Padding {
+                        top: 3.0,
+                        right: 4.0,
+                        bottom: 3.0,
+                        left: 4.0,
+                    })
+                    .style(palette::no_bubble),
+            );
             if last {
-                block = block.push(footer());
+                elements.push(wrap(group_with_footer(block, footer())));
+            } else {
+                elements.push(wrap(block.into()));
             }
-            elements.push(wrap(block.into()));
         } else {
-            let taken = pending_bubble.take().unwrap_or_else(|| {
-                iced::widget::Column::new()
-                    .spacing(2)
-                    .align_x(Horizontal::Right)
-            });
-            pending_bubble = Some(taken.push(body_text));
+            let col = pending
+                .take()
+                .unwrap_or_else(|| iced::widget::Column::new().spacing(2));
+            pending = Some(col.push(body_text));
         }
     }
-    if let Some(mut bubble) = pending_bubble.take() {
-        bubble = bubble.push(footer());
-        elements.push(wrap(bubble.into()));
+    if let Some(col) = pending.take() {
+        elements.push(wrap(group_with_footer(bubble(col), footer())));
     }
 
     elements
+}
+
+/// Пузырь (или длинный блок) + подвал под ним: подвал прижат к правой
+/// кромке самого широкого элемента группы — колонка Shrink, оба ребёнка
+/// Shrink, align_x(Right) сводит их правые кромки.
+fn group_with_footer(
+    main: impl Into<iced::Element<'static, Message>>,
+    footer: iced::Element<'static, Message>,
+) -> iced::Element<'static, Message> {
+    iced::widget::Column::new()
+        .push(main.into())
+        .push(container(footer).padding(Padding {
+            top: 1.0,
+            right: 0.0,
+            bottom: 0.0,
+            left: 0.0,
+        }))
+        .align_x(Horizontal::Right)
+        .into()
 }
