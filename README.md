@@ -41,6 +41,19 @@ Done so far:
 - headless UI tests (`iced_test`) plus unit tests; CI runs fmt, clippy, tests,
   a release build and cargo-deny on every push
 
+## Download
+
+Releases ship one archive with the client, the daemon and a launcher for
+Linux x86_64 — no toolchains needed:
+
+```sh
+tar -xzf shopot-v0.1.0-x86_64-linux-gnu.tar.gz
+cd shopot && ./run.sh
+```
+
+`run.sh` creates your identity on first start, runs the daemon in the
+background and opens the client. Building from source is below.
+
 ## Build and run
 
 Requires a stable Rust toolchain and [Zig 0.17.0](https://ziglang.org/) for
