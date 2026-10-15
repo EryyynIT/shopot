@@ -9,7 +9,7 @@ use crate::core_link::mock::{MockLink, Scene};
 use crate::core_link::uds::UdsLink;
 use crate::core_link::{CoreLink, Request};
 use crate::model::msg::MsgId;
-use crate::ui::{self, LinkIn, MeetIn, Message};
+use crate::ui::{self, LinkIn, MeetIn, Message, WindowIn};
 
 fn update<L: CoreLink>(state: &mut App<L>, message: Message) -> Task<Message> {
     ui::update(state, message)
@@ -75,11 +75,13 @@ fn boot<L: CoreLink>(link: Arc<L>) -> (App<L>, Task<Message>) {
     (state, task)
 }
 
-/// Постоянный поток событий ядра + клавиатура (Esc закрывает оверлей).
+/// Постоянный поток событий ядра + клавиатура (Esc закрывает оверлей)
+/// + фокус окна (открытый в фокусе чат не уведомляет, GUI_UI.md §4).
 fn subscription<L: CoreLink>(state: &App<L>) -> Subscription<Message> {
     Subscription::batch([
         Subscription::run_with(Arc::clone(&state.link), events_subscription),
         esc_subscription(),
+        focus_subscription(),
     ])
 }
 
@@ -98,6 +100,19 @@ fn esc_subscription() -> Subscription<Message> {
             key: Key::Named(Named::Escape),
             ..
         } => Some(Message::Meet(MeetIn::CloseOverlay)),
+        _ => None,
+    })
+}
+
+/// Фокус окна для правила уведомлений (GUI_UI.md §4): без фокуса
+/// уведомляется любой чат, включая открытый.
+fn focus_subscription() -> Subscription<Message> {
+    use iced::window::Event as WindowEvent;
+    iced::event::listen().filter_map(|event| match event {
+        iced::Event::Window(WindowEvent::Focused) => Some(Message::Window(WindowIn::Focus(true))),
+        iced::Event::Window(WindowEvent::Unfocused) => {
+            Some(Message::Window(WindowIn::Focus(false)))
+        }
         _ => None,
     })
 }
