@@ -456,5 +456,7 @@ fn screenshot_demo_scene() {
             .write_image_data(&shot.rgba)
             .expect("rgba кадр пишется в PNG");
     }
-    std::fs::write("/tmp/shopot-s1-demo.png", png).expect("скриншот сохраняется");
+    // Путь читает README (docs/screenshot.png): тест перегенерирует ассет.
+    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/docs/screenshot.png");
+    std::fs::write(path, png).expect("скриншот сохраняется");
 }
