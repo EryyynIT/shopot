@@ -9,7 +9,7 @@ use crate::core_link::mock::{MockLink, Scene};
 use crate::core_link::uds::UdsLink;
 use crate::core_link::{CoreLink, Request};
 use crate::model::msg::MsgId;
-use crate::ui::{self, LinkIn, Message};
+use crate::ui::{self, LinkIn, MeetIn, Message};
 
 fn update<L: CoreLink>(state: &mut App<L>, message: Message) -> Task<Message> {
     ui::update(state, message)
@@ -66,14 +66,31 @@ fn boot<L: CoreLink>(link: Arc<L>) -> (App<L>, Task<Message>) {
     (state, task)
 }
 
-/// Постоянный поток событий ядра; идентификатор подписки — сам линк.
+/// Постоянный поток событий ядра + клавиатура (Esc закрывает оверлей).
 fn subscription<L: CoreLink>(state: &App<L>) -> Subscription<Message> {
-    Subscription::run_with(Arc::clone(&state.link), events_subscription)
+    Subscription::batch([
+        Subscription::run_with(Arc::clone(&state.link), events_subscription),
+        esc_subscription(),
+    ])
 }
 
 fn events_subscription<L: CoreLink>(link: &Arc<L>) -> impl iced::futures::Stream<Item = Message> {
     use iced::futures::StreamExt;
     CoreLink::events(Arc::clone(link)).map(|event| Message::Link(LinkIn::Event(event)))
+}
+
+/// Esc закрывает оверлей (GUI_UI.md §3). `listen()` отдаёт только события,
+/// которые не съел виджет: привязки композера не задеваются.
+fn esc_subscription() -> Subscription<Message> {
+    use iced::keyboard::key::Named;
+    use iced::keyboard::{Event as KeyEvent, Key};
+    iced::keyboard::listen().filter_map(|event| match event {
+        KeyEvent::KeyPressed {
+            key: Key::Named(Named::Escape),
+            ..
+        } => Some(Message::Meet(MeetIn::CloseOverlay)),
+        _ => None,
+    })
 }
 
 fn theme<L: CoreLink>(_: &App<L>) -> iced::Theme {
