@@ -2,15 +2,16 @@
 //! и переданные данные (GUI_UI.md §2).
 
 use iced::alignment::Horizontal;
-use iced::widget::{button, column, container, qr_code, row, space, text, text_input};
+use iced::widget::{button, column, container, qr_code, row, scrollable, space, text, text_input};
 use iced::{Element, Length, Padding};
 
 use crate::model::cid::Cid;
 use crate::model::feed::FeedItem;
 use crate::model::msg::SendState;
 use crate::model::settings::Settings;
+use crate::model::store::SearchHit;
 use crate::ui::palette;
-use crate::ui::{time_hm, ChatIn, InviteView, MeetIn, MenuView, Message, SettingsIn};
+use crate::ui::{time_hm, ChatIn, InviteView, MeetIn, MenuView, Message, SearchView, SettingsIn};
 
 /// Строка сайдбара: акцентная полоса у самого края карточки, точка
 /// presence, имя, бейдж непрочитанных. Высота карточки фиксированная —
@@ -653,6 +654,97 @@ pub fn settings_panel(settings: &Settings, scale: f32) -> Element<'_, Message> {
         .spacing(12),
     )
     .width(Length::Fixed(420.0))
+    .padding(16)
+    .style(palette::dialog)
+    .into()
+}
+
+/// Сколько совпадений показывать в панели; остаток — строкой-хвостом.
+const SEARCH_SHOW: usize = 50;
+
+/// Панель Ctrl+F (S6): запрос + совпадения по загруженной ленте.
+/// Клик по совпадению закрывает панель; переход к сообщению в ленте —
+/// со scroll-анкорами, осознанно отложено.
+pub fn search_panel<'a>(
+    view: &'a SearchView,
+    hits: Vec<SearchHit>,
+    scale: f32,
+) -> Element<'a, Message> {
+    let input = text_input("Что найти…", &view.query)
+        .id(view.input_id.clone())
+        .size(13.0 * scale)
+        .padding(Padding {
+            top: 8.0,
+            right: 10.0,
+            bottom: 8.0,
+            left: 10.0,
+        })
+        .on_input(|text| Message::Chat(ChatIn::SearchInput(text)))
+        .style(palette::input);
+
+    let mut results = column![].spacing(2);
+    if view.query.trim().is_empty() {
+        results = results.push(
+            text("Поиск ищет по загруженным сообщениям этого чата.")
+                .size(12.0 * scale)
+                .color(palette::DIM),
+        );
+    } else if hits.is_empty() {
+        results = results.push(
+            text("Ничего не найдено.")
+                .size(12.0 * scale)
+                .color(palette::DIM),
+        );
+    } else {
+        for hit in hits.iter().take(SEARCH_SHOW) {
+            let author = if hit.mine { "я" } else { "не я" };
+            results = results.push(
+                button(
+                    row![
+                        text(time_hm(hit.ts_ms))
+                            .size(11.0 * scale)
+                            .color(palette::DIM),
+                        text(hit.body.clone())
+                            .size(12.0 * scale)
+                            .color(palette::TEXT),
+                        space::Space::new().width(Length::Fill),
+                        text(author).size(11.0 * scale).color(palette::DIM),
+                    ]
+                    .spacing(8)
+                    .align_y(iced::alignment::Vertical::Center),
+                )
+                .width(Length::Fill)
+                .padding(Padding {
+                    top: 4.0,
+                    right: 8.0,
+                    bottom: 4.0,
+                    left: 8.0,
+                })
+                .style(palette::button_plain)
+                .on_press(Message::Meet(MeetIn::CloseOverlay)),
+            );
+        }
+        if hits.len() > SEARCH_SHOW {
+            results = results.push(
+                text(format!("и ещё {}", hits.len() - SEARCH_SHOW))
+                    .size(11.0 * scale)
+                    .color(palette::DIM),
+            );
+        }
+    }
+
+    container(
+        column![
+            text("Поиск по чату")
+                .size(14.0 * scale)
+                .font(palette::bold())
+                .color(palette::TEXT),
+            input,
+            scrollable(results).height(Length::Fixed(320.0)),
+        ]
+        .spacing(10),
+    )
+    .width(Length::Fixed(520.0))
     .padding(16)
     .style(palette::dialog)
     .into()

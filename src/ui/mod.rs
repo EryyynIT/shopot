@@ -61,6 +61,10 @@ pub enum ChatIn {
     SelectIndex(usize),
     Send,
     Edit(text_editor::Action),
+    /// Ctrl+F — панель поиска по загруженному чату (S6).
+    SearchOpen,
+    /// Ввод в поисковой строке панели.
+    SearchInput(String),
     /// Лента прокручена; `true` — докатились до верха: догрузить более
     /// старые сообщения (S6; окно GET_HISTORY растёт от загруженного
     /// до потолка ядра).
@@ -130,6 +134,15 @@ pub enum Overlay {
     Menu(MenuView),
     /// Настройки: собственного стейта нет, всё живёт в Store.settings.
     Settings,
+    /// Поиск по загруженному чату (Ctrl+F, S6).
+    Search(SearchView),
+}
+
+/// Панель поиска: запрос живёт здесь, совпадения считает Store.
+pub struct SearchView {
+    pub query: String,
+    /// Фокус в строку при открытии.
+    pub input_id: iced::widget::Id,
 }
 
 /// Инвайт-диалог: мой код и чужой код (GUI_UI.md §1).
@@ -452,6 +465,24 @@ fn on_chat<L: CoreLink>(state: &mut State<L>, chat: ChatIn) -> Task<Message> {
             Task::none()
         }
         ChatIn::Send => send_current(state),
+        ChatIn::SearchOpen => {
+            // Панель модальна; без выбранного чата искать нечего.
+            if matches!(state.overlay, Overlay::None) && state.store.selected().is_some() {
+                let input_id = iced::widget::Id::unique();
+                state.overlay = Overlay::Search(SearchView {
+                    query: String::new(),
+                    input_id: input_id.clone(),
+                });
+                return operation::focus::<Message>(input_id);
+            }
+            Task::none()
+        }
+        ChatIn::SearchInput(text) => {
+            if let Overlay::Search(view) = &mut state.overlay {
+                view.query = text;
+            }
+            Task::none()
+        }
         ChatIn::ScrollTop(at_top) => {
             if at_top {
                 load_older(state)
@@ -786,6 +817,21 @@ fn overlay_layer<'a, L: CoreLink>(
             ))
         ]
         .into(),
+        Overlay::Search(view) => {
+            let hits = state
+                .store
+                .selected()
+                .map_or_else(Vec::new, |cid| state.store.search_loaded(cid, &view.query));
+            stack![
+                widgets::backdrop(close()),
+                centered(widgets::search_panel(
+                    view,
+                    hits,
+                    state.store.settings.font_scale
+                ))
+            ]
+            .into()
+        }
     }
 }
 
@@ -1149,9 +1195,9 @@ pub fn chat_index(code: &iced::keyboard::key::Code) -> Option<usize> {
 }
 
 /// Enter — отправить, Shift+Enter — перенос, Esc — закрыть оверлей,
-/// Ctrl+1..9 — чат по номеру, Ctrl+Q — выход; остальное — как в iced.
-/// Эти комбинации ловятся при фокусе композера: подписка клавиатуры
-/// в headless-эмуляторе событий не получает.
+/// Ctrl+1..9 — чат по номеру, Ctrl+F — поиск, Ctrl+Q — выход; остальное
+/// — как в iced. Эти комбинации ловятся при фокусе композера: подписка
+/// клавиатуры в headless-эмуляторе событий не получает.
 fn key_binding(event: text_editor::KeyPress) -> Option<text_editor::Binding<Message>> {
     match event.key.as_ref() {
         keyboard::Key::Named(Named::Enter) => {
@@ -1184,6 +1230,9 @@ fn ctrl_binding(event: text_editor::KeyPress) -> Option<text_editor::Binding<Mes
     match code {
         Code::KeyQ => Some(text_editor::Binding::Custom(Message::Window(
             WindowIn::Exit,
+        ))),
+        Code::KeyF => Some(text_editor::Binding::Custom(Message::Chat(
+            ChatIn::SearchOpen,
         ))),
         _ => text_editor::Binding::from_key_press(event),
     }
@@ -1393,6 +1442,36 @@ mod tests {
         // Скролл не у верха глушится сразу.
         let _ = update(&mut state, Message::Chat(ChatIn::ScrollTop(false)));
         assert!(!state.history_in_flight);
+    }
+
+    /// Ctrl+F: панель открывается только при выбранном чате, ввод
+    /// попадает в запрос, Esc-путь закрывает общий CloseOverlay.
+    #[test]
+    fn search_panel_opens_on_selected_chat_and_takes_input() {
+        let mut state = state();
+        state.store.replace_contacts(vec![contact(1, "Аня")]);
+
+        let _ = update(&mut state, Message::Chat(ChatIn::SearchOpen));
+        assert!(
+            !matches!(state.overlay, Overlay::Search(_)),
+            "без чата искать нечего"
+        );
+
+        let _ = update(&mut state, Message::Chat(ChatIn::Select(Cid(1))));
+        let _ = update(&mut state, Message::Chat(ChatIn::SearchOpen));
+        assert!(
+            matches!(state.overlay, Overlay::Search(_)),
+            "панель открыта"
+        );
+
+        let _ = update(
+            &mut state,
+            Message::Chat(ChatIn::SearchInput("привет".into())),
+        );
+        let Overlay::Search(view) = &state.overlay else {
+            panic!("панель ещё открыта")
+        };
+        assert_eq!(view.query, "привет");
     }
 
     #[test]
