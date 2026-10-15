@@ -141,6 +141,11 @@ impl<L: CoreLink> State<L> {
             invite_code: None,
         }
     }
+
+    /// Оверлей закрыт — инвариант для тестов и сценариев.
+    pub fn overlay_closed(&self) -> bool {
+        matches!(self.overlay, Overlay::None)
+    }
 }
 
 pub fn update<L: CoreLink>(state: &mut State<L>, message: Message) -> Task<Message> {
@@ -873,7 +878,9 @@ fn composer<L: CoreLink>(state: &State<L>) -> Element<'_, Message> {
     .into()
 }
 
-/// Enter — отправить, Shift+Enter — перенос; остальное — как в iced.
+/// Enter — отправить, Shift+Enter — перенос, Esc — закрыть оверлей;
+/// остальное — как в iced. Esc здесь ловится при фокусе композера:
+/// подписка клавиатуры в headless-эмуляторе событий не получает.
 fn key_binding(event: text_editor::KeyPress) -> Option<text_editor::Binding<Message>> {
     match event.key.as_ref() {
         keyboard::Key::Named(Named::Enter) => {
@@ -883,6 +890,9 @@ fn key_binding(event: text_editor::KeyPress) -> Option<text_editor::Binding<Mess
                 Some(text_editor::Binding::Custom(Message::Chat(ChatIn::Send)))
             }
         }
+        keyboard::Key::Named(Named::Escape) => Some(text_editor::Binding::Custom(Message::Meet(
+            MeetIn::CloseOverlay,
+        ))),
         _ => text_editor::Binding::from_key_press(event),
     }
 }

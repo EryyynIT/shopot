@@ -114,11 +114,32 @@ fn click(text: &str) -> [Instruction; 2] {
     ]
 }
 
+fn right_click(text: &str) -> [Instruction; 2] {
+    [
+        Instruction::Interact(Interaction::Mouse(Mouse::Press {
+            button: iced::mouse::Button::Right,
+            target: Some(Target::Text(text.to_owned())),
+        })),
+        Instruction::Interact(Interaction::Mouse(Mouse::Release {
+            button: iced::mouse::Button::Right,
+            target: Some(Target::Text(text.to_owned())),
+        })),
+    ]
+}
+
 #[test]
 fn smoke_scenarios() {
     contacts_reply_populates_sidebar();
     incoming_message_counts_unread();
     send_flow_shows_delivered_and_autoreply();
+    meet_scenarios();
+}
+
+/// Знакомство (S2): инвайт-диалог и блокировка через меню.
+fn meet_scenarios() {
+    invite_dialog_cycles_issue_and_add();
+    right_click_menu_blocks_and_opens_card();
+    escape_closes_overlay();
 }
 
 /// contacts → сайдбар populated: имя, статус «в сети», счётчик сессий.
@@ -226,6 +247,177 @@ fn send_flow_shows_delivered_and_autoreply() {
     );
     assert!(thread.msgs.iter().any(|m| m.body == "пинг"));
     assert!(thread.msgs.iter().any(|m| m.body == "принято"));
+}
+
+/// Инвайт-диалог: код заглушки отрисовался, чужой код гасится —
+/// контакт появляется в сайдбаре и открывается.
+fn invite_dialog_cycles_issue_and_add() {
+    let program = app::program(Link::new(Scene::smoke()));
+    let (sender, mut receiver) = mpsc::channel(512);
+    let mut emu = Emulator::new(
+        sender,
+        &program,
+        Mode::Immediate,
+        iced::Size::new(1000.0, 700.0),
+    );
+    run_instruction(
+        &mut emu,
+        &program,
+        &mut receiver,
+        Instruction::Expect(Expectation::Text("Аня".into())),
+    );
+
+    // Кнопка сайдбара открывает диалог.
+    let [press, release] = click("Пригласить");
+    run_instruction(&mut emu, &program, &mut receiver, press);
+    run_instruction(&mut emu, &program, &mut receiver, release);
+
+    // Код выдан ядром (заглушка): панель копирования и QR на месте.
+    run_instruction(
+        &mut emu,
+        &program,
+        &mut receiver,
+        Instruction::Expect(Expectation::Text("Скопировать код".into())),
+    );
+
+    // Чужой код: клик по полю, ввод, «Добавить».
+    let [press, release] = click("Вставьте код приглашения");
+    run_instruction(&mut emu, &program, &mut receiver, press);
+    run_instruction(&mut emu, &program, &mut receiver, release);
+    run_instruction(
+        &mut emu,
+        &program,
+        &mut receiver,
+        Instruction::Interact(Interaction::Keyboard(Keyboard::Typewrite(
+            "shopot1.abc@192.168.1.5".into(),
+        ))),
+    );
+    let [press, release] = click("Добавить");
+    run_instruction(&mut emu, &program, &mut receiver, press);
+    run_instruction(&mut emu, &program, &mut receiver, release);
+    pump(&mut emu, &program, &mut receiver, 1200);
+
+    let (state, _) = emu.into_state();
+    let guest = state
+        .store
+        .contacts()
+        .find(|c| c.name == "Гость 1")
+        .expect("гость появился в сайдбаре");
+    assert_eq!(
+        state.store.selected(),
+        Some(guest.cid),
+        "новый контакт открыт"
+    );
+    assert!(state.overlay_closed(), "диалог закрыт после добавления");
+}
+
+/// Правая кнопка на строке контакта — меню: блокировка, карточка, закрытие.
+fn right_click_menu_blocks_and_opens_card() {
+    let program = app::program(Link::new(Scene::smoke()));
+    let (sender, mut receiver) = mpsc::channel(512);
+    let mut emu = Emulator::new(
+        sender,
+        &program,
+        Mode::Immediate,
+        iced::Size::new(1000.0, 700.0),
+    );
+    run_instruction(
+        &mut emu,
+        &program,
+        &mut receiver,
+        Instruction::Expect(Expectation::Text("Аня".into())),
+    );
+
+    let [press, release] = right_click("Аня");
+    run_instruction(&mut emu, &program, &mut receiver, press);
+    run_instruction(&mut emu, &program, &mut receiver, release);
+    run_instruction(
+        &mut emu,
+        &program,
+        &mut receiver,
+        Instruction::Expect(Expectation::Text("Заблокировать".into())),
+    );
+
+    let [press, release] = click("Заблокировать");
+    run_instruction(&mut emu, &program, &mut receiver, press);
+    run_instruction(&mut emu, &program, &mut receiver, release);
+    pump(&mut emu, &program, &mut receiver, 500);
+
+    // Меню снова: теперь «Разблокировать», открываем карточку.
+    let [press, release] = right_click("Аня");
+    run_instruction(&mut emu, &program, &mut receiver, press);
+    run_instruction(&mut emu, &program, &mut receiver, release);
+    run_instruction(
+        &mut emu,
+        &program,
+        &mut receiver,
+        Instruction::Expect(Expectation::Text("Разблокировать".into())),
+    );
+    let [press, release] = click("Информация");
+    run_instruction(&mut emu, &program, &mut receiver, press);
+    run_instruction(&mut emu, &program, &mut receiver, release);
+    run_instruction(
+        &mut emu,
+        &program,
+        &mut receiver,
+        Instruction::Expect(Expectation::Text("заблокирован".into())),
+    );
+
+    let [press, release] = click("Закрыть");
+    run_instruction(&mut emu, &program, &mut receiver, press);
+    run_instruction(&mut emu, &program, &mut receiver, release);
+    pump(&mut emu, &program, &mut receiver, 300);
+
+    let (state, _) = emu.into_state();
+    assert!(
+        state.store.contact(Cid(1)).expect("Аня").blocked,
+        "блок через меню дошёл до Store"
+    );
+}
+
+/// Esc закрывает оверлей, пока композер в фокусе (GUI_UI.md §3).
+/// Подписка клавиатуры в headless-эмуляторе событий не получает, поэтому
+/// Esc проверяется через привязку композера; живой путь — подписка.
+fn escape_closes_overlay() {
+    let program = app::program(Link::new(Scene::smoke()));
+    let (sender, mut receiver) = mpsc::channel(512);
+    let mut emu = Emulator::new(
+        sender,
+        &program,
+        Mode::Immediate,
+        iced::Size::new(1000.0, 700.0),
+    );
+    run_instruction(
+        &mut emu,
+        &program,
+        &mut receiver,
+        Instruction::Expect(Expectation::Text("Аня".into())),
+    );
+    // Фокус композера: открыть чат.
+    let [press, release] = click("Аня");
+    run_instruction(&mut emu, &program, &mut receiver, press);
+    run_instruction(&mut emu, &program, &mut receiver, release);
+
+    let [press, release] = click("Пригласить");
+    run_instruction(&mut emu, &program, &mut receiver, press);
+    run_instruction(&mut emu, &program, &mut receiver, release);
+    run_instruction(
+        &mut emu,
+        &program,
+        &mut receiver,
+        Instruction::Expect(Expectation::Text("Скопировать код".into())),
+    );
+
+    run_instruction(
+        &mut emu,
+        &program,
+        &mut receiver,
+        Instruction::Interact(Interaction::Keyboard(Keyboard::Type(Key::Escape))),
+    );
+    pump(&mut emu, &program, &mut receiver, 300);
+
+    let (state, _) = emu.into_state();
+    assert!(state.overlay_closed(), "Esc закрыл инвайт-диалог");
 }
 
 /// Скриншот демо-сцены для ручной визуальной приёмки.
