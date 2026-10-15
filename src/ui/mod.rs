@@ -53,6 +53,8 @@ pub enum LinkIn {
 #[derive(Debug, Clone)]
 pub enum ChatIn {
     Select(Cid),
+    /// Ctrl+1..9 — чат по номеру в порядке сайдбара (GUI_UI.md §4).
+    SelectIndex(usize),
     Send,
     Edit(text_editor::Action),
 }
@@ -411,6 +413,13 @@ fn on_link<L: CoreLink>(state: &mut State<L>, link: LinkIn) -> Task<Message> {
 fn on_chat<L: CoreLink>(state: &mut State<L>, chat: ChatIn) -> Task<Message> {
     match chat {
         ChatIn::Select(cid) => select_chat(state, cid),
+        ChatIn::SelectIndex(index) => {
+            let cid = state.store.contacts().nth(index).map(|c| c.cid);
+            match cid {
+                Some(cid) => select_chat(state, cid),
+                None => Task::none(),
+            }
+        }
         ChatIn::Edit(action) => {
             state.composer.perform(action);
             if let Some(cid) = state.store.selected() {
@@ -1062,9 +1071,28 @@ fn composer<L: CoreLink>(state: &State<L>) -> Element<'_, Message> {
     .into()
 }
 
-/// Enter — отправить, Shift+Enter — перенос, Esc — закрыть оверлей;
-/// остальное — как в iced. Esc здесь ловится при фокусе композера:
-/// подписка клавиатуры в headless-эмуляторе событий не получает.
+/// Ctrl+1..9 — индекс чата в порядке сайдбара. Код физической клавиши:
+/// не зависит от раскладки (второй ряд и в RU, и в US — цифры).
+pub fn chat_index(code: &iced::keyboard::key::Code) -> Option<usize> {
+    use iced::keyboard::key::Code;
+    match code {
+        Code::Digit1 => Some(0),
+        Code::Digit2 => Some(1),
+        Code::Digit3 => Some(2),
+        Code::Digit4 => Some(3),
+        Code::Digit5 => Some(4),
+        Code::Digit6 => Some(5),
+        Code::Digit7 => Some(6),
+        Code::Digit8 => Some(7),
+        Code::Digit9 => Some(8),
+        _ => None,
+    }
+}
+
+/// Enter — отправить, Shift+Enter — перенос, Esc — закрыть оверлей,
+/// Ctrl+1..9 — чат по номеру, Ctrl+Q — выход; остальное — как в iced.
+/// Эти комбинации ловятся при фокусе композера: подписка клавиатуры
+/// в headless-эмуляторе событий не получает.
 fn key_binding(event: text_editor::KeyPress) -> Option<text_editor::Binding<Message>> {
     match event.key.as_ref() {
         keyboard::Key::Named(Named::Enter) => {
@@ -1076,6 +1104,27 @@ fn key_binding(event: text_editor::KeyPress) -> Option<text_editor::Binding<Mess
         }
         keyboard::Key::Named(Named::Escape) => Some(text_editor::Binding::Custom(Message::Meet(
             MeetIn::CloseOverlay,
+        ))),
+        _ if event.modifiers.control() => ctrl_binding(event),
+        _ => text_editor::Binding::from_key_press(event),
+    }
+}
+
+/// Ctrl-комбинации — по физической клавише, раскладка не важна
+/// (GUI_UI.md §4). Нераспознанное отдаётся iced.
+fn ctrl_binding(event: text_editor::KeyPress) -> Option<text_editor::Binding<Message>> {
+    use iced::keyboard::key::{Code, Physical};
+    let Physical::Code(code) = event.physical_key else {
+        return text_editor::Binding::from_key_press(event);
+    };
+    if let Some(index) = chat_index(&code) {
+        return Some(text_editor::Binding::Custom(Message::Chat(
+            ChatIn::SelectIndex(index),
+        )));
+    }
+    match code {
+        Code::KeyQ => Some(text_editor::Binding::Custom(Message::Window(
+            WindowIn::Exit,
         ))),
         _ => text_editor::Binding::from_key_press(event),
     }
