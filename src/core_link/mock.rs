@@ -458,6 +458,11 @@ impl MockLink {
                 }
                 Ok(OkReply::Done)
             }
+            Request::Version => Ok(OkReply::Version {
+                major: 2,
+                minor: 2,
+                patch: 0,
+            }),
             Request::History { cid, limit } => {
                 let known = {
                     let state = inner.state.lock().expect("стейт не отравлен");

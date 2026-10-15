@@ -48,6 +48,10 @@ pub enum Request {
     Block { cid: Cid },
     /// Разблокировать контакт (UNBLOCK_CONTACT).
     Unblock { cid: Cid },
+    /// Версия API (GET_VERSION): readiness probe из CORE-API.md, первый
+    /// запрос каждого соединения. От major зависят раскладки tail-зависимых
+    /// методов (SEND_MESSAGE, GET_HISTORY).
+    Version,
     /// История чата (GET_HISTORY): окно новейших записей, старые → новые.
     /// Лимит ядра — 200, 0 означает «дефолтные 50».
     History { cid: Cid, limit: u32 },
@@ -130,6 +134,8 @@ pub enum OkReply {
     Added { cid: Cid },
     /// CREATE_INVITE: односторонний инвайт-код.
     Code(String),
+    /// GET_VERSION: версия API демона, semver.
+    Version { major: u16, minor: u16, patch: u16 },
     /// GET_HISTORY: всего записей у ядра + окно новейших (старые → новые).
     History {
         total: u32,

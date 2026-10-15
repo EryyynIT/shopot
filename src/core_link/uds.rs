@@ -3,15 +3,16 @@
 //! в поток, backoff-ресинк при обрыве. Здесь же раскладки payload методов
 //! и событий — структурный слой поверх кодека [`super::api`].
 //!
-//! Версия API демона выясняется на первом SEND_MESSAGE: API 2.x требует
-//! entity tail, API 1.x отвергает лишний байт (BadFrame) — клиент
-//! подстраивается и помнит выбор до конца соединения.
+//! Версия API выясняется зондирующим GET_VERSION (readiness probe
+//! из CORE-API.md) перед первым запросом соединения: API 2.x требует
+//! entity tail в SEND_MESSAGE и в записях GET_HISTORY, API 1.x лишних
+//! байтов не шлёт и не принимает.
 
 use std::collections::HashMap;
 use std::future::Future;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU16, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -60,10 +61,9 @@ struct Inner {
     conn: Mutex<Option<mpsc::Sender<Vec<u8>>>>,
     pending: Pending,
     next_id: AtomicU32,
-    /// Демон говорил на API 2.x (SEND_MESSAGE требует entity tail).
-    /// Сбрасывается при каждом новом соединении — между ними демон
-    /// могли заменить.
-    api2: AtomicBool,
+    /// Major-версия API демона; 0 — ещё не выяснена (сбрасывается при
+    /// каждом новом соединении — между ними демон могли заменить).
+    api_major: AtomicU16,
     events_tx: mpsc::Sender<LinkEvent>,
     events_rx: Mutex<Option<mpsc::Receiver<LinkEvent>>>,
 }
@@ -88,7 +88,7 @@ impl UdsLink {
                 conn: Mutex::new(None),
                 pending: Arc::new(Mutex::new(HashMap::new())),
                 next_id: AtomicU32::new(1),
-                api2: AtomicBool::new(false),
+                api_major: AtomicU16::new(0),
                 events_tx,
                 events_rx: Mutex::new(Some(events_rx)),
             }),
@@ -135,7 +135,7 @@ impl Inner {
             match UnixStream::connect(&self.path).await {
                 Ok(stream) => {
                     backoff = self.backoff;
-                    self.api2.store(false, Ordering::Relaxed);
+                    self.api_major.store(0, Ordering::Relaxed);
                     let _ = self.events_tx.send(LinkEvent::Resync).await;
                     self.serve(stream).await;
                     let _ = self.events_tx.send(LinkEvent::Down).await;
@@ -229,27 +229,22 @@ impl Inner {
     }
 
     async fn request(&self, request: Request) -> Reply {
-        let api2 = self.api2.load(Ordering::Relaxed);
-        let (method, payload) = encode_request(&request, api2);
-        let reply = self.roundtrip(method, payload).await;
-
-        // Первый SEND_MESSAGE — зонд версии: API 2.x отвечает BadFrame на
-        // payload без entity tail. Повторяем с хвостом и запоминаем версию
-        // до конца соединения. Иной BadFrame на валидном тексте ядро не
-        // вернёт, ложных срабатываний нет.
-        if method == Method::SendMessage
-            && !api2
-            && reply == Err(LinkError::Kernel(Status::BadFrame))
-        {
-            self.api2.store(true, Ordering::Relaxed);
-            let (method, payload) = encode_request(&request, true);
-            return self.roundtrip(method, payload).await;
+        // Версия API — первый запрос соединения: readiness probe из
+        // CORE-API.md. От major зависят раскладки tail-зависимых методов;
+        // сбой зонда не роняет запрос — ядро без GET_VERSION не встречалось.
+        if self.api_major.load(Ordering::Relaxed) == 0 {
+            let (method, payload) = encode_request(&Request::Version, false);
+            let _ = self.roundtrip(method, payload, false).await;
         }
-        reply
+        let api2 = self.api_major.load(Ordering::Relaxed) >= 2;
+        let (method, payload) = encode_request(&request, api2);
+        self.roundtrip(method, payload, api2).await
     }
 
     /// Один запрос-ответ: request_id, кадр, ожидание с таймаутом.
-    async fn roundtrip(&self, method: Method, payload: Vec<u8>) -> Reply {
+    /// `api2` снимок версии на момент кодирования — раскладка ответа
+    /// (entity tail в записях истории) должна совпадать с запросом.
+    async fn roundtrip(&self, method: Method, payload: Vec<u8>, api2: bool) -> Reply {
         let request_id = self.next_id.fetch_add(1, Ordering::Relaxed);
 
         // Лок берём только чтобы клонировать очередь записи: никакие
@@ -290,7 +285,13 @@ impl Inner {
         }
 
         match timeout(REPLY_TIMEOUT, rx).await {
-            Ok(Ok(Ok(raw))) => decode_reply(method, raw),
+            Ok(Ok(Ok(raw))) => {
+                let reply = decode_reply(method, raw, api2);
+                if let Ok(OkReply::Version { major, .. }) = &reply {
+                    self.api_major.store(*major, Ordering::Relaxed);
+                }
+                reply
+            }
             // Дренаж при обрыве: всем отправлен Disconnected.
             Ok(Ok(Err(err))) => Err(err),
             // Канал ответа закрыт без отправки — соединение умерло.
@@ -328,6 +329,7 @@ fn encode_request(request: &Request, api2: bool) -> (Method, Vec<u8>) {
     let mut payload = Vec::new();
     let method = match request {
         Request::Contacts => Method::ListContacts,
+        Request::Version => Method::GetVersion,
         Request::SendMsg { cid, text } => {
             api::put::u32(&mut payload, cid.0 as u32);
             api::put::str16(&mut payload, text).expect("текст уже проверен на 4096");
@@ -371,7 +373,9 @@ fn encode_request(request: &Request, api2: bool) -> (Method, Vec<u8>) {
 }
 
 /// Ответ → типизированный Reply по методу; статус != OK — Err(Kernel).
-fn decode_reply(method: Method, raw: RawReply) -> Reply {
+/// `api2` — демон ответил как API 2.x: записи GET_HISTORY обязаны нести
+/// entity tail, у API 1.x их нет вовсе.
+fn decode_reply(method: Method, raw: RawReply, api2: bool) -> Reply {
     if raw.status != Status::Ok {
         return Err(LinkError::Kernel(raw.status));
     }
@@ -402,6 +406,17 @@ fn decode_reply(method: Method, raw: RawReply) -> Reply {
             let code = r.read_str16().map_err(|_| LinkError::BadFrame("code"))?;
             OkReply::Code(String::from_utf8_lossy(code).into_owned())
         }
+        Method::GetVersion => {
+            let mut r = api::Reader::new(&raw.payload);
+            let major = r.read_u16().map_err(|_| LinkError::BadFrame("major"))?;
+            let minor = r.read_u16().map_err(|_| LinkError::BadFrame("minor"))?;
+            let patch = r.read_u16().map_err(|_| LinkError::BadFrame("patch"))?;
+            OkReply::Version {
+                major,
+                minor,
+                patch,
+            }
+        }
         Method::GetHistory => {
             let mut r = api::Reader::new(&raw.payload);
             let total = r.read_u32().map_err(|_| LinkError::BadFrame("total"))?;
@@ -416,10 +431,9 @@ fn decode_reply(method: Method, raw: RawReply) -> Reply {
                 );
                 let ts_ms = r.read_u64().map_err(|_| LinkError::BadFrame("ts"))? as i64;
                 let text = r.read_str16().map_err(|_| LinkError::BadFrame("body"))?;
-                // Entity tail появился в API 2.x (всегда есть, даже пустой
-                // ent_count=0); ядро 1.x запись им не дополняет. Байты
-                // после тела — это tail, иначе запись кончилась.
-                if r.has_more() {
+                // Entity tail есть только у API 2.x; позиционно отличить его
+                // от флагов следующей записи нельзя — решает версия зонда.
+                if api2 {
                     skip_entity_tail(&mut r)?;
                 }
                 records.push(HistoryMsg {
@@ -613,6 +627,27 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
+    /// Ответить на зондирующий GET_VERSION: фейковое ядро версии 2.2.0.
+    /// Реальный запрос проверяется на версионность отдельно.
+    async fn answer_version(stream: &mut TokioUnixStream, major: u16) {
+        let (header, payload) = read_frame(stream).await;
+        assert_eq!(header.id, Method::GetVersion as u16, "первый запрос — зонд");
+        assert!(payload.is_empty(), "GET_VERSION без payload");
+        let mut answer = Vec::new();
+        api::put::u16(&mut answer, major);
+        api::put::u16(&mut answer, 0);
+        api::put::u16(&mut answer, 0);
+        stream
+            .write_all(&response_frame(
+                Method::GetVersion as u16,
+                header.request_id,
+                Status::Ok,
+                &answer,
+            ))
+            .await
+            .expect("версия отправлена");
+    }
+
     #[tokio::test]
     async fn contacts_roundtrip_decodes_typed_list() {
         let path = temp_socket("contacts");
@@ -634,6 +669,7 @@ mod tests {
             tokio::spawn(async move { CoreLink::execute(&*link, Request::Contacts).await })
         };
 
+        answer_version(&mut stream, 2).await;
         let (header, payload) = read_frame(&mut stream).await;
         assert_eq!(header.kind, Kind::Request);
         assert_eq!(header.id, Method::ListContacts as u16);
@@ -696,29 +732,11 @@ mod tests {
             })
         };
 
+        // Зонд версии: демон 2.2.0 — SEND_MESSAGE обязан нести entity tail
+        // уже в первом запросе.
+        answer_version(&mut stream, 2).await;
         let (header, payload) = read_frame(&mut stream).await;
         assert_eq!(header.id, Method::SendMessage as u16);
-        // Первый payload без tail: версия API демона ещё не выяснена.
-        let mut r = api::Reader::new(&payload);
-        assert_eq!(r.read_u32(), Ok(3));
-        assert_eq!(
-            r.read_str16().map(|b| std::str::from_utf8(b).unwrap()),
-            Ok("привет")
-        );
-        assert!(!r.has_more(), "до выяснения версии API tail не ставится");
-        // Ядро API 2.x отвечает BadFrame — зонд версии сработал.
-        stream
-            .write_all(&response_frame(
-                Method::SendMessage as u16,
-                header.request_id,
-                Status::BadFrame,
-                &[],
-            ))
-            .await
-            .expect("ответ отправлен");
-
-        // Повтор с entity tail (ent_count = 0) и успешный ответ.
-        let (header, payload) = read_frame(&mut stream).await;
         let mut r = api::Reader::new(&payload);
         assert_eq!(r.read_u32(), Ok(3));
         assert_eq!(
@@ -745,10 +763,10 @@ mod tests {
                 msg_id: CoreMsgId([0xAB; 16]),
                 queued: true
             }),
-            "BadFrame без tail → повтор с tail, сообщение ушло"
+            "queued=1 — сообщение в outbox ядра"
         );
 
-        // Второй запрос — версия уже известна, tail ставится сразу,
+        // Второй запрос — зонд не повторяется, tail ставится сразу,
         // а ядро отвечает машинным кодом.
         let task = {
             let link = Arc::clone(&link);
@@ -764,10 +782,11 @@ mod tests {
             })
         };
         let (header, payload) = read_frame(&mut stream).await;
+        assert_eq!(header.id, Method::SendMessage as u16, "зонд единственный");
         let mut r = api::Reader::new(&payload);
         assert_eq!(r.read_u32(), Ok(3));
         assert!(r.read_str16().is_ok());
-        assert_eq!(r.read_u8(), Ok(0), "версия запомнена: tail сразу");
+        assert_eq!(r.read_u8(), Ok(0), "tail сразу");
         stream
             .write_all(&response_frame(
                 Method::SendMessage as u16,
@@ -861,6 +880,7 @@ mod tests {
             let link = Arc::clone(&link);
             tokio::spawn(async move { CoreLink::execute(&*link, Request::Contacts).await })
         };
+        answer_version(&mut stream, 2).await;
         let (header, _) = read_frame(&mut stream).await;
         let mut answer = Vec::new();
         api::put::u32(&mut answer, 0);
@@ -891,12 +911,14 @@ mod tests {
             "зависший запрос получает Disconnected, а не висит вечно"
         );
 
-        // Реконнект: Resync, дальше запрос ходит по новому соединению.
+        // Реконнект: Resync, дальше запрос ходит по новому соединению —
+        // зонд версии повторяется, между соединениями демон могли заменить.
         let (mut stream2, _) = listener.accept().await.expect("коннект 2 — ресинк");
         let task3 = {
             let link = Arc::clone(&link);
             tokio::spawn(async move { CoreLink::execute(&*link, Request::Contacts).await })
         };
+        answer_version(&mut stream2, 2).await;
         let (header, _) = read_frame(&mut stream2).await;
         let mut answer = Vec::new();
         api::put::u32(&mut answer, 1);
@@ -956,6 +978,7 @@ mod tests {
                 .await
             })
         };
+        answer_version(&mut stream, 2).await;
         let (header, payload) = read_frame(&mut stream).await;
         assert_eq!(header.id, Method::AcceptInvite as u16);
         let mut r = api::Reader::new(&payload);
@@ -1012,11 +1035,11 @@ mod tests {
         cleanup(&path);
     }
 
-    /// GET_HISTORY: записи с entity tail (API 2.x) и без него (API 1.x)
-    /// разбираются одинаково; флаги mine/delivered читаются из bits.
+    /// GET_HISTORY у API 2.x: каждая запись несёт entity tail (даже
+    /// пустой ent_count = 0), флаги mine/delivered читаются из bits.
     #[tokio::test]
-    async fn history_reply_decodes_with_and_without_entity_tail() {
-        let path = temp_socket("history");
+    async fn history_reply_from_api2_decodes_entity_tails() {
+        let path = temp_socket("history2");
         cleanup(&path);
         let listener = UnixListener::bind(&path).expect("сокет забинден");
         let link = Arc::new(UdsLink::with_config(
@@ -1040,6 +1063,7 @@ mod tests {
                 .await
             })
         };
+        answer_version(&mut stream, 2).await;
         let (header, payload) = read_frame(&mut stream).await;
         assert_eq!(header.id, Method::GetHistory as u16);
         assert_eq!(
@@ -1048,8 +1072,8 @@ mod tests {
             "payload = cid u32 + limit u32"
         );
 
-        // Ответ: total=3, count=2; запись 1 — моя доставленная, с tail из
-        // одной сущности; запись 2 — чужая, без tail (ядро 1.x).
+        // total=3, count=2; запись 1 — моя доставленная с сущностью,
+        // запись 2 — чужая с пустым tail.
         let mut answer = Vec::new();
         api::put::u32(&mut answer, 3);
         api::put::u32(&mut answer, 2);
@@ -1067,6 +1091,7 @@ mod tests {
         answer.extend_from_slice(&[0x02; 16]);
         api::put::u64(&mut answer, 1_700_000_005_000);
         api::put::str16(&mut answer, "чужое").expect("str16");
+        api::put::u8(&mut answer, 0); // ent_count = 0
         stream
             .write_all(&response_frame(
                 Method::GetHistory as u16,
@@ -1097,7 +1122,71 @@ mod tests {
                     },
                 ],
             }),
-            "tail у первой записи пропущен, вторая читается без tail"
+            "tails пропущены, поля разобраны"
+        );
+        cleanup(&path);
+    }
+
+    /// GET_HISTORY у API 1.x: ядро шлёт записи без tail — разбор идёт
+    /// строго, лишний байт был бы BadFrame.
+    #[tokio::test]
+    async fn history_reply_from_api1_decodes_bare_records() {
+        let path = temp_socket("history1");
+        cleanup(&path);
+        let listener = UnixListener::bind(&path).expect("сокет забинден");
+        let link = Arc::new(UdsLink::with_config(
+            path.clone(),
+            Duration::from_millis(10),
+            false,
+        ));
+        let _events = CoreLink::events(Arc::clone(&link));
+        let (mut stream, _) = listener.accept().await.expect("коннект");
+
+        let task = {
+            let link = Arc::clone(&link);
+            tokio::spawn(async move {
+                CoreLink::execute(
+                    &*link,
+                    Request::History {
+                        cid: Cid(5),
+                        limit: 50,
+                    },
+                )
+                .await
+            })
+        };
+        answer_version(&mut stream, 1).await;
+        let (header, _) = read_frame(&mut stream).await;
+
+        let mut answer = Vec::new();
+        api::put::u32(&mut answer, 1);
+        api::put::u32(&mut answer, 1);
+        api::put::u8(&mut answer, 0b00);
+        answer.extend_from_slice(&[0x02; 16]);
+        api::put::u64(&mut answer, 1_700_000_005_000);
+        api::put::str16(&mut answer, "старое ядро").expect("str16");
+        stream
+            .write_all(&response_frame(
+                Method::GetHistory as u16,
+                header.request_id,
+                Status::Ok,
+                &answer,
+            ))
+            .await
+            .expect("ответ отправлен");
+        assert_eq!(
+            task.await.expect("задача не паникует"),
+            Ok(OkReply::History {
+                total: 1,
+                records: vec![HistoryMsg {
+                    mine: false,
+                    delivered: false,
+                    msg_id: CoreMsgId([0x02; 16]),
+                    ts_ms: 1_700_000_005_000,
+                    text: "старое ядро".into(),
+                }],
+            }),
+            "записи 1.x без tail разбираются"
         );
         cleanup(&path);
     }
@@ -1135,6 +1224,9 @@ mod tests {
             })
         };
 
+        // Оба первых запроса увидели неизвестную версию — зондов два.
+        answer_version(&mut stream, 2).await;
+        answer_version(&mut stream, 2).await;
         let (h1, _) = read_frame(&mut stream).await;
         let (h2, _) = read_frame(&mut stream).await;
 
