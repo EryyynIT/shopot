@@ -9,6 +9,8 @@ Built with [iced](https://github.com/iced-rs/iced) on the tiny-skia software
 renderer in Rust: dark TUI-derived palette, one accent color, honest send
 statuses, no fake delivery receipts.
 
+[README на русском](README.ru.md)
+
 ![Screenshot](docs/screenshot.png)
 
 ## Status
