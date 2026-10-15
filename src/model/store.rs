@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use crate::model::cid::Cid;
 use crate::model::feed::{self, FeedItem};
 use crate::model::msg::{CoreMsgId, Msg, MsgId, SendState};
+use crate::model::settings::Settings;
 
 /// Контакт.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -43,6 +44,8 @@ pub struct Store {
     threads: HashMap<Cid, Thread>,
     selected: Option<Cid>,
     next_msg_id: u64,
+    /// Выбор пользователя (масштаб, компакт, приватность уведомлений).
+    pub settings: Settings,
 }
 
 impl Store {
