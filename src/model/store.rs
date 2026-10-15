@@ -15,12 +15,25 @@ pub struct Contact {
     pub blocked: bool,
 }
 
-/// Лента чата: сообщения, непрочитанные, черновик (в памяти, не на диске).
+/// Состояние защищённой сессии с контактом. Пока ядро присылает сессию
+/// только текстом sys-строк — разбираем их подписи (I-15); в S5 заменить
+/// на структурированное событие (Q15 бэкенду).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Session {
+    #[default]
+    Unknown,
+    Up,
+    Down,
+}
+
+/// Лента чата: сообщения, непрочитанные, черновик, сессия
+/// (в памяти, не на диске).
 #[derive(Clone, Debug, Default)]
 pub struct Thread {
     pub msgs: Vec<Msg>,
     pub unread: u32,
     pub draft: String,
+    pub session: Session,
 }
 
 /// Проекция ядра для UI. Пересобирается из contacts + событий.
@@ -110,11 +123,25 @@ impl Store {
     }
 
     pub fn push_sys(&mut self, cid: Cid, ts_ms: i64, text: String) {
+        let thread = self.threads.entry(cid).or_default();
+        // Хак до Q15: событие сессии приходит строкой. Подписи — из
+        // демо-сцены/ядра; ложные срабатывания на обычных сообщениях
+        // исключены: push_sys вызывается только для sys-событий.
+        if text.contains("сессия установлена") {
+            thread.session = Session::Up;
+        } else if text.contains("сессия разорвана") || text.contains("сессия закрыта")
+        {
+            thread.session = Session::Down;
+        }
+        thread.msgs.push(Msg::sys(ts_ms, text));
+    }
+
+    /// Состояние сессии с контактом — для подзаголовка шапки чата.
+    pub fn session(&self, cid: Cid) -> Session {
         self.threads
-            .entry(cid)
-            .or_default()
-            .msgs
-            .push(Msg::sys(ts_ms, text));
+            .get(&cid)
+            .map(|t| t.session)
+            .unwrap_or(Session::Unknown)
     }
 
     pub fn mark_sent(&mut self, cid: Cid, msg_id: MsgId) {
@@ -187,6 +214,17 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sys_text_tracks_session_state() {
+        let mut store = Store::default();
+        store.replace_contacts(vec![contact(1, "Аня", true)]);
+        assert_eq!(store.session(Cid(1)), Session::Unknown);
+        store.push_sys(Cid(1), 1_000, "сессия установлена".into());
+        assert_eq!(store.session(Cid(1)), Session::Up);
+        store.push_sys(Cid(1), 2_000, "сессия разорвана".into());
+        assert_eq!(store.session(Cid(1)), Session::Down);
+    }
 
     const DAY: i64 = 24 * 60 * 60 * 1000;
 
