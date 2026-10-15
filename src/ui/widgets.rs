@@ -21,6 +21,7 @@ pub fn contact_row(
     online: bool,
     unread: u32,
     selected: bool,
+    scale: f32,
 ) -> Element<'static, Message> {
     let bar = container(text(""))
         .width(Length::Fixed(3.0))
@@ -28,13 +29,14 @@ pub fn contact_row(
         .style(palette::chat_bar(selected));
 
     let dot = text(if online { "●" } else { "○" })
-        .size(12)
+        .size(12.0 * scale)
         .color(if online { palette::OK } else { palette::DIM });
 
     let has_unread = unread > 0;
     // to_owned: фрагмент текста должен владеть строкой (Element 'static
     // для lazy), &str протянул бы заимствование из Store.
     let name = text(name.to_owned())
+        .size(14.0 * scale)
         .font(if has_unread || selected {
             palette::bold()
         } else {
@@ -53,7 +55,7 @@ pub fn contact_row(
         .align_y(iced::alignment::Vertical::Center);
     if has_unread {
         cells = cells.push(
-            container(text(unread.to_string()).size(11))
+            container(text(unread.to_string()).size(11.0 * scale))
                 .padding(Padding {
                     top: 1.0,
                     right: 6.0,
@@ -78,10 +80,10 @@ pub fn contact_row(
 }
 
 /// Разделитель дня по центру: «Сегодня», «Вчера», «12 марта».
-pub fn date_sep(ts_ms: i64) -> Element<'static, Message> {
+pub fn date_sep(ts_ms: i64, scale: f32) -> Element<'static, Message> {
     container(
         text(crate::ui::date_label(ts_ms))
-            .size(11)
+            .size(11.0 * scale)
             .color(palette::DIM),
     )
     .width(Length::Fill)
@@ -97,8 +99,8 @@ pub fn date_sep(ts_ms: i64) -> Element<'static, Message> {
 
 /// Служебная строка ядра: цветом WARN — событие важное для безопасности
 /// и не должно сливаться с разделителями дат.
-pub fn sys_line(body: String) -> Element<'static, Message> {
-    container(text(body).size(11).color(palette::WARN))
+pub fn sys_line(body: String, scale: f32) -> Element<'static, Message> {
+    container(text(body).size(11.0 * scale).color(palette::WARN))
         .width(Length::Fill)
         .align_x(Horizontal::Center)
         .padding(Padding {
@@ -110,12 +112,57 @@ pub fn sys_line(body: String) -> Element<'static, Message> {
         .into()
 }
 
+/// Статус отправки моей группы — подпись в подвале (честность статусов,
+/// GUI_STYLE.md §2). У чужой группы статуса нет.
+fn send_status(send: &SendState) -> Option<(String, iced::Color)> {
+    match send {
+        SendState::Sending => Some(("отправляю".to_owned(), palette::DIM)),
+        SendState::Sent => Some(("отправлено".to_owned(), palette::DIM)),
+        SendState::Queued => Some(("отправится позже".to_owned(), palette::DIM)),
+        SendState::Delivered => Some(("доставлено".to_owned(), palette::OK)),
+        SendState::Failed(reason) => Some((format!("не ушло: {reason}"), palette::ERR)),
+    }
+}
+
+/// Подвал группы: время и статус отправки (только у меня).
+fn group_footer(
+    ts_ms: i64,
+    status: &Option<(String, iced::Color)>,
+    scale: f32,
+) -> iced::Element<'static, Message> {
+    let mut foot = row![text(time_hm(ts_ms))
+        .size(10.0 * scale)
+        .color(palette::MUTED)]
+    .spacing(4.0);
+    if let Some((label, color)) = status {
+        foot = foot.push(text(label.clone()).size(10.0 * scale).color(*color));
+    }
+    foot.into()
+}
+
+/// Обёртка строки группы: ширина ленты, отступ, выравнивание.
+fn wrap_row(
+    inner: iced::Element<'static, Message>,
+    align_x: Horizontal,
+) -> Element<'static, Message> {
+    container(inner)
+        .width(Length::Fill)
+        .align_x(align_x)
+        .padding(Padding {
+            top: 1.0,
+            right: 2.0,
+            bottom: 1.0,
+            left: 2.0,
+        })
+        .into()
+}
+
 /// Группа сообщений одного автора: пузыри моей стороны справа, чужие
 /// слева; тексты в пузыре — по левому краю; время и статус — строкой
 /// под пузырём, у его правой кромки. Fill-распорок в цепочке группы
 /// нет ни одной: они протягивают ширину ближайшего ограничителя и
 /// распахивают пузырь (правка по замерам пробы раскладки).
-pub fn message_group(group: &FeedItem) -> Vec<Element<'static, Message>> {
+pub fn message_group(group: &FeedItem, scale: f32) -> Vec<Element<'static, Message>> {
     let FeedItem::Group {
         mine,
         name: _,
@@ -133,38 +180,8 @@ pub fn message_group(group: &FeedItem) -> Vec<Element<'static, Message>> {
     } else {
         Horizontal::Left
     };
-    let wrap = |inner: iced::Element<'static, Message>| {
-        container(inner)
-            .width(Length::Fill)
-            .align_x(align_x)
-            .padding(Padding {
-                top: 1.0,
-                right: 2.0,
-                bottom: 1.0,
-                left: 2.0,
-            })
-            .into()
-    };
 
-    // Подвал: время + статус отправки (только у меня) — «часики у галочек».
-    let status = if *mine {
-        Some(match send {
-            SendState::Sending => ("отправляю".to_owned(), palette::DIM),
-            SendState::Sent => ("отправлено".to_owned(), palette::DIM),
-            SendState::Queued => ("отправится позже".to_owned(), palette::DIM),
-            SendState::Delivered => ("доставлено".to_owned(), palette::OK),
-            SendState::Failed(reason) => (format!("не ушло: {reason}"), palette::ERR),
-        })
-    } else {
-        None
-    };
-    let footer = || -> iced::Element<'static, Message> {
-        let mut foot = row![text(time_hm(*ts_ms)).size(10).color(palette::MUTED)].spacing(4.0);
-        if let Some((label, color)) = &status {
-            foot = foot.push(text(label.clone()).size(10).color(*color));
-        }
-        foot.into()
-    };
+    let status = if *mine { send_status(send) } else { None };
 
     let bubble_style: fn(&iced::Theme) -> iced::widget::container::Style = if *mine {
         palette::bubble_mine
@@ -189,12 +206,14 @@ pub fn message_group(group: &FeedItem) -> Vec<Element<'static, Message>> {
 
     for (index, (_, body)) in bodies.iter().enumerate() {
         let last = index + 1 == count;
-        let body_text = text(body.to_owned()).size(14).color(palette::TEXT);
+        let body_text = text(body.to_owned())
+            .size(14.0 * scale)
+            .color(palette::TEXT);
 
         // Длинные тексты — без пузыря, на всю ширину (GUI_STYLE.md §2).
         if body.len() > 300 {
             if let Some(col) = pending.take() {
-                elements.push(wrap(bubble(col).into()));
+                elements.push(wrap_row(bubble(col).into(), align_x));
             }
             let block = iced::widget::Column::new().push(
                 container(body_text)
@@ -208,9 +227,12 @@ pub fn message_group(group: &FeedItem) -> Vec<Element<'static, Message>> {
                     .style(palette::no_bubble),
             );
             if last {
-                elements.push(wrap(group_with_footer(block, footer())));
+                elements.push(wrap_row(
+                    group_with_footer(block, group_footer(*ts_ms, &status, scale)),
+                    align_x,
+                ));
             } else {
-                elements.push(wrap(block.into()));
+                elements.push(wrap_row(block.into(), align_x));
             }
         } else {
             let col = pending
@@ -220,10 +242,58 @@ pub fn message_group(group: &FeedItem) -> Vec<Element<'static, Message>> {
         }
     }
     if let Some(col) = pending.take() {
-        elements.push(wrap(group_with_footer(bubble(col), footer())));
+        elements.push(wrap_row(
+            group_with_footer(bubble(col), group_footer(*ts_ms, &status, scale)),
+            align_x,
+        ));
     }
 
     elements
+}
+
+/// Компактная группа: без пузырей, всё слева, мои строки — с отступом
+/// (GUI_STYLE.md §2). Имя автора — над чужой группой: выравнивание
+/// больше не отличает авторов.
+pub fn compact_group(group: &FeedItem, scale: f32) -> Vec<Element<'static, Message>> {
+    let FeedItem::Group {
+        mine,
+        name,
+        ts_ms,
+        bodies,
+        send,
+        ..
+    } = group
+    else {
+        return Vec::new();
+    };
+
+    let status = if *mine { send_status(send) } else { None };
+    let mut col = iced::widget::Column::<Message>::new().spacing(2);
+    if !*mine {
+        col = col.push(
+            text(name.clone())
+                .size(12.0 * scale)
+                .font(palette::bold())
+                .color(palette::DIM),
+        );
+    }
+    let indent = if *mine { 16.0 } else { 0.0 };
+    for (_, body) in bodies {
+        col = col.push(
+            container(
+                text(body.to_owned())
+                    .size(14.0 * scale)
+                    .color(palette::TEXT),
+            )
+            .padding(Padding {
+                left: indent,
+                ..Padding::default()
+            }),
+        );
+    }
+    col = col.push(group_footer(*ts_ms, &status, scale));
+
+    vec![wrap_row(col.into(), Horizontal::Left)]
 }
 
 /// Пузырь (или длинный блок) + подвал под ним: подвал прижат к правой
@@ -268,19 +338,19 @@ pub fn backdrop(on_close: Message) -> Element<'static, Message> {
 
 /// Инвайт-диалог: мой код (эллипсис + QR + копирование) и чужой код.
 /// Возвращаемый Element заимствует view — оверлей не lazy.
-pub fn invite_panel(view: &InviteView) -> Element<'_, Message> {
+pub fn invite_panel(view: &InviteView, scale: f32) -> Element<'_, Message> {
     let mut body = column![text("Приглашение")
-        .size(14)
+        .size(14.0 * scale)
         .font(palette::bold())
         .color(palette::TEXT),]
     .spacing(10);
 
     // Форма выдачи: адрес опционален; relay только с адресом (CORE-API §4.2).
-    body = body.push(text("Адрес").size(11).color(palette::DIM));
+    body = body.push(text("Адрес").size(11.0 * scale).color(palette::DIM));
     body = body.push(
         text_input("host:7777 — необязательно", &view.addr)
             .on_input(|value| Message::Meet(MeetIn::AddrInput(value)))
-            .size(12)
+            .size(12.0 * scale)
             .padding(8)
             .style(palette::input),
     );
@@ -288,18 +358,18 @@ pub fn invite_panel(view: &InviteView) -> Element<'_, Message> {
         iced::widget::checkbox(view.relay)
             .label("через relay — собеседник не увидит ваш IP")
             .on_toggle(|on| Message::Meet(MeetIn::RelayToggled(on)))
-            .text_size(11)
+            .text_size(11.0 * scale)
             .style(palette::checkbox_style),
     );
     body = body.push(
         text("Без адреса код работает только в одной локальной сети.")
-            .size(10)
+            .size(10.0 * scale)
             .color(palette::DIM),
     );
     body = body.push(
         button(
             text("Выдать код")
-                .size(12)
+                .size(12.0 * scale)
                 .font(palette::bold())
                 .color(palette::BG),
         )
@@ -313,21 +383,21 @@ pub fn invite_panel(view: &InviteView) -> Element<'_, Message> {
         .on_press_maybe((!view.submitting).then_some(Message::Meet(MeetIn::IssueInvite))),
     );
 
-    body = body.push(text("Мой код").size(11).color(palette::DIM));
+    body = body.push(text("Мой код").size(11.0 * scale).color(palette::DIM));
     body = body.push(match (&view.code, &view.error) {
         (Some(code), _) => text(crate::ui::elided_code(code))
-            .size(11)
+            .size(11.0 * scale)
             .color(palette::TEXT),
         (None, None) => text("Код появится после выдачи.")
-            .size(11)
+            .size(11.0 * scale)
             .color(palette::DIM),
-        (None, Some(_)) => text("Код не выдан.").size(11).color(palette::ERR),
+        (None, Some(_)) => text("Код не выдан.").size(11.0 * scale).color(palette::ERR),
     });
 
     if view.code.is_some() {
         let copy = button(
             text("Скопировать код")
-                .size(12)
+                .size(12.0 * scale)
                 .font(palette::bold())
                 .color(palette::BG),
         )
@@ -355,26 +425,30 @@ pub fn invite_panel(view: &InviteView) -> Element<'_, Message> {
         body = body.push(actions);
         body = body.push(
             text("Код одноразовый: действует до первого подключения.")
-                .size(10)
+                .size(10.0 * scale)
                 .color(palette::DIM),
         );
     }
 
     body = body.push(space::Space::new().height(4));
     body = body
-        .push(text("Вставить чужой код").size(11).color(palette::DIM))
+        .push(
+            text("Вставить чужой код")
+                .size(11.0 * scale)
+                .color(palette::DIM),
+        )
         .push(
             row![
                 text_input("Вставьте код приглашения", &view.foreign)
                     .on_input(|value| Message::Meet(MeetIn::ForeignInput(value)))
                     .on_submit(Message::Meet(MeetIn::SubmitForeign))
-                    .size(13)
+                    .size(13.0 * scale)
                     .padding(8)
                     .style(palette::input)
                     .width(Length::Fill),
                 button(
                     text("Добавить")
-                        .size(12)
+                        .size(12.0 * scale)
                         .font(palette::bold())
                         .color(palette::BG),
                 )
@@ -395,7 +469,7 @@ pub fn invite_panel(view: &InviteView) -> Element<'_, Message> {
         );
 
     if let Some(error) = &view.error {
-        body = body.push(text(error.clone()).size(11).color(palette::ERR));
+        body = body.push(text(error.clone()).size(11.0 * scale).color(palette::ERR));
     }
 
     container(body)
@@ -413,6 +487,7 @@ pub fn contact_card(
     name: &str,
     online: bool,
     blocked: bool,
+    scale: f32,
 ) -> Element<'static, Message> {
     let (status, color) = if blocked {
         ("заблокирован", palette::ERR)
@@ -430,13 +505,13 @@ pub fn contact_card(
     container(
         column![
             text(name.to_owned())
-                .size(15)
+                .size(15.0 * scale)
                 .font(palette::bold())
                 .color(palette::TEXT),
-            text(status).size(12).color(color),
+            text(status).size(12.0 * scale).color(color),
             space::Space::new().height(4),
             row![
-                button(text(block_label).size(12).color(if blocked {
+                button(text(block_label).size(12.0 * scale).color(if blocked {
                     palette::TEXT
                 } else {
                     palette::ERR
@@ -450,7 +525,7 @@ pub fn contact_card(
                 .style(palette::button_dim)
                 .on_press(Message::Meet(MeetIn::ToggleBlock(cid))),
                 space::Space::new().width(Length::Fill),
-                button(text("Закрыть").size(12).color(palette::TEXT))
+                button(text("Закрыть").size(12.0 * scale).color(palette::TEXT))
                     .padding(Padding {
                         top: 8.0,
                         right: 14.0,
@@ -472,7 +547,12 @@ pub fn contact_card(
 
 /// Меню по правой кнопке на контакте: блок/разблок и информация
 /// (GUI_UI.md §4).
-pub fn context_menu(menu: &MenuView, name: &str, blocked: bool) -> Element<'static, Message> {
+pub fn context_menu(
+    menu: &MenuView,
+    name: &str,
+    blocked: bool,
+    scale: f32,
+) -> Element<'static, Message> {
     let label = if blocked {
         "Разблокировать"
     } else {
@@ -480,12 +560,12 @@ pub fn context_menu(menu: &MenuView, name: &str, blocked: bool) -> Element<'stat
     };
     container(
         column![
-            text(name.to_owned()).size(11).color(palette::DIM),
-            button(
-                text(label)
-                    .size(13)
-                    .color(if blocked { palette::TEXT } else { palette::ERR })
-            )
+            text(name.to_owned()).size(11.0 * scale).color(palette::DIM),
+            button(text(label).size(13.0 * scale).color(if blocked {
+                palette::TEXT
+            } else {
+                palette::ERR
+            }))
             .width(Length::Fill)
             .padding(Padding {
                 top: 6.0,
@@ -495,7 +575,7 @@ pub fn context_menu(menu: &MenuView, name: &str, blocked: bool) -> Element<'stat
             })
             .style(palette::button_menu)
             .on_press(Message::Meet(MeetIn::ToggleBlock(menu.cid))),
-            button(text("Информация").size(13).color(palette::TEXT))
+            button(text("Информация").size(13.0 * scale).color(palette::TEXT))
                 .width(Length::Fill)
                 .padding(Padding {
                     top: 6.0,

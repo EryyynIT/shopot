@@ -571,7 +571,7 @@ fn overlay_layer<'a, L: CoreLink>(
         Overlay::None => space::Space::new().into(),
         Overlay::Invite(view) => stack![
             widgets::backdrop(close()),
-            centered(widgets::invite_panel(view))
+            centered(widgets::invite_panel(view, state.store.settings.font_scale))
         ]
         .into(),
         Overlay::Card(cid) => {
@@ -583,7 +583,13 @@ fn overlay_layer<'a, L: CoreLink>(
             let blocked = contact.map(|c| c.blocked).unwrap_or(false);
             stack![
                 widgets::backdrop(close()),
-                centered(widgets::contact_card(*cid, &name, online, blocked)),
+                centered(widgets::contact_card(
+                    *cid,
+                    &name,
+                    online,
+                    blocked,
+                    state.store.settings.font_scale
+                )),
             ]
             .into()
         }
@@ -601,17 +607,22 @@ fn overlay_layer<'a, L: CoreLink>(
             };
             stack![
                 widgets::backdrop(close()),
-                container(opaque(widgets::context_menu(menu, &name, blocked)))
-                    .padding(Padding {
-                        top,
-                        left: menu.at.x,
-                        right: 0.0,
-                        bottom: 0.0,
-                    })
-                    .width(Length::Fill)
-                    .height(Length::Fill)
-                    .align_x(Horizontal::Left)
-                    .align_y(Vertical::Top),
+                container(opaque(widgets::context_menu(
+                    menu,
+                    &name,
+                    blocked,
+                    state.store.settings.font_scale
+                )))
+                .padding(Padding {
+                    top,
+                    left: menu.at.x,
+                    right: 0.0,
+                    bottom: 0.0,
+                })
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .align_x(Horizontal::Left)
+                .align_y(Vertical::Top),
             ]
             .into()
         }
@@ -619,6 +630,7 @@ fn overlay_layer<'a, L: CoreLink>(
 }
 
 fn title_bar<L: CoreLink>(state: &State<L>) -> Element<'static, Message> {
+    let scale = state.store.settings.font_scale;
     let (label, color) = if state.link.is_stub() {
         ("режим: заглушка", palette::DIM)
     } else if state.link_up {
@@ -629,11 +641,11 @@ fn title_bar<L: CoreLink>(state: &State<L>) -> Element<'static, Message> {
     container(
         row![
             text("shopot")
-                .size(14)
+                .size(14.0 * scale)
                 .font(palette::bold())
                 .color(palette::ACCENT),
             space::Space::new().width(Length::Fill),
-            text(label).size(11).color(color),
+            text(label).size(11.0 * scale).color(color),
         ]
         .align_y(Vertical::Center),
     )
@@ -651,9 +663,10 @@ fn title_bar<L: CoreLink>(state: &State<L>) -> Element<'static, Message> {
 }
 
 fn sidebar<L: CoreLink>(state: &State<L>) -> Element<'_, Message> {
+    let scale = state.store.settings.font_scale;
     let selected = state.store.selected();
     // Снимок строк + ключ ленивости: список перестраивается только при
-    // изменении состава/статусов (GUI_DEV.md §3 — список чатов lazy).
+    // изменении состава/статусов или масштаба (GUI_DEV.md §3 — lazy).
     let rows: Vec<(Cid, String, bool, u32, bool)> = state
         .store
         .contacts()
@@ -674,10 +687,10 @@ fn sidebar<L: CoreLink>(state: &State<L>) -> Element<'_, Message> {
         container(
             column![
                 text("Пока контактов нет. Создайте код приглашения или вставьте чужой.")
-                    .size(12)
+                    .size(12.0 * scale)
                     .color(palette::DIM),
                 row![
-                    button(text("Пригласить").size(12).color(palette::TEXT))
+                    button(text("Пригласить").size(12.0 * scale).color(palette::TEXT))
                         .padding(Padding {
                             top: 6.0,
                             right: 12.0,
@@ -686,7 +699,7 @@ fn sidebar<L: CoreLink>(state: &State<L>) -> Element<'_, Message> {
                         })
                         .style(palette::button_dim)
                         .on_press(Message::Meet(MeetIn::OpenInvite)),
-                    button(text("Добавить").size(12).color(palette::TEXT))
+                    button(text("Добавить").size(12.0 * scale).color(palette::TEXT))
                         .padding(Padding {
                             top: 6.0,
                             right: 12.0,
@@ -708,18 +721,23 @@ fn sidebar<L: CoreLink>(state: &State<L>) -> Element<'_, Message> {
         })
         .into()
     } else {
-        let key: Vec<(i64, u32, bool, bool)> = rows
+        // Масштаб в ключе: смена настройки обязана перерисовать строки.
+        let key: Vec<(u32, i64, u32, bool, bool)> = rows
             .iter()
-            .map(|(cid, _, online, unread, chosen)| (cid.0, *unread, *online, *chosen))
+            .map(|(cid, _, online, unread, chosen)| {
+                (scale.to_bits(), cid.0, *unread, *online, *chosen)
+            })
             .collect();
         lazy(key, move |_| {
             let mut list = column![].spacing(2);
             for (cid, name, online, unread, chosen) in &rows {
                 // Правая кнопка — меню знакомства; on_move запоминает точку.
                 list = list.push(
-                    mouse_area(widgets::contact_row(*cid, name, *online, *unread, *chosen))
-                        .on_right_press(Message::Meet(MeetIn::OpenMenu(*cid)))
-                        .on_move(|point| Message::Meet(MeetIn::Cursor(point))),
+                    mouse_area(widgets::contact_row(
+                        *cid, name, *online, *unread, *chosen, scale,
+                    ))
+                    .on_right_press(Message::Meet(MeetIn::OpenMenu(*cid)))
+                    .on_move(|point| Message::Meet(MeetIn::Cursor(point))),
                 );
             }
             list
@@ -731,7 +749,7 @@ fn sidebar<L: CoreLink>(state: &State<L>) -> Element<'_, Message> {
     let mut pane = column![list].spacing(4);
     if has_contacts {
         pane = pane.push(
-            button(text("Пригласить").size(12).color(palette::DIM))
+            button(text("Пригласить").size(12.0 * scale).color(palette::DIM))
                 .width(Length::Fill)
                 .padding(Padding {
                     top: 6.0,
@@ -758,13 +776,18 @@ fn sidebar<L: CoreLink>(state: &State<L>) -> Element<'_, Message> {
 }
 
 fn main_pane<L: CoreLink>(state: &State<L>) -> Element<'_, Message> {
+    let scale = state.store.settings.font_scale;
     let Some(cid) = state.store.selected() else {
-        return container(text("Выберите чат слева").size(13).color(palette::DIM))
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .align_x(Horizontal::Center)
-            .align_y(Vertical::Center)
-            .into();
+        return container(
+            text("Выберите чат слева")
+                .size(13.0 * scale)
+                .color(palette::DIM),
+        )
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .align_x(Horizontal::Center)
+        .align_y(Vertical::Center)
+        .into();
     };
 
     let name = state
@@ -780,7 +803,7 @@ fn main_pane<L: CoreLink>(state: &State<L>) -> Element<'_, Message> {
             button(
                 column![
                     text(name.clone())
-                        .size(14)
+                        .size(14.0 * scale)
                         .font(palette::bold())
                         .color(palette::TEXT),
                     {
@@ -789,7 +812,7 @@ fn main_pane<L: CoreLink>(state: &State<L>) -> Element<'_, Message> {
                             Session::Down => ("сессия не установлена", palette::WARN),
                             Session::Unknown => ("состояние сессии неизвестно", palette::MUTED),
                         };
-                        text(label).size(10).color(color)
+                        text(label).size(10.0 * scale).color(color)
                     },
                 ]
                 .spacing(1)
@@ -805,7 +828,7 @@ fn main_pane<L: CoreLink>(state: &State<L>) -> Element<'_, Message> {
             .on_press(Message::Meet(MeetIn::OpenCard(cid))),
             space::Space::new().width(Length::Fill),
             text(if online { "●" } else { "○" })
-                .size(12)
+                .size(12.0 * scale)
                 .color(if online { palette::OK } else { palette::DIM }),
         ]
         .spacing(8)
@@ -840,6 +863,8 @@ fn main_pane<L: CoreLink>(state: &State<L>) -> Element<'_, Message> {
 }
 
 fn feed_view<L: CoreLink>(state: &State<L>, cid: Cid) -> Element<'_, Message> {
+    let scale = state.store.settings.font_scale;
+    let compact = state.store.settings.compact;
     let items = state.store.feed(cid, local_day);
     let mut list = column![].spacing(2).padding(Padding {
         top: 8.0,
@@ -849,10 +874,15 @@ fn feed_view<L: CoreLink>(state: &State<L>, cid: Cid) -> Element<'_, Message> {
     });
     for item in items {
         match item {
-            FeedItem::DateSep { ts_ms } => list = list.push(widgets::date_sep(ts_ms)),
-            FeedItem::Sys { text } => list = list.push(widgets::sys_line(text)),
+            FeedItem::DateSep { ts_ms } => list = list.push(widgets::date_sep(ts_ms, scale)),
+            FeedItem::Sys { text } => list = list.push(widgets::sys_line(text, scale)),
             group @ FeedItem::Group { .. } => {
-                for element in widgets::message_group(&group) {
+                let rows = if compact {
+                    widgets::compact_group(&group, scale)
+                } else {
+                    widgets::message_group(&group, scale)
+                };
+                for element in rows {
                     list = list.push(element);
                 }
             }
@@ -874,15 +904,17 @@ fn feed_view<L: CoreLink>(state: &State<L>, cid: Cid) -> Element<'_, Message> {
 }
 
 fn composer<L: CoreLink>(state: &State<L>) -> Element<'_, Message> {
+    let scale = state.store.settings.font_scale;
     let empty = state.composer.text().trim().is_empty();
-    // Авторост: базовая строка 48 px, до 5 строк (128 px) — GUI_UI.md §1.
+    // Авторост: базовая строка 48 px, до 5 строк — GUI_UI.md §1;
+    // высота растёт вместе с масштабом шрифта.
     let lines = state.composer.text().lines().count().clamp(1, 5) as f32;
-    let editor_height = 48.0 + (lines - 1.0) * 20.0;
+    let editor_height = (48.0 + (lines - 1.0) * 20.0) * scale;
 
     let editor = text_editor(&state.composer)
         .id(state.composer_id.clone())
         .height(Length::Fixed(editor_height))
-        .size(14)
+        .size(14.0 * scale)
         .placeholder("Сообщение… · Enter — отправить, Shift+Enter — перенос строки")
         .padding(Padding {
             top: 10.0,
@@ -896,7 +928,7 @@ fn composer<L: CoreLink>(state: &State<L>) -> Element<'_, Message> {
 
     let send = button(
         text("Отправить")
-            .size(12)
+            .size(12.0 * scale)
             .font(palette::bold())
             .color(palette::BG),
     )
@@ -947,6 +979,7 @@ fn key_binding(event: text_editor::KeyPress) -> Option<text_editor::Binding<Mess
 }
 
 fn status_bar<L: CoreLink>(state: &State<L>) -> Element<'static, Message> {
+    let scale = state.store.settings.font_scale;
     let total = state.store.contacts().count();
     let online = state.store.online_count();
     let (line, color) = if !state.link.is_stub() && !state.link_up {
@@ -965,7 +998,7 @@ fn status_bar<L: CoreLink>(state: &State<L>) -> Element<'static, Message> {
             palette::DIM,
         )
     };
-    container(text(line).size(11).color(color))
+    container(text(line).size(11.0 * scale).color(color))
         .width(Length::Fill)
         .height(Length::Fixed(24.0))
         .padding(Padding {
