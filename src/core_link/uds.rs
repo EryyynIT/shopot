@@ -811,6 +811,88 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn accept_invite_block_unblock_payloads_on_wire() {
+        let path = temp_socket("meet");
+        cleanup(&path);
+        let listener = UnixListener::bind(&path).expect("сокет забинден");
+        let link = Arc::new(UdsLink::with_config(
+            path.clone(),
+            Duration::from_millis(10),
+            false,
+        ));
+        let _events = CoreLink::events(Arc::clone(&link));
+        let (mut stream, _) = listener.accept().await.expect("коннект");
+
+        // ACCEPT_INVITE: code str16 + my_name str16 (пустое — ядро подставит «друг»).
+        let task = {
+            let link = Arc::clone(&link);
+            tokio::spawn(async move {
+                CoreLink::execute(
+                    &*link,
+                    Request::Add {
+                        code: "shopot://i/AbCdEf".into(),
+                    },
+                )
+                .await
+            })
+        };
+        let (header, payload) = read_frame(&mut stream).await;
+        assert_eq!(header.id, Method::AcceptInvite as u16);
+        let mut r = api::Reader::new(&payload);
+        assert_eq!(
+            r.read_str16().map(|b| std::str::from_utf8(b).unwrap()),
+            Ok("shopot://i/AbCdEf")
+        );
+        assert_eq!(
+            r.read_str16().map(|b| std::str::from_utf8(b).unwrap()),
+            Ok(""),
+            "my_name пустой: имя задаёт держатель кода у себя"
+        );
+        assert!(!r.has_more(), "строгий разбор payload");
+        let mut answer = Vec::new();
+        api::put::u32(&mut answer, 12);
+        stream
+            .write_all(&response_frame(
+                Method::AcceptInvite as u16,
+                header.request_id,
+                Status::Ok,
+                &answer,
+            ))
+            .await
+            .expect("ответ");
+        assert_eq!(
+            task.await.expect("задача не паникует"),
+            Ok(OkReply::Added { cid: Cid(12) })
+        );
+
+        // BLOCK_CONTACT: только cid u32; ответ пуст.
+        for (method, request) in [
+            (Method::BlockContact, Request::Block { cid: Cid(12) }),
+            (Method::UnblockContact, Request::Unblock { cid: Cid(12) }),
+        ] {
+            let task = {
+                let link = Arc::clone(&link);
+                let request = request.clone();
+                tokio::spawn(async move { CoreLink::execute(&*link, request).await })
+            };
+            let (header, payload) = read_frame(&mut stream).await;
+            assert_eq!(header.id, method as u16);
+            assert_eq!(payload, 12u32.to_le_bytes(), "payload = cid u32");
+            stream
+                .write_all(&response_frame(
+                    method as u16,
+                    header.request_id,
+                    Status::Ok,
+                    &[],
+                ))
+                .await
+                .expect("ответ");
+            assert_eq!(task.await.expect("задача не паникует"), Ok(OkReply::Done));
+        }
+        cleanup(&path);
+    }
+
+    #[tokio::test]
     async fn responses_route_by_request_id_even_out_of_order() {
         let path = temp_socket("ooo");
         cleanup(&path);

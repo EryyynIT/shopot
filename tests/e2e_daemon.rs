@@ -10,8 +10,9 @@ use std::process::{Child, Command};
 use std::time::{Duration, Instant};
 
 use futures_util::StreamExt;
+use shopot_gui::core_link::api::Status;
 use shopot_gui::core_link::uds::UdsLink;
-use shopot_gui::core_link::{CoreLink, LinkEvent, OkReply, Request};
+use shopot_gui::core_link::{CoreLink, LinkError, LinkEvent, OkReply, Request};
 
 struct Daemon(Child, PathBuf);
 
@@ -197,4 +198,35 @@ async fn invite_message_delivery_two_daemons() {
         |e| matches!(e, LinkEvent::MessageDelivered { msg_id: m, .. } if *m == msg_id),
     )
     .await;
+
+    // S2: блок/разблок на реальном ядре. Заблокированному отправка
+    // отклоняется CONTACT_BLOCKED, после разблокировки снова уходит.
+    assert_eq!(
+        CoreLink::execute(&*link_b, Request::Block { cid: cid_b }).await,
+        Ok(OkReply::Done),
+        "BLOCK_CONTACT"
+    );
+    let reply = CoreLink::execute(
+        &*link_b,
+        Request::SendMsg {
+            cid: cid_b,
+            text: "не уйдёт".into(),
+        },
+    )
+    .await;
+    assert_eq!(reply, Err(LinkError::Kernel(Status::ContactBlocked)));
+    assert_eq!(
+        CoreLink::execute(&*link_b, Request::Unblock { cid: cid_b }).await,
+        Ok(OkReply::Done),
+        "UNBLOCK_CONTACT"
+    );
+    let reply = CoreLink::execute(
+        &*link_b,
+        Request::SendMsg {
+            cid: cid_b,
+            text: "снова уходит".into(),
+        },
+    )
+    .await;
+    assert!(matches!(reply, Ok(OkReply::Sent { .. })), "{reply:?}");
 }
