@@ -118,7 +118,7 @@ fn click(text: &str) -> [Instruction; 2] {
 fn smoke_scenarios() {
     contacts_reply_populates_sidebar();
     incoming_message_counts_unread();
-    send_flow_shows_sent_and_autoreply();
+    send_flow_shows_delivered_and_autoreply();
 }
 
 /// contacts → сайдбар populated: имя, статус «в сети», счётчик сессий.
@@ -165,8 +165,8 @@ fn incoming_message_counts_unread() {
     );
 }
 
-/// Отправка: «отправлено» в ленте, автоответ, бейдж сброшен открытием.
-fn send_flow_shows_sent_and_autoreply() {
+/// Отправка: ACK ядра показывает «доставлено», затем автоответ.
+fn send_flow_shows_delivered_and_autoreply() {
     let program = app::program(Link::new(Scene::smoke()));
     let (sender, mut receiver) = mpsc::channel(512);
     let mut emu = Emulator::new(
@@ -197,12 +197,12 @@ fn send_flow_shows_sent_and_autoreply() {
 
     pump(&mut emu, &program, &mut receiver, 1500);
 
-    // Лента показывает и статус отправки, и автоответ.
+    // Лента показывает доставку (ACK ядра) и автоответ.
     run_instruction(
         &mut emu,
         &program,
         &mut receiver,
-        Instruction::Expect(Expectation::Text("отправлено".into())),
+        Instruction::Expect(Expectation::Text("доставлено".into())),
     );
     run_instruction(
         &mut emu,
@@ -219,7 +219,11 @@ fn send_flow_shows_sent_and_autoreply() {
         .iter()
         .find(|m| m.body == "привет")
         .expect("моё сообщение в ленте");
-    assert_eq!(sent.send, SendState::Sent);
+    assert_eq!(
+        sent.send,
+        SendState::Delivered,
+        "заглушка шлёт квази-ACK — как реальное ядро"
+    );
     assert!(thread.msgs.iter().any(|m| m.body == "пинг"));
     assert!(thread.msgs.iter().any(|m| m.body == "принято"));
 }
