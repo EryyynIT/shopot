@@ -26,6 +26,10 @@ use crate::model::store::Store;
 /// Лимит тела SEND_MESSAGE (str16 ≤ 4096, CORE-API.md §4.3).
 const MAX_BODY: usize = 4096;
 
+/// Первый запрос истории при открытии чата; догрузка растёт от него
+/// до потолка ядра (GUI_DEV.md §3: порциями 100–200).
+const HISTORY_LOAD: u32 = 100;
+
 /// Сообщения приложения: канал ядра, действия чата, знакомство, настройки,
 /// окно.
 #[derive(Debug, Clone)]
@@ -57,6 +61,10 @@ pub enum ChatIn {
     SelectIndex(usize),
     Send,
     Edit(text_editor::Action),
+    /// Лента прокручена; `true` — докатились до верха: догрузить более
+    /// старые сообщения (S6; окно GET_HISTORY растёт от загруженного
+    /// до потолка ядра).
+    ScrollTop(bool),
 }
 
 /// Действия знакомства: инвайт-диалог, карточка контакта, блокировка
@@ -171,6 +179,9 @@ pub struct State<L: CoreLink> {
     /// (GUI_UI.md §4). Подписку окна обслуживает main; по умолчанию
     /// считаем окно в фокусе.
     pub window_focused: bool,
+    /// GET_HISTORY в полёте — скролл к верху не плодит повторных
+    /// запросов, пока окно не доехало.
+    pub history_in_flight: bool,
 }
 
 impl<L: CoreLink> State<L> {
@@ -186,6 +197,7 @@ impl<L: CoreLink> State<L> {
             cursor: Point::ORIGIN,
             invite_code: None,
             window_focused: true,
+            history_in_flight: false,
         }
     }
 
@@ -404,6 +416,17 @@ fn on_link<L: CoreLink>(state: &mut State<L>, link: LinkIn) -> Task<Message> {
                 state.store.set_blocked(cid, false);
                 Task::none()
             }
+            // История дописывается в начало ленты; позицию прокрутки не
+            // трогаем — пользователь читает то же место (S6).
+            (Request::History { cid, .. }, Ok(OkReply::History { total, records })) => {
+                state.history_in_flight = false;
+                state.store.load_history(cid, total, &records);
+                Task::none()
+            }
+            (Request::History { .. }, Err(_)) => {
+                state.history_in_flight = false;
+                Task::none()
+            }
             // Остальные ответы ядерного канала появляются со своими спринтами.
             _ => Task::none(),
         },
@@ -429,18 +452,53 @@ fn on_chat<L: CoreLink>(state: &mut State<L>, chat: ChatIn) -> Task<Message> {
             Task::none()
         }
         ChatIn::Send => send_current(state),
+        ChatIn::ScrollTop(at_top) => {
+            if at_top {
+                load_older(state)
+            } else {
+                Task::none()
+            }
+        }
     }
 }
 
-/// Открыть чат: непрочитанные обнулены, композер заряжен черновиком.
+/// Открыть чат: непрочитанные обнулены, композер заряжен черновиком,
+/// при первом открытии запрошена история (S6).
 fn select_chat<L: CoreLink>(state: &mut State<L>, cid: Cid) -> Task<Message> {
     state.store.select(Some(cid));
     let draft = state.store.draft(cid).to_owned();
     state.composer = text_editor::Content::with_text(&draft);
-    Task::batch([
+    let mut tasks = vec![
         scroll_feed(state),
         operation::focus::<Message>(state.composer_id.clone()),
-    ])
+    ];
+    if !state.store.history_requested(cid) && !state.history_in_flight {
+        state.store.mark_history_requested(cid);
+        state.history_in_flight = true;
+        tasks.push(request_task(
+            state,
+            Request::History {
+                cid,
+                limit: HISTORY_LOAD,
+            },
+        ));
+    }
+    Task::batch(tasks)
+}
+
+/// Скролл к верху ленты: расширить окно истории. Повторные события
+/// скролла глушатся флагом в полёте и потолком окна ядра.
+fn load_older<L: CoreLink>(state: &mut State<L>) -> Task<Message> {
+    let Some(cid) = state.store.selected() else {
+        return Task::none();
+    };
+    if state.history_in_flight || !state.store.has_more_history(cid) {
+        return Task::none();
+    }
+    let limit =
+        (state.store.history_loaded(cid) + HISTORY_LOAD).min(crate::core_link::HISTORY_MAX_LIMIT);
+    state.history_in_flight = true;
+    request_task(state, Request::History { cid, limit })
 }
 
 /// Действия знакомства; все они идут через [`request_task`], ответы
@@ -1012,6 +1070,7 @@ fn feed_view<L: CoreLink>(state: &State<L>, cid: Cid) -> Element<'_, Message> {
         .id(state.feed_id.clone())
         .width(Length::Fill)
         .height(Length::Fill)
+        .on_scroll(|viewport| Message::Chat(ChatIn::ScrollTop(viewport.absolute_offset().y <= 0.0)))
         .into()
 }
 
@@ -1274,6 +1333,66 @@ mod tests {
 
         let _ = update(&mut state, Message::Chat(ChatIn::SelectIndex(5)));
         assert_eq!(state.store.selected(), None, "лишний номер молчится");
+    }
+
+    /// Поток истории S6: первое открытие чата запрашивает GET_HISTORY,
+    /// ответ восстанавливает ленту, скролл к верху догружает старое,
+    /// после исчерпания окна запросы не уходят.
+    #[test]
+    fn chat_open_restores_history_and_top_scroll_pages_older() {
+        let mut state = state();
+        state.store.replace_contacts(vec![contact(1, "Аня")]);
+        let _ = update(&mut state, Message::Chat(ChatIn::Select(Cid(1))));
+        assert!(state.store.history_requested(Cid(1)), "история запрошена");
+        assert!(state.history_in_flight);
+
+        let record = |n: u8, ts: i64, text: &str| crate::core_link::HistoryMsg {
+            mine: false,
+            delivered: false,
+            msg_id: crate::model::msg::CoreMsgId([n; 16]),
+            ts_ms: ts,
+            text: text.to_owned(),
+        };
+        let history_reply = |records: Vec<crate::core_link::HistoryMsg>| {
+            Message::Link(LinkIn::Replied {
+                request: Request::History {
+                    cid: Cid(1),
+                    limit: 100,
+                },
+                reply: Ok(OkReply::History { total: 3, records }),
+                tag: None,
+            })
+        };
+
+        let _ = update(
+            &mut state,
+            history_reply(vec![record(1, 1000, "раз"), record(2, 2000, "два")]),
+        );
+        assert!(!state.history_in_flight);
+        let msgs = &state.store.thread(Cid(1)).unwrap().msgs;
+        assert_eq!(msgs.len(), 2, "лента восстановлена");
+        assert!(state.store.has_more_history(Cid(1)));
+
+        // Скролл к верху: окно растёт до потолка, старое встаёт впереди.
+        let _ = update(&mut state, Message::Chat(ChatIn::ScrollTop(true)));
+        assert!(state.history_in_flight, "догрузка запрошена");
+        let _ = update(
+            &mut state,
+            history_reply(vec![record(0, 500, "самое старое")]),
+        );
+        assert_eq!(
+            state.store.thread(Cid(1)).unwrap().msgs[0].body,
+            "самое старое"
+        );
+        assert!(!state.store.has_more_history(Cid(1)), "total 3 исчерпан");
+
+        // Верх без остатка — запрос не уходит.
+        let _ = update(&mut state, Message::Chat(ChatIn::ScrollTop(true)));
+        assert!(!state.history_in_flight, "нечего догружать");
+
+        // Скролл не у верха глушится сразу.
+        let _ = update(&mut state, Message::Chat(ChatIn::ScrollTop(false)));
+        assert!(!state.history_in_flight);
     }
 
     #[test]
