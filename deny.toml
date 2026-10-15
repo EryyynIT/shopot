@@ -1,0 +1,33 @@
+# Гейты поставки: лицензии графа, известные уязвимости, источники.
+# Проверка: cargo deny check (в CI — job deny).
+
+[graph]
+all-features = true
+
+[licenses]
+version = 2
+# Только пермиссивные; всё прочее — запрет по умолчанию.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "Zlib",
+    "CC0-1.0",
+    "BSL-1.0",
+    "NCSA",
+]
+
+[advisories]
+version = 2
+# Уязвимости — deny по умолчанию; unmaintained/yanked — предупреждения.
+unmaintained = "workspace"
+yanked = "warn"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
