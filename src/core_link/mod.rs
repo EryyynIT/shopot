@@ -5,6 +5,7 @@
 //! но не знает про сам сокет: реальный транспорт появится в
 //! `uds.rs` одной заменой типа в [`crate::app`].
 
+pub mod api;
 pub mod mock;
 
 use std::future::Future;
