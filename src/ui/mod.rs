@@ -57,8 +57,14 @@ pub enum ChatIn {
 /// (спринт S2, GUI_UI.md §1).
 #[derive(Debug, Clone)]
 pub enum MeetIn {
-    /// Открыть инвайт-диалог; код из кэша сессии или CREATE_INVITE.
+    /// Открыть инвайт-диалог: форма выдачи + LAN-код из кэша сессии.
     OpenInvite,
+    /// Ввод адреса для кода (host:port; пусто — только локальная сеть).
+    AddrInput(String),
+    /// Галка «через relay»: соединение через релей, peer IP не видит.
+    RelayToggled(bool),
+    /// Выдать код (CREATE_INVITE с текущими адресом и relay).
+    IssueInvite,
     /// Скопировать код приглашения в буфер обмена.
     CopyCode,
     /// Ввод чужого кода.
@@ -98,6 +104,10 @@ pub struct InviteView {
     pub foreign: String,
     /// ACCEPT_INVITE в полёте — кнопка «Добавить» неактивна.
     pub submitting: bool,
+    /// Адрес для кода: пусто — только локальная сеть (LAN-анонс ядра).
+    pub addr: String,
+    /// Выдать код через relay; требует адреса (CORE-API.md §4.2).
+    pub relay: bool,
 }
 
 /// Меню по правой кнопке на контакте (GUI_UI.md §4).
@@ -265,9 +275,13 @@ fn on_link<L: CoreLink>(state: &mut State<L>, link: LinkIn) -> Task<Message> {
                 }
                 Task::none()
             }
-            (Request::Invite { .. }, Ok(OkReply::Code(code))) => {
-                state.invite_code = Some(code.clone());
+            (Request::Invite { relay, addr }, Ok(OkReply::Code(code))) => {
+                // Кэшируем только LAN-код; коды с адресом — разовое решение.
+                if !relay && addr.is_empty() {
+                    state.invite_code = Some(code.clone());
+                }
                 if let Overlay::Invite(view) = &mut state.overlay {
+                    view.submitting = false;
                     view.code = Some(code.clone());
                     view.qr = qr_of(&code);
                 }
@@ -275,6 +289,7 @@ fn on_link<L: CoreLink>(state: &mut State<L>, link: LinkIn) -> Task<Message> {
             }
             (Request::Invite { .. }, Err(err)) => {
                 if let Overlay::Invite(view) = &mut state.overlay {
+                    view.submitting = false;
                     view.error = Some(err.user_text());
                 }
                 Task::none()
@@ -345,24 +360,47 @@ fn on_meet<L: CoreLink>(state: &mut State<L>, meet: MeetIn) -> Task<Message> {
                 error: None,
                 foreign: String::new(),
                 submitting: false,
+                addr: String::new(),
+                relay: false,
             }));
-            match state.invite_code.clone() {
-                Some(code) => {
-                    // Кэш сессии: не тратим слот реестра приглашений.
-                    if let Overlay::Invite(view) = &mut state.overlay {
-                        view.code = Some(code.clone());
-                        view.qr = qr_of(&code);
-                    }
-                    Task::none()
+            // Кэш LAN-кода: не тратим слот реестра приглашений.
+            if let Some(code) = state.invite_code.clone() {
+                if let Overlay::Invite(view) = &mut state.overlay {
+                    view.code = Some(code.clone());
+                    view.qr = qr_of(&code);
                 }
-                None => request_task(
-                    state,
-                    Request::Invite {
-                        relay: false,
-                        addr: String::new(),
-                    },
-                ),
             }
+            Task::none()
+        }
+        MeetIn::AddrInput(text) => {
+            if let Overlay::Invite(view) = &mut state.overlay {
+                view.addr = text;
+                // relay без адреса не имеет смысла — снимаем галку.
+                if view.addr.trim().is_empty() {
+                    view.relay = false;
+                }
+            }
+            Task::none()
+        }
+        MeetIn::RelayToggled(on) => {
+            if let Overlay::Invite(view) = &mut state.overlay {
+                view.relay = on && !view.addr.trim().is_empty();
+            }
+            Task::none()
+        }
+        MeetIn::IssueInvite => {
+            let request = match &state.overlay {
+                Overlay::Invite(view) if !view.submitting => Request::Invite {
+                    relay: view.relay,
+                    addr: view.addr.trim().to_owned(),
+                },
+                _ => return Task::none(),
+            };
+            if let Overlay::Invite(view) = &mut state.overlay {
+                view.submitting = true;
+                view.error = None;
+            }
+            request_task(state, request)
         }
         MeetIn::CopyCode => {
             let code = match &state.overlay {

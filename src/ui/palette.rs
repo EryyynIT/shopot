@@ -3,7 +3,7 @@
 //! состояний. Никаких цветов мимо этого модуля.
 
 use iced::border::Radius;
-use iced::widget::{button, container, qr_code, text, text_editor, text_input};
+use iced::widget::{button, checkbox, container, qr_code, text, text_editor, text_input};
 use iced::{Background, Border, Color, Theme};
 
 /// Основной фон окна.
@@ -261,6 +261,24 @@ pub fn input(_: &Theme, status: text_input::Status) -> text_input::Style {
         placeholder: DIM,
         value: TEXT,
         selection: Color::from_rgba8(0x4C, 0xC2, 0xFF, 0.30),
+    }
+}
+
+/// Чекбокс диалога: рамка LINE, отметка акцентом (без цветных заливок).
+pub fn checkbox_style(_: &Theme, status: checkbox::Status) -> checkbox::Style {
+    let text_color = match status {
+        checkbox::Status::Disabled { .. } => MUTED,
+        _ => TEXT,
+    };
+    checkbox::Style {
+        background: Background::Color(RAISE),
+        icon_color: ACCENT,
+        border: Border {
+            color: LINE,
+            width: 1.0,
+            radius: Radius::from(4.0),
+        },
+        text_color: Some(text_color),
     }
 }
 

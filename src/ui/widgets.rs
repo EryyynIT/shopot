@@ -275,12 +275,52 @@ pub fn invite_panel(view: &InviteView) -> Element<'_, Message> {
         .color(palette::TEXT),]
     .spacing(10);
 
+    // Форма выдачи: адрес опционален; relay только с адресом (CORE-API §4.2).
+    body = body.push(text("Адрес").size(11).color(palette::DIM));
+    body = body.push(
+        text_input("host:7777 — необязательно", &view.addr)
+            .on_input(|value| Message::Meet(MeetIn::AddrInput(value)))
+            .size(12)
+            .padding(8)
+            .style(palette::input),
+    );
+    body = body.push(
+        iced::widget::checkbox(view.relay)
+            .label("через relay — собеседник не увидит ваш IP")
+            .on_toggle(|on| Message::Meet(MeetIn::RelayToggled(on)))
+            .text_size(11)
+            .style(palette::checkbox_style),
+    );
+    body = body.push(
+        text("Без адреса код работает только в одной локальной сети.")
+            .size(10)
+            .color(palette::DIM),
+    );
+    body = body.push(
+        button(
+            text("Выдать код")
+                .size(12)
+                .font(palette::bold())
+                .color(palette::BG),
+        )
+        .padding(Padding {
+            top: 8.0,
+            right: 14.0,
+            bottom: 8.0,
+            left: 14.0,
+        })
+        .style(palette::button_accent)
+        .on_press_maybe((!view.submitting).then_some(Message::Meet(MeetIn::IssueInvite))),
+    );
+
     body = body.push(text("Мой код").size(11).color(palette::DIM));
     body = body.push(match (&view.code, &view.error) {
         (Some(code), _) => text(crate::ui::elided_code(code))
             .size(11)
             .color(palette::TEXT),
-        (None, None) => text("Код выдаётся…").size(11).color(palette::DIM),
+        (None, None) => text("Код появится после выдачи.")
+            .size(11)
+            .color(palette::DIM),
         (None, Some(_)) => text("Код не выдан.").size(11).color(palette::ERR),
     });
 
