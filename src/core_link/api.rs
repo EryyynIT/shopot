@@ -66,12 +66,31 @@ pub enum Method {
 
 impl Method {
     pub fn from_u16(v: u16) -> Option<Self> {
-        if v > 0 && v <= 22 {
-            // Дискриминанты плотные: 1..=22 без пропусков.
-            Some(unsafe { std::mem::transmute(v) })
-        } else {
-            None
-        }
+        Some(match v {
+            1 => Self::Close,
+            2 => Self::GetVersion,
+            3 => Self::GetIdentity,
+            4 => Self::CreateInvite,
+            5 => Self::AcceptInvite,
+            6 => Self::ListContacts,
+            7 => Self::SendMessage,
+            8 => Self::SetReaction,
+            9 => Self::RemoveReaction,
+            10 => Self::GetHistory,
+            11 => Self::GetMessage,
+            12 => Self::SetName,
+            13 => Self::SetAvatar,
+            14 => Self::GetAvatarId,
+            15 => Self::SendFile,
+            16 => Self::StartCall,
+            17 => Self::AnswerCall,
+            18 => Self::EndCall,
+            19 => Self::BlockContact,
+            20 => Self::UnblockContact,
+            21 => Self::Connect,
+            22 => Self::Listen,
+            _ => return None,
+        })
     }
 }
 
@@ -355,6 +374,13 @@ pub mod put {
     }
 
     pub fn u32(out: &mut Vec<u8>, v: u32) {
+        out.extend_from_slice(&v.to_le_bytes());
+    }
+    pub fn u64(out: &mut Vec<u8>, v: u64) {
+        out.extend_from_slice(&v.to_le_bytes());
+    }
+
+    pub fn i64(out: &mut Vec<u8>, v: i64) {
         out.extend_from_slice(&v.to_le_bytes());
     }
 

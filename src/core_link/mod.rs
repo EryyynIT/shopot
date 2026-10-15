@@ -1,122 +1,163 @@
-//! Канал с ядром: [`CoreLink`], запросы, ответы, события.
+//! Канал с ядром: [`CoreLink`], типизированные запросы, ответы, события.
 //!
-//! Трейт проектируется под будущий строчный протокол UDS
-//! (`@<n> <команда>` → `@<n> ok|err`, события `imsg`/`msg`/`presence`/`sys`),
-//! но не знает про сам сокет: реальный транспорт появится в
-//! `uds.rs` одной заменой типа в [`crate::app`].
+//! Контракт — бинарный протокол API 1.0.0 ядра shopot (подмодуль `core/`,
+//! спецификация `core/zig/docs/CORE-API.md`): один REQUEST = один RESPONSE
+//! с корреляцией по request_id, события рассылаются всем. Кодек кадров —
+//! в [`api`], транспорт и раскладки payload — в [`uds`], демо-режим — в
+//! [`mock`]. Строк на проводе нет: пользовательский текст появляется
+//! только после [`LinkError::user_text`].
 
 pub mod api;
 pub mod mock;
+pub mod uds;
 
 use std::future::Future;
+use std::hash::Hash;
 use std::sync::Arc;
 
 use futures_core::Stream;
 
 use crate::model::cid::Cid;
-use crate::model::msg::MsgId;
-
-/// Идентификатор запроса (тег `@<n>` в реальном протоколе).
-pub type ReqId = u64;
+use crate::model::msg::CoreMsgId;
+use crate::model::store::Contact;
 
 /// Текущее время в мс — единая точка для ts у событий и сообщений.
 pub fn now_ms() -> i64 {
     chrono::Utc::now().timestamp_millis()
 }
 
-/// Машинный формат списка контактов (затык 6 из LOCAL_PLANS.md):
-/// `c <cid> <on|off> <b|-> <имя>`.
-pub fn format_contact(c: &crate::model::store::Contact) -> String {
-    format!(
-        "c {} {} {} {}",
-        c.cid,
-        if c.online { "on" } else { "off" },
-        if c.blocked { "b" } else { "-" },
-        c.name
-    )
-}
-
-/// Разбор машинного формата. Чужие строки — не паника, просто пропускаются.
-pub fn parse_contacts(lines: &[String]) -> Vec<crate::model::store::Contact> {
-    lines
-        .iter()
-        .filter_map(|line| {
-            let mut parts = line.splitn(5, ' ');
-            let tag = parts.next()?;
-            if tag != "c" {
-                return None;
-            }
-            let cid = parts.next()?.parse::<i64>().ok()?;
-            let online = match parts.next()? {
-                "on" => true,
-                "off" => false,
-                _ => return None,
-            };
-            let blocked = match parts.next()? {
-                "-" => false,
-                "b" => true,
-                _ => return None,
-            };
-            let name = parts.next()?.to_owned();
-            Some(crate::model::store::Contact {
-                cid: Cid(cid),
-                name,
-                online,
-                blocked,
-            })
-        })
-        .collect()
-}
-
-/// Команда ядру. Состав повторяет команды TUI/REPL.
+/// Команда ядру; одна команда = один метод API 1.0.0.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Request {
-    /// Машинный список контактов: строки `c <cid> <on|off> <blocked> <имя>`.
+    /// Список контактов (LIST_CONTACTS).
     Contacts,
-    /// Отправить сообщение контакту.
+    /// Отправить сообщение (SEND_MESSAGE). Офлайн-контакт — не ошибка:
+    /// ответ `queued` означает outbox ядра.
     SendMsg { cid: Cid, text: String },
-    /// Добавить контакт по инвайт-коду `shopot1.…`.
+    /// Добавить контакт по инвайт-коду (ACCEPT_INVITE).
     Add { code: String },
-    /// Выдать свой инвайт-код.
+    /// Выдать свой инвайт-код (CREATE_INVITE).
     Invite,
-    /// Заблокировать контакт.
+    /// Заблокировать контакт (BLOCK_CONTACT).
     Block { cid: Cid },
-    /// Разблокировать контакт.
+    /// Разблокировать контакт (UNBLOCK_CONTACT).
     Unblock { cid: Cid },
+}
+
+/// Ошибка канала с ядром (GUI_DEV.md §2: типизированные варианты).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LinkError {
+    /// Демон не отвечает или соединение оборвалось.
+    Disconnected,
+    /// Ядро ответило машинным кодом статуса.
+    Kernel(api::Status),
+    /// Ответ не разобран — нарушение контракта со стороны ядра.
+    BadFrame(&'static str),
+}
+
+impl std::fmt::Display for LinkError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Disconnected => write!(f, "нет связи с ядром"),
+            Self::Kernel(status) => write!(f, "ядро: {}", status.name()),
+            Self::BadFrame(what) => write!(f, "кадр не разобран: {what}"),
+        }
+    }
+}
+
+impl std::error::Error for LinkError {}
+
+impl LinkError {
+    /// Текст для пользователя: что случилось + что делать (TEXT_STYLE §3).
+    /// Ядро шлёт только машинные коды — человеческий текст рождается здесь.
+    pub fn user_text(&self) -> String {
+        match self {
+            Self::Disconnected => "Нет связи с ядром. Запустите shopot serve и подождите.".into(),
+            Self::Kernel(api::Status::NoContact) => "Контакт не найден.".into(),
+            Self::Kernel(api::Status::ContactBlocked) => {
+                "Контакт заблокирован. Разблокируйте, чтобы писать.".into()
+            }
+            Self::Kernel(api::Status::BadInviteCode) => {
+                "Неверный код. Скопируйте строку целиком — она начинается с shopot://i/.".into()
+            }
+            Self::Kernel(api::Status::TooManyInvites) => {
+                "Активных приглашений уже четыре. Отзовите старое — новые не выдаются.".into()
+            }
+            Self::Kernel(api::Status::TooBig) => {
+                "Сообщение слишком длинное — лимит 4096 байт.".into()
+            }
+            Self::Kernel(api::Status::NoSession) => {
+                "Нет защищённой сессии. Напишите, когда контакт будет онлайн.".into()
+            }
+            Self::Kernel(api::Status::Internal) => "Сбой ядра. Попробуйте позже.".into(),
+            Self::Kernel(status) => {
+                format!("Ошибка ядра ({}). Попробуйте позже.", status.name())
+            }
+            Self::BadFrame(_) => "Ядро ответило не по протоколу. Обновите shopot-core.".into(),
+        }
+    }
+}
+
+/// Содержательный ответ при OK. Ошибки — через `Err(LinkError)`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OkReply {
+    /// LIST_CONTACTS: контакты в порядке ядра.
+    Contacts(Vec<Contact>),
+    /// SEND_MESSAGE: msg_id ядра + queued (true = ушло в outbox).
+    Sent { msg_id: CoreMsgId, queued: bool },
+    /// ACCEPT_INVITE: cid добавленного контакта.
+    Added { cid: Cid },
+    /// CREATE_INVITE: односторонний инвайт-код.
+    Code(String),
+    /// У команды нет содержательного ответа (block/unblock).
+    Done,
 }
 
 /// Ответ на [`Request`]. Ошибки команды — данные, не паника: они едут
 /// в Store как статус отправки и показываются пользователю.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Reply {
-    Ok(Vec<String>),
-    Err(String),
-}
+pub type Reply = Result<OkReply, LinkError>;
 
-/// События ядра (поток, параллельный ответам).
+/// События ядра (рассылка всем клиентам, CORE-API.md §5).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LinkEvent {
-    /// Входящее сообщение с msg_id (в реальном ядре — событие `imsg`).
-    IMsg {
+    /// Входящее сообщение.
+    MessageReceived {
         cid: Cid,
         name: String,
-        msg_id: MsgId,
+        msg_id: CoreMsgId,
         ts_ms: i64,
         text: String,
     },
-    /// Presence контакта: ● онлайн / ○ офлайн.
-    Presence { cid: Cid, online: bool },
-    /// Служебная строка для ленты контакта.
-    Sys { cid: Cid, text: String },
-    /// Канал упал (для uds-транспорта; заглушка не присылает).
+    /// ACK: сообщение доставлено на устройство пира.
+    MessageDelivered { cid: Cid, msg_id: CoreMsgId },
+    /// Presence контакта; сессия = живое соединение.
+    Presence {
+        cid: Cid,
+        online: bool,
+        last_seen_ms: i64,
+    },
+    /// Держатель нашего инвайта подключился.
+    ContactJoined { cid: Cid, name: String },
+    /// Профиль контакта обновился (имя; avatar_id — с S8).
+    ContactProfile {
+        cid: Cid,
+        name: String,
+        avatar_id: CoreMsgId,
+    },
+    /// Пир заблокировал нас.
+    BlockedByPeer { cid: Cid },
+    /// Соединение с демоном потеряно (транспорт; заглушка не присылает).
     Down,
+    /// Соединение восстановлено — обновить контакты (ресинк).
+    Resync,
 }
 
-/// Равноправная реализация транспорта ядра: заглушка сейчас, UDS позже.
+/// Равноправная реализация транспорта ядра: заглушка сейчас, UDS рядом.
 ///
 /// [`CoreLink::events`] вызывается один раз (подписчик — iced),
 /// [`CoreLink::execute`] — из асинхронного контекста iced (tokio).
-pub trait CoreLink: Send + Sync + 'static {
+/// `Hash` — идентичность подписки iced (`Subscription::run_with`).
+pub trait CoreLink: Send + Sync + Hash + 'static {
     /// Поток событий ядра; забирает ручку линка (подписчик один).
     /// Требует tokio-контекста.
     fn events(self: Arc<Self>) -> impl Stream<Item = LinkEvent> + Send + 'static;
@@ -124,53 +165,41 @@ pub trait CoreLink: Send + Sync + 'static {
     /// Исполнить запрос и вернуть ответ. Будущее не заимствует линк:
     /// его можно уложить в Task и дождаться в update.
     fn execute(&self, request: Request) -> impl Future<Output = Reply> + Send + 'static;
+
+    /// Заглушка это или реальное ядро — для подписей в UI.
+    fn is_stub(&self) -> bool {
+        false
+    }
+}
+
+/// Мост tokio mpsc → futures Stream (без tokio-stream: poll_recv есть
+/// публично). Общий для mock и uds.
+pub(crate) struct RecvStream<T>(tokio::sync::mpsc::Receiver<T>);
+
+impl<T> Stream for RecvStream<T> {
+    type Item = T;
+
+    fn poll_next(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<T>> {
+        // tokio::sync::mpsc::Receiver::poll_recv принимает &mut self.
+        self.get_mut().0.poll_recv(cx)
+    }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::model::store::Contact;
-
-    #[test]
-    fn contact_line_roundtrip() {
-        let contacts = [
-            Contact {
-                cid: Cid(1),
-                name: "Аня".into(),
-                online: true,
-                blocked: false,
-            },
-            Contact {
-                cid: Cid(2),
-                name: "Борис О".into(),
-                online: false,
-                blocked: true,
-            },
-        ];
-        let lines: Vec<String> = contacts.iter().map(format_contact).collect();
-        assert_eq!(lines, ["c 1 on - Аня", "c 2 off b Борис О"]);
-
-        let parsed = parse_contacts(&lines);
-        assert_eq!(parsed.len(), 2);
-        assert_eq!(parsed[0].cid, Cid(1));
-        assert_eq!(parsed[0].name, "Аня");
-        assert!(parsed[0].online);
-        assert!(!parsed[0].blocked);
-        assert_eq!(parsed[1].name, "Борис О", "имя может содержать пробелы");
-        assert!(!parsed[1].online);
-        assert!(parsed[1].blocked);
+pub(crate) async fn take_events(
+    mut stream: impl Stream<Item = LinkEvent> + Unpin,
+    n: usize,
+) -> std::collections::VecDeque<LinkEvent> {
+    use futures_util::StreamExt;
+    use std::collections::VecDeque;
+    let mut out = VecDeque::with_capacity(n);
+    for _ in 0..n {
+        if let Some(event) = stream.next().await {
+            out.push_back(event);
+        }
     }
-
-    #[test]
-    fn parse_skips_garbage_lines() {
-        let lines = vec![
-            "мусор".to_owned(),
-            "c не_число on - X".to_owned(),
-            "c 3 может off - X".to_owned(),
-            "c 4 on - Вера".to_owned(),
-        ];
-        let parsed = parse_contacts(&lines);
-        assert_eq!(parsed.len(), 1);
-        assert_eq!(parsed[0].name, "Вера");
-    }
+    out
 }

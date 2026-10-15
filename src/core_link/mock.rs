@@ -1,13 +1,13 @@
 //! Заглушка ядра: демо-сцена, автоответы, флип presence.
 //!
-//! Не тестовый костыль, а равноправная реализация [`CoreLink`]:
-//! она же демо-режим (статус-строка «режим: заглушка»).
+//! Не тестовый костыль, а равноправная реализация [`CoreLink`]
+//! (`--mock`): семантика повторяет реальный канал — офлайн-отправка
+//! уходит в outbox (queued), ACK приходит отдельно (доставлено).
 
+use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
-use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::task::{Context, Poll};
 use std::time::Duration;
 
 use futures_core::Stream;
@@ -15,9 +15,18 @@ use std::future::Future;
 use tokio::sync::mpsc;
 use tokio::time;
 
-use crate::core_link::{LinkEvent, Reply, Request};
+use crate::core_link::api::Status;
+use crate::core_link::{CoreLink, LinkError, LinkEvent, OkReply, Reply, Request};
 use crate::model::cid::Cid;
-use crate::model::msg::MsgId;
+use crate::model::msg::CoreMsgId;
+use crate::model::store::Contact;
+
+/// msg_id из номера — детерминированные 16 байт для демо/тестов.
+fn core_id(n: u64) -> CoreMsgId {
+    let mut bytes = [0u8; 16];
+    bytes[8..].copy_from_slice(&n.to_be_bytes());
+    CoreMsgId(bytes)
+}
 
 /// Сцена заглушки: кто в контактах и что происходит по таймеру.
 #[derive(Debug, Clone)]
@@ -43,7 +52,6 @@ pub struct SceneContact {
 impl Scene {
     /// Демо-сцена: Аня с непрочитанными, Борис офлайн, Вера онлайн.
     pub fn demo() -> Self {
-        use crate::model::msg::MsgId;
         Self {
             contacts: vec![
                 SceneContact {
@@ -65,30 +73,30 @@ impl Scene {
             scripted: vec![
                 (
                     Duration::from_millis(150),
-                    LinkEvent::IMsg {
+                    LinkEvent::MessageReceived {
                         cid: Cid(1),
                         name: "Аня".into(),
-                        msg_id: MsgId(1001),
+                        msg_id: core_id(1001),
                         ts_ms: crate::core_link::now_ms(),
                         text: "привет!".into(),
                     },
                 ),
                 (
                     Duration::from_millis(250),
-                    LinkEvent::IMsg {
+                    LinkEvent::MessageReceived {
                         cid: Cid(1),
                         name: "Аня".into(),
-                        msg_id: MsgId(1002),
+                        msg_id: core_id(1002),
                         ts_ms: crate::core_link::now_ms(),
                         text: "как дела?".into(),
                     },
                 ),
                 (
                     Duration::from_millis(350),
-                    LinkEvent::IMsg {
+                    LinkEvent::MessageReceived {
                         cid: Cid(2),
                         name: "Борис".into(),
-                        msg_id: MsgId(1003),
+                        msg_id: core_id(1003),
                         ts_ms: crate::core_link::now_ms(),
                         text: "есть минута?".into(),
                     },
@@ -97,10 +105,10 @@ impl Scene {
                     // Жё и Шё в кадре — проверка кириллицы жирных глифов
                     // на скриншоте (GUI_DEV.md §3).
                     Duration::from_millis(450),
-                    LinkEvent::IMsg {
+                    LinkEvent::MessageReceived {
                         cid: Cid(1),
                         name: "Аня".into(),
-                        msg_id: MsgId(1004),
+                        msg_id: core_id(1004),
                         ts_ms: crate::core_link::now_ms(),
                         text: "Жёсткий дедлайн. Шёпотом: переждём.".into(),
                     },
@@ -115,7 +123,6 @@ impl Scene {
     /// Детерминированная сцена для UI-тестов: один онлайн-контакт,
     /// без флипа presence, быстрый автоответ.
     pub fn smoke() -> Self {
-        use crate::model::msg::MsgId;
         Self {
             contacts: vec![SceneContact {
                 cid: 1,
@@ -124,10 +131,10 @@ impl Scene {
             }],
             scripted: vec![(
                 Duration::from_millis(300),
-                LinkEvent::IMsg {
+                LinkEvent::MessageReceived {
                     cid: Cid(1),
                     name: "Аня".into(),
-                    msg_id: MsgId(2001),
+                    msg_id: core_id(2001),
                     ts_ms: crate::core_link::now_ms(),
                     text: "пинг".into(),
                 },
@@ -150,6 +157,8 @@ struct Inner {
     tx: mpsc::Sender<LinkEvent>,
     rx: Mutex<Option<mpsc::Receiver<LinkEvent>>>,
     msg_seq: AtomicU64,
+    /// Очередь офлайн-отправок по контактам: уйдёт «доставлено» при флипе.
+    queued: Mutex<HashMap<Cid, Vec<CoreMsgId>>>,
 }
 
 struct State {
@@ -208,6 +217,7 @@ impl MockLink {
                 tx,
                 rx: Mutex::new(Some(rx)),
                 msg_seq: AtomicU64::new(1),
+                queued: Mutex::new(HashMap::new()),
             }),
             scene: Arc::new(scene),
         }
@@ -220,7 +230,7 @@ impl Hash for MockLink {
     }
 }
 
-impl super::CoreLink for MockLink {
+impl CoreLink for MockLink {
     fn events(self: Arc<Self>) -> impl Stream<Item = LinkEvent> + Send + 'static {
         let Some(rx) = self.inner.rx.lock().expect("rx не занят").take() else {
             panic!("подписка на события заглушки уже взята");
@@ -251,7 +261,7 @@ impl super::CoreLink for MockLink {
             });
         }
 
-        RecvStream(rx)
+        super::RecvStream(rx)
     }
 
     fn execute(&self, request: Request) -> impl Future<Output = Reply> + Send + 'static {
@@ -259,6 +269,10 @@ impl super::CoreLink for MockLink {
         let reply_delay_ms = self.scene.reply_delay_ms;
         let scene_replies = self.scene.replies.clone();
         async move { Self::handle(&inner, request, reply_delay_ms, &scene_replies).await }
+    }
+
+    fn is_stub(&self) -> bool {
+        true
     }
 }
 
@@ -272,54 +286,67 @@ impl MockLink {
         match request {
             Request::Contacts => {
                 let state = inner.state.lock().expect("стейт не отравлен");
-                let lines = state
+                let contacts = state
                     .contacts
                     .iter()
-                    .map(|c| {
-                        crate::core_link::format_contact(&crate::model::store::Contact {
-                            cid: c.cid,
-                            name: c.name.clone(),
-                            online: c.online,
-                            blocked: c.blocked,
-                        })
+                    .map(|c| Contact {
+                        cid: c.cid,
+                        name: c.name.clone(),
+                        online: c.online,
+                        blocked: c.blocked,
                     })
                     .collect();
-                Reply::Ok(lines)
+                Ok(OkReply::Contacts(contacts))
             }
             Request::SendMsg { cid, text: _ } => {
                 let (online, name) = {
                     let state = inner.state.lock().expect("стейт не отравлен");
                     match state.contacts.iter().find(|c| c.cid == cid) {
-                        None => return Reply::Err("нет такого контакта".into()),
+                        None => return Err(LinkError::Kernel(Status::NoContact)),
                         Some(c) if c.blocked => {
-                            return Reply::Err(
-                                "контакт заблокирован: разблокируйте, чтобы писать".into(),
-                            )
+                            return Err(LinkError::Kernel(Status::ContactBlocked));
                         }
                         Some(c) => (c.online, c.name.clone()),
                     }
                 };
+
+                let msg_id = core_id(inner.msg_seq.fetch_add(1, Ordering::Relaxed));
+                let tx = inner.tx.clone();
+
                 if !online {
-                    return Reply::Err(
-                        "Нет связи с пиром. Сообщение не отправлено — попробуйте позже.".into(),
-                    );
+                    // Семантика ядра: офлайн — не ошибка, а outbox.
+                    inner
+                        .queued
+                        .lock()
+                        .expect("queue не отравлен")
+                        .entry(cid)
+                        .or_default()
+                        .push(msg_id);
+                    return Ok(OkReply::Sent {
+                        msg_id,
+                        queued: true,
+                    });
                 }
 
-                let tx = inner.tx.clone();
-                let msg_id = next_msg_id(&inner.msg_seq);
-                let delay = {
+                let (delay, reply_text) = {
                     let mut state = inner.state.lock().expect("стейт не отравлен");
                     let jitter = state.lcg.next() % 200;
-                    Duration::from_millis(reply_delay_ms.saturating_add(jitter).saturating_sub(100))
-                };
-                let reply_text = {
-                    let mut state = inner.state.lock().expect("стейт не отравлен");
-                    scene_replies[(state.lcg.next() as usize) % scene_replies.len()].clone()
+                    let reply =
+                        scene_replies[(state.lcg.next() as usize) % scene_replies.len()].clone();
+                    (
+                        Duration::from_millis(
+                            reply_delay_ms.saturating_add(jitter).saturating_sub(100),
+                        ),
+                        reply,
+                    )
                 };
                 tokio::spawn(async move {
+                    // ACK от пира, затем автоответ — как живой цикл доставки.
+                    time::sleep(delay / 4).await;
+                    let _ = tx.send(LinkEvent::MessageDelivered { cid, msg_id }).await;
                     time::sleep(delay).await;
                     let _ = tx
-                        .send(LinkEvent::IMsg {
+                        .send(LinkEvent::MessageReceived {
                             cid,
                             name,
                             msg_id,
@@ -328,120 +355,112 @@ impl MockLink {
                         })
                         .await;
                 });
-                Reply::Ok(vec![])
+                Ok(OkReply::Sent {
+                    msg_id,
+                    queued: false,
+                })
             }
             Request::Invite => {
                 let mut state = inner.state.lock().expect("стейт не отравлен");
                 let code: String = (0..80)
                     .map(|_| B64URL[(state.lcg.next() % 64) as usize] as char)
                     .collect();
-                Reply::Ok(vec![format!("shopot1.{code}@192.168.1.5")])
+                Ok(OkReply::Code(format!("shopot1.{code}@192.168.1.5")))
             }
             Request::Add { code } => {
-                if !code.starts_with("shopot1.") {
-                    return Reply::Err(
-                        "Неверный код. Скопируйте строку целиком — она начинается с shopot1."
-                            .into(),
-                    );
+                if !code.starts_with("shopot1.") && !code.starts_with("shopot://i/") {
+                    return Err(LinkError::Kernel(Status::BadInviteCode));
                 }
-                let cid = {
+                let (cid, guest_name) = {
                     let mut state = inner.state.lock().expect("стейт не отравлен");
                     state.guest_seq += 1;
                     let guest = state.guest_seq;
                     let cid = Cid(100 + guest as i64);
-                    let name = format!("Гость {guest}");
+                    let guest_name = format!("Гость {guest}");
                     state.contacts.push(MockContact {
                         cid,
-                        name,
+                        name: guest_name.clone(),
                         online: false,
                         blocked: false,
                     });
-                    cid
+                    (cid, guest_name)
                 };
                 let tx = inner.tx.clone();
                 tokio::spawn(async move {
                     time::sleep(Duration::from_millis(400)).await;
-                    let _ = tx.send(LinkEvent::Presence { cid, online: true }).await;
                     let _ = tx
-                        .send(LinkEvent::Sys {
+                        .send(LinkEvent::ContactJoined {
                             cid,
-                            text: "сессия установлена".into(),
+                            name: guest_name,
                         })
                         .await;
                 });
-                Reply::Ok(vec![])
+                Ok(OkReply::Added { cid })
             }
             Request::Block { cid } | Request::Unblock { cid } => {
                 let blocked = matches!(request, Request::Block { .. });
                 let mut state = inner.state.lock().expect("стейт не отравлен");
                 match state.contacts.iter_mut().find(|c| c.cid == cid) {
                     Some(contact) => contact.blocked = blocked,
-                    None => return Reply::Err("нет такого контакта".into()),
+                    None => return Err(LinkError::Kernel(Status::NoContact)),
                 }
-                Reply::Ok(vec![])
+                Ok(OkReply::Done)
             }
         }
     }
 }
 
-fn next_msg_id(seq: &AtomicU64) -> MsgId {
-    MsgId(seq.fetch_add(1, Ordering::Relaxed))
+fn flip_random(inner: &Arc<Inner>) -> Vec<LinkEvent> {
+    let index = {
+        let mut state = inner.state.lock().expect("стейт не отравлен");
+        if state.contacts.is_empty() {
+            return Vec::new();
+        }
+        (state.lcg.next() as usize) % state.contacts.len()
+    };
+    flip_contact(inner, index)
 }
 
-fn flip_random(inner: &Arc<Inner>) -> Vec<LinkEvent> {
+/// Флип presence контакта по индексу:Presence + квази-ACK очереди при
+/// выходе в онлайн. Индекс наружу — для детерминированных тестов.
+fn flip_contact(inner: &Arc<Inner>, index: usize) -> Vec<LinkEvent> {
     let mut state = inner.state.lock().expect("стейт не отравлен");
-    if state.contacts.is_empty() {
+    let Some(contact) = state.contacts.get_mut(index) else {
         return Vec::new();
-    }
-    let index = (state.lcg.next() as usize) % state.contacts.len();
-    let contact = &mut state.contacts[index];
+    };
     contact.online = !contact.online;
     let online = contact.online;
     let cid = contact.cid;
-    let mut events = vec![LinkEvent::Presence { cid, online }];
+    let mut events = vec![LinkEvent::Presence {
+        cid,
+        online,
+        last_seen_ms: 0,
+    }];
     if online {
-        events.push(LinkEvent::Sys {
-            cid,
-            text: "сессия установлена".into(),
-        });
+        // Квази-ACK: outbox контакта доехал.
+        let delivered = inner
+            .queued
+            .lock()
+            .expect("queue не отравлен")
+            .remove(&cid)
+            .unwrap_or_default();
+        for msg_id in delivered {
+            events.push(LinkEvent::MessageDelivered { cid, msg_id });
+        }
     }
     events
 }
 
 const B64URL: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
 
-/// Мост tokio mpsc → futures Stream (без tokio-stream: poll_recv есть публично).
-struct RecvStream(mpsc::Receiver<LinkEvent>);
-
-impl Stream for RecvStream {
-    type Item = LinkEvent;
-
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        self.0.poll_recv(cx)
-    }
-}
 /// Хелпер тестов: собрать первые `n` событий из потока.
 #[cfg(test)]
-pub(crate) async fn take_events(
-    mut stream: impl Stream<Item = LinkEvent> + Unpin,
-    n: usize,
-) -> std::collections::VecDeque<LinkEvent> {
-    use futures_util::StreamExt;
-    use std::collections::VecDeque;
-    let mut out = VecDeque::with_capacity(n);
-    for _ in 0..n {
-        if let Some(event) = stream.next().await {
-            out.push_back(event);
-        }
-    }
-    out
-}
+pub(crate) use super::take_events;
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::core_link::CoreLink;
-    use crate::model::msg::MsgId;
 
     fn scene() -> Scene {
         Scene {
@@ -465,17 +484,21 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn contacts_lines_follow_machine_format() {
+    async fn contacts_are_typed() {
         let link = MockLink::new(scene());
         let reply = link.execute(Request::Contacts).await;
-        assert_eq!(
-            reply,
-            Reply::Ok(vec!["c 1 on - Аня".into(), "c 2 off - Борис".into(),])
-        );
+        let Ok(OkReply::Contacts(contacts)) = reply else {
+            panic!("{reply:?}");
+        };
+        assert_eq!(contacts.len(), 2);
+        assert_eq!(contacts[0].cid, Cid(1));
+        assert_eq!(contacts[0].name, "Аня");
+        assert!(contacts[0].online);
+        assert!(!contacts[1].blocked);
     }
 
     #[tokio::test(start_paused = true)]
-    async fn send_to_online_contact_autoreplies() {
+    async fn send_to_online_contact_delivers_and_autoreplies() {
         let link = Arc::new(MockLink::new(scene()));
 
         let reply = link
@@ -484,32 +507,59 @@ mod tests {
                 text: "привет".into(),
             })
             .await;
-        assert_eq!(reply, Reply::Ok(vec![]));
+        let Ok(OkReply::Sent { queued, .. }) = reply else {
+            panic!("{reply:?}");
+        };
+        assert!(!queued, "онлайн-контакт получает сразу");
 
-        let mut events = take_events(CoreLink::events(Arc::clone(&link)), 1).await;
-
+        let mut events = take_events(CoreLink::events(Arc::clone(&link)), 2).await;
+        assert!(
+            matches!(
+                events.pop_front(),
+                Some(LinkEvent::MessageDelivered { cid: Cid(1), .. })
+            ),
+            "сначала ACK доставки"
+        );
         let event = events.pop_front().expect("автоответ приходит");
-        let LinkEvent::IMsg { cid, text, .. } = event else {
-            panic!("ожидали IMsg, получено {event:?}");
+        let LinkEvent::MessageReceived { cid, text, .. } = event else {
+            panic!("ожидали MessageReceived, получено {event:?}");
         };
         assert_eq!(cid, Cid(1));
         assert!(!text.is_empty());
     }
 
     #[tokio::test(start_paused = true)]
-    async fn send_to_offline_contact_fails_honestly() {
-        let link = MockLink::new(scene());
+    async fn send_to_offline_contact_is_queued_until_flip() {
+        let link = Arc::new(MockLink::new(scene()));
+
         let reply = link
             .execute(Request::SendMsg {
                 cid: Cid(2),
                 text: "привет".into(),
             })
             .await;
-        assert!(matches!(reply, Reply::Err(_)));
+        let Ok(OkReply::Sent { queued, .. }) = reply else {
+            panic!("{reply:?}");
+        };
+        assert!(queued, "офлайн — это outbox, не ошибка");
+
+        // Борис выходит в онлайн — квази-ACK: очередь доехала.
+        for event in flip_contact(&link.inner, 1) {
+            let _ = link.inner.tx.send(event).await;
+        }
+        let mut events = take_events(CoreLink::events(Arc::clone(&link)), 2).await;
+        assert!(matches!(
+            events.pop_front(),
+            Some(LinkEvent::Presence { online: true, .. })
+        ));
+        assert!(matches!(
+            events.pop_front(),
+            Some(LinkEvent::MessageDelivered { cid: Cid(2), .. })
+        ));
     }
 
     #[tokio::test(start_paused = true)]
-    async fn add_valid_code_creates_contact_and_comes_online() {
+    async fn add_valid_code_creates_contact_and_announces_join() {
         let link = Arc::new(MockLink::new(scene()));
 
         let reply = link
@@ -517,77 +567,81 @@ mod tests {
                 code: "shopot1.abc@1.2.3.4".into(),
             })
             .await;
-        assert!(matches!(reply, Reply::Ok(_)));
-
-        let mut events = take_events(CoreLink::events(Arc::clone(&link)), 2).await;
-
-        let lines = match link.execute(Request::Contacts).await {
-            Reply::Ok(lines) => lines,
-            other => panic!("{other:?}"),
+        let Ok(OkReply::Added { cid }) = reply else {
+            panic!("{reply:?}");
         };
-        assert!(
-            lines.iter().any(|l| l.contains("Гость 1")),
-            "строки контактов: {lines:?}"
+        assert_eq!(cid, Cid(101));
+
+        let mut events = take_events(CoreLink::events(Arc::clone(&link)), 1).await;
+        let event = events.pop_front().expect("ContactJoined приходит");
+        assert_eq!(
+            event,
+            LinkEvent::ContactJoined {
+                cid: Cid(101),
+                name: "Гость 1".into()
+            }
         );
 
-        // Гость выходит в линк и здоровается служебной строкой.
-        let presence = events.pop_front().expect("presence");
-        assert_eq!(
-            presence,
-            LinkEvent::Presence {
-                cid: Cid(101),
-                online: true
-            }
-        );
-        let sys = events.pop_front().expect("sys");
-        assert_eq!(
-            sys,
-            LinkEvent::Sys {
-                cid: Cid(101),
-                text: "сессия установлена".into()
-            }
-        );
+        let Ok(OkReply::Contacts(contacts)) = link.execute(Request::Contacts).await else {
+            panic!();
+        };
+        assert!(contacts.iter().any(|c| c.name == "Гость 1"));
     }
 
     #[tokio::test(start_paused = true)]
-    async fn add_bad_code_is_an_error_with_hint() {
+    async fn add_bad_code_is_kernel_error() {
         let link = MockLink::new(scene());
         let reply = link
             .execute(Request::Add {
                 code: "mqtt://broker".into(),
             })
             .await;
-        assert!(matches!(reply, Reply::Err(_)));
+        assert_eq!(reply, Err(LinkError::Kernel(Status::BadInviteCode)));
+        assert!(reply.unwrap_err().user_text().contains("Скопируйте"));
     }
 
     #[tokio::test(start_paused = true)]
     async fn invite_code_has_v2_shape() {
         let link = MockLink::new(scene());
         let reply = link.execute(Request::Invite).await;
-        let Reply::Ok(lines) = reply else { panic!() };
-        assert_eq!(lines.len(), 1);
-        assert!(lines[0].starts_with("shopot1."));
-        assert!(lines[0].ends_with("@192.168.1.5"));
+        let Ok(OkReply::Code(code)) = reply else {
+            panic!()
+        };
+        assert!(code.starts_with("shopot1."));
+        assert!(code.ends_with("@192.168.1.5"));
     }
 
     #[tokio::test(start_paused = true)]
     async fn block_marks_contact() {
         let link = MockLink::new(scene());
-        link.execute(Request::Block { cid: Cid(1) }).await;
-        let Reply::Ok(lines) = link.execute(Request::Contacts).await else {
-            panic!()
+        assert_eq!(
+            link.execute(Request::Block { cid: Cid(1) }).await,
+            Ok(OkReply::Done)
+        );
+        let Ok(OkReply::Contacts(contacts)) = link.execute(Request::Contacts).await else {
+            panic!();
         };
-        assert!(lines[0].contains(" b "));
-        link.execute(Request::Unblock { cid: Cid(1) }).await;
-        let Reply::Ok(lines) = link.execute(Request::Contacts).await else {
-            panic!()
+        assert!(contacts[0].blocked);
+        assert_eq!(
+            link.execute(Request::Unblock { cid: Cid(1) }).await,
+            Ok(OkReply::Done)
+        );
+        let Ok(OkReply::Contacts(contacts)) = link.execute(Request::Contacts).await else {
+            panic!();
         };
-        assert!(lines[0].contains(" - "));
+        assert!(!contacts[0].blocked);
     }
 
-    #[test]
-    fn msg_ids_render_hex16() {
-        assert_eq!(MsgId(255).to_string().len(), 16);
-        assert_eq!(MsgId(0).to_string(), "0".repeat(16));
+    #[tokio::test(start_paused = true)]
+    async fn unknown_contact_send_is_kernel_no_contact() {
+        let link = MockLink::new(scene());
+        let reply = link
+            .execute(Request::SendMsg {
+                cid: Cid(99),
+                text: "эй".into(),
+            })
+            .await;
+        assert_eq!(reply, Err(LinkError::Kernel(Status::NoContact)));
+        assert_eq!(reply.unwrap_err().user_text(), "Контакт не найден.");
     }
 }

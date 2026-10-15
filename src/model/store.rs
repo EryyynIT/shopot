@@ -7,7 +7,7 @@ use crate::model::feed::{self, FeedItem};
 use crate::model::msg::{CoreMsgId, Msg, MsgId, SendState};
 
 /// Контакт.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Contact {
     pub cid: Cid,
     pub name: String,

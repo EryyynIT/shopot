@@ -14,12 +14,15 @@ use iced::widget::{
 };
 use iced::{Element, Length, Padding, Task};
 
-use crate::core_link::{now_ms, parse_contacts, CoreLink, LinkEvent, Reply, Request};
+use crate::core_link::{now_ms, CoreLink, LinkEvent, OkReply, Reply, Request};
 use crate::model::cid::Cid;
 use crate::model::feed::FeedItem;
 use crate::model::msg::MsgId;
 use crate::model::store::Session;
 use crate::model::store::Store;
+
+/// Лимит тела SEND_MESSAGE (str16 ≤ 4096, CORE-API.md §4.3).
+const MAX_BODY: usize = 4096;
 
 /// Сообщения приложения: канал ядра и локальные действия чата.
 #[derive(Debug, Clone)]
@@ -53,6 +56,8 @@ pub enum ChatIn {
 pub struct State<L: CoreLink> {
     pub link: Arc<L>,
     pub store: Store,
+    /// Жив ли канал с ядром (Down/Resync и неудачный Contacts).
+    pub link_up: bool,
     /// Содержимое композера; текст черновика хранит Store.
     pub composer: text_editor::Content,
     pub feed_id: iced::widget::Id,
@@ -64,6 +69,7 @@ impl<L: CoreLink> State<L> {
         Self {
             link,
             store: Store::new(),
+            link_up: true,
             composer: text_editor::Content::new(),
             feed_id: iced::widget::Id::unique(),
             composer_id: iced::widget::Id::unique(),
@@ -81,7 +87,7 @@ pub fn update<L: CoreLink>(state: &mut State<L>, message: Message) -> Task<Messa
 fn on_link<L: CoreLink>(state: &mut State<L>, link: LinkIn) -> Task<Message> {
     match link {
         LinkIn::Event(event) => match event {
-            LinkEvent::IMsg {
+            LinkEvent::MessageReceived {
                 cid,
                 name,
                 msg_id,
@@ -89,46 +95,103 @@ fn on_link<L: CoreLink>(state: &mut State<L>, link: LinkIn) -> Task<Message> {
                 text,
             } => {
                 let opened = state.store.selected() == Some(cid);
-                state.store.push_incoming(cid, &name, msg_id, ts_ms, text);
+                state
+                    .store
+                    .push_incoming_core(cid, &name, msg_id, ts_ms, text);
                 if opened {
                     scroll_feed(state)
                 } else {
                     Task::none()
                 }
             }
-            LinkEvent::Presence { cid, online } => {
+            LinkEvent::MessageDelivered { cid, msg_id } => {
+                state.store.mark_delivered(cid, msg_id);
+                Task::none()
+            }
+            LinkEvent::Presence { cid, online, .. } => {
                 state.store.set_presence(cid, online);
                 Task::none()
             }
-            LinkEvent::Sys { cid, text } => {
-                state.store.push_sys(cid, now_ms(), text);
+            LinkEvent::ContactJoined { cid, name } => {
+                if state.store.ensure_contact(cid, &name) {
+                    state.store.set_presence(cid, true);
+                    state.store.push_sys(
+                        cid,
+                        now_ms(),
+                        format!("{name} подключился по вашему коду"),
+                    );
+                }
                 Task::none()
             }
-            // Заглушке не приходит; обработка появится с uds-транспортом.
-            LinkEvent::Down => Task::none(),
+            LinkEvent::ContactProfile { cid, name, .. } => {
+                state.store.rename_contact(cid, &name);
+                Task::none()
+            }
+            LinkEvent::BlockedByPeer { cid } => {
+                state
+                    .store
+                    .push_sys(cid, now_ms(), "контакт заблокировал вас".into());
+                state.store.set_presence(cid, false);
+                Task::none()
+            }
+            LinkEvent::Down => {
+                state.link_up = false;
+                Task::none()
+            }
+            LinkEvent::Resync => {
+                state.link_up = true;
+                let link = Arc::clone(&state.link);
+                Task::perform(
+                    async move { CoreLink::execute(&*link, Request::Contacts).await },
+                    |reply| {
+                        Message::Link(LinkIn::Replied {
+                            request: Request::Contacts,
+                            reply,
+                            tag: None,
+                        })
+                    },
+                )
+            }
         },
         LinkIn::Replied {
             request,
             reply,
             tag,
         } => match (request, reply) {
-            (Request::Contacts, Reply::Ok(lines)) => {
-                state.store.replace_contacts(parse_contacts(&lines));
+            (Request::Contacts, Ok(OkReply::Contacts(contacts))) => {
+                state.link_up = true;
+                state.store.replace_contacts(contacts);
                 Task::none()
             }
-            (Request::SendMsg { cid, .. }, Reply::Ok(_)) => {
+            (Request::Contacts, Err(_)) => {
+                state.link_up = false;
+                Task::none()
+            }
+            (
+                Request::SendMsg { cid, .. },
+                Ok(OkReply::Sent {
+                    msg_id,
+                    queued: false,
+                }),
+            ) => {
                 if let Some(tag) = tag {
-                    state.store.mark_sent(cid, tag);
+                    state.store.mark_sent_core(cid, tag, msg_id);
                 }
                 Task::none()
             }
-            (Request::SendMsg { cid, .. }, Reply::Err(reason)) => {
+            (Request::SendMsg { cid, .. }, Ok(OkReply::Sent { queued: true, .. })) => {
                 if let Some(tag) = tag {
-                    state.store.mark_failed(cid, tag, reason);
+                    state.store.mark_queued(cid, tag);
                 }
                 Task::none()
             }
-            // Остальные команды S1 не отправляет из UI.
+            (Request::SendMsg { cid, .. }, Err(err)) => {
+                if let Some(tag) = tag {
+                    state.store.mark_failed(cid, tag, err.user_text());
+                }
+                Task::none()
+            }
+            // Остальные команды (add/invite/block) пока не идут из UI.
             _ => Task::none(),
         },
     }
@@ -170,6 +233,16 @@ fn send_current<L: CoreLink>(state: &mut State<L>) -> Task<Message> {
     state.composer = text_editor::Content::new();
     state.store.set_draft(cid, String::new());
 
+    // Превышение лимита ядра ловим до поездки: тело SEND_MESSAGE — str16.
+    if text.len() > MAX_BODY {
+        state.store.mark_failed(
+            cid,
+            msg_id,
+            "Сообщение слишком длинное — лимит 4096 байт.".into(),
+        );
+        return Task::none();
+    }
+
     let request = Request::SendMsg { cid, text };
     let reply_request = request.clone();
     let link = Arc::clone(&state.link);
@@ -194,7 +267,7 @@ fn scroll_feed<L: CoreLink>(state: &State<L>) -> Task<Message> {
 pub fn view<L: CoreLink>(state: &State<L>) -> Element<'_, Message> {
     container(
         column![
-            title_bar(),
+            title_bar(state),
             row![sidebar(state), main_pane(state)].height(Length::Fill),
             status_bar(state),
         ]
@@ -207,7 +280,14 @@ pub fn view<L: CoreLink>(state: &State<L>) -> Element<'_, Message> {
     .into()
 }
 
-fn title_bar() -> Element<'static, Message> {
+fn title_bar<L: CoreLink>(state: &State<L>) -> Element<'static, Message> {
+    let (label, color) = if state.link.is_stub() {
+        ("режим: заглушка", palette::DIM)
+    } else if state.link_up {
+        ("ядро: API 1.0.0", palette::DIM)
+    } else {
+        ("ядро: нет связи", palette::ERR)
+    };
     container(
         row![
             text("shopot")
@@ -215,7 +295,7 @@ fn title_bar() -> Element<'static, Message> {
                 .font(palette::bold())
                 .color(palette::ACCENT),
             space::Space::new().width(Length::Fill),
-            text("режим: заглушка").size(11).color(palette::DIM),
+            text(label).size(11).color(color),
         ]
         .align_y(Vertical::Center),
     )
@@ -467,22 +547,34 @@ fn key_binding(event: text_editor::KeyPress) -> Option<text_editor::Binding<Mess
 fn status_bar<L: CoreLink>(state: &State<L>) -> Element<'static, Message> {
     let total = state.store.contacts().count();
     let online = state.store.online_count();
-    container(
-        text(format!("ядро: заглушка · сессий: {online} из {total}"))
-            .size(11)
-            .color(palette::DIM),
-    )
-    .width(Length::Fill)
-    .height(Length::Fixed(24.0))
-    .padding(Padding {
-        top: 0.0,
-        right: 12.0,
-        bottom: 0.0,
-        left: 12.0,
-    })
-    .align_y(Vertical::Center)
-    .style(palette::panel)
-    .into()
+    let (line, color) = if !state.link.is_stub() && !state.link_up {
+        (
+            format!("ядро: нет связи · сессий: {online} из {total}"),
+            palette::ERR,
+        )
+    } else {
+        let mode = if state.link.is_stub() {
+            "заглушка"
+        } else {
+            "UDS"
+        };
+        (
+            format!("ядро: {mode} · сессий: {online} из {total}"),
+            palette::DIM,
+        )
+    };
+    container(text(line).size(11).color(color))
+        .width(Length::Fill)
+        .height(Length::Fixed(24.0))
+        .padding(Padding {
+            top: 0.0,
+            right: 12.0,
+            bottom: 0.0,
+            left: 12.0,
+        })
+        .align_y(Vertical::Center)
+        .style(palette::panel)
+        .into()
 }
 
 // ---------- время и локальные подписи (TEXT_STYLE.md §3) ----------
