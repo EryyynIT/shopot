@@ -35,9 +35,10 @@ pub fn contact_row(
 
     let has_unread = unread > 0;
     // to_owned: фрагмент текста должен владеть строкой (Element 'static
-    // для lazy), &str протянул бы заимствование из Store.
+    // для lazy), &str протянул бы заимствование из Store. База 16 —
+    // прежний дефолт iced, принятый в S1 вид строки не меняем.
     let name = text(name.to_owned())
-        .size(14.0 * scale)
+        .size(16.0 * scale)
         .font(if has_unread || selected {
             palette::bold()
         } else {
