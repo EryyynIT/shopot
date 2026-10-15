@@ -25,12 +25,13 @@ use crate::model::store::Store;
 /// Лимит тела SEND_MESSAGE (str16 ≤ 4096, CORE-API.md §4.3).
 const MAX_BODY: usize = 4096;
 
-/// Сообщения приложения: канал ядра, действия чата, знакомство.
+/// Сообщения приложения: канал ядра, действия чата, знакомство, настройки.
 #[derive(Debug, Clone)]
 pub enum Message {
     Link(LinkIn),
     Chat(ChatIn),
     Meet(MeetIn),
+    Settings(SettingsIn),
 }
 
 /// Ответы и события core_link. Не протекают в виджеты: update пишет
@@ -83,6 +84,20 @@ pub enum MeetIn {
     CloseOverlay,
 }
 
+/// Действия настроек (S3, GUI_UI.md §4): приватность уведомлений,
+/// компактная лента, масштаб шрифта.
+#[derive(Debug, Clone)]
+pub enum SettingsIn {
+    /// Открыть панель настроек.
+    Open,
+    /// Галка «скрывать текст в уведомлениях».
+    ToggleNotificationText(bool),
+    /// Галка «компактная лента».
+    ToggleCompact(bool),
+    /// Кнопка масштаба: +шаг или −шаг (границы удерживает Store).
+    ChangeFontScale(f32),
+}
+
 /// Оверлей поверх главного окна (GUI_UI.md §3); звонок появится в S7.
 pub enum Overlay {
     None,
@@ -90,6 +105,8 @@ pub enum Overlay {
     Invite(Box<InviteView>),
     Card(Cid),
     Menu(MenuView),
+    /// Настройки: собственного стейта нет, всё живёт в Store.settings.
+    Settings,
 }
 
 /// Инвайт-диалог: мой код и чужой код (GUI_UI.md §1).
@@ -163,6 +180,29 @@ pub fn update<L: CoreLink>(state: &mut State<L>, message: Message) -> Task<Messa
         Message::Link(link) => on_link(state, link),
         Message::Chat(chat) => on_chat(state, chat),
         Message::Meet(meet) => on_meet(state, meet),
+        Message::Settings(settings) => on_settings(state, settings),
+    }
+}
+
+/// Настройки пишутся в Store сразу; рендер читает их в том же кадре.
+fn on_settings<L: CoreLink>(state: &mut State<L>, settings: SettingsIn) -> Task<Message> {
+    match settings {
+        SettingsIn::Open => {
+            state.overlay = Overlay::Settings;
+            Task::none()
+        }
+        SettingsIn::ToggleNotificationText(on) => {
+            state.store.settings.hide_notification_text = on;
+            Task::none()
+        }
+        SettingsIn::ToggleCompact(on) => {
+            state.store.settings.compact = on;
+            Task::none()
+        }
+        SettingsIn::ChangeFontScale(delta) => {
+            state.store.settings.change_font_scale(delta);
+            Task::none()
+        }
     }
 }
 
@@ -626,6 +666,14 @@ fn overlay_layer<'a, L: CoreLink>(
             ]
             .into()
         }
+        Overlay::Settings => stack![
+            widgets::backdrop(close()),
+            centered(widgets::settings_panel(
+                &state.store.settings,
+                state.store.settings.font_scale
+            ))
+        ]
+        .into(),
     }
 }
 
@@ -645,8 +693,18 @@ fn title_bar<L: CoreLink>(state: &State<L>) -> Element<'static, Message> {
                 .font(palette::bold())
                 .color(palette::ACCENT),
             space::Space::new().width(Length::Fill),
+            button(text("Настройки").size(11.0 * scale).color(palette::TEXT))
+                .padding(Padding {
+                    top: 2.0,
+                    right: 10.0,
+                    bottom: 2.0,
+                    left: 10.0,
+                })
+                .style(palette::button_plain)
+                .on_press(Message::Settings(SettingsIn::Open)),
             text(label).size(11.0 * scale).color(color),
         ]
+        .spacing(10)
         .align_y(Vertical::Center),
     )
     .width(Length::Fill)

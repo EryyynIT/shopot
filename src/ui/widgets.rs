@@ -8,8 +8,9 @@ use iced::{Element, Length, Padding};
 use crate::model::cid::Cid;
 use crate::model::feed::FeedItem;
 use crate::model::msg::SendState;
+use crate::model::settings::Settings;
 use crate::ui::palette;
-use crate::ui::{time_hm, ChatIn, InviteView, MeetIn, MenuView, Message};
+use crate::ui::{time_hm, ChatIn, InviteView, MeetIn, MenuView, Message, SettingsIn};
 
 /// Строка сайдбара: акцентная полоса у самого края карточки, точка
 /// presence, имя, бейдж непрочитанных. Высота карточки фиксированная —
@@ -590,6 +591,68 @@ pub fn context_menu(
     )
     .width(Length::Fixed(180.0))
     .padding(8)
+    .style(palette::dialog)
+    .into()
+}
+
+/// Панель настроек: приватность уведомлений, компактная лента, масштаб
+/// шрифта (S3, GUI_UI.md §4). Возвращает Element, заимствующий settings —
+/// значения читаются из Store на каждый кадр.
+pub fn settings_panel(settings: &Settings, scale: f32) -> Element<'_, Message> {
+    use crate::model::settings::{FONT_SCALE_MAX, FONT_SCALE_MIN, FONT_SCALE_STEP};
+
+    let percent = (settings.font_scale * 100.0).round() as i32;
+    let step_button = |label: &'static str, delta: f32, enabled: bool| {
+        button(text(label).size(12.0 * scale).color(palette::TEXT))
+            .padding(Padding {
+                top: 6.0,
+                right: 14.0,
+                bottom: 6.0,
+                left: 14.0,
+            })
+            .style(palette::button_dim)
+            .on_press_maybe(
+                enabled.then_some(Message::Settings(SettingsIn::ChangeFontScale(delta))),
+            )
+    };
+
+    container(
+        column![
+            text("Настройки")
+                .size(14.0 * scale)
+                .font(palette::bold())
+                .color(palette::TEXT),
+            iced::widget::checkbox(settings.hide_notification_text)
+                .label("Скрывать текст в уведомлениях")
+                .on_toggle(|on| Message::Settings(SettingsIn::ToggleNotificationText(on)))
+                .text_size(12.0 * scale)
+                .style(palette::checkbox_style),
+            iced::widget::checkbox(settings.compact)
+                .label("Компактная лента — без пузырей, всё слева")
+                .on_toggle(|on| Message::Settings(SettingsIn::ToggleCompact(on)))
+                .text_size(12.0 * scale)
+                .style(palette::checkbox_style),
+            text(format!("Масштаб шрифта: {percent}%"))
+                .size(12.0 * scale)
+                .color(palette::DIM),
+            row![
+                step_button(
+                    "Уменьшить",
+                    -FONT_SCALE_STEP,
+                    settings.font_scale > FONT_SCALE_MIN
+                ),
+                step_button(
+                    "Увеличить",
+                    FONT_SCALE_STEP,
+                    settings.font_scale < FONT_SCALE_MAX
+                ),
+            ]
+            .spacing(8),
+        ]
+        .spacing(12),
+    )
+    .width(Length::Fixed(420.0))
+    .padding(16)
     .style(palette::dialog)
     .into()
 }
