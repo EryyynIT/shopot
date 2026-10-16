@@ -19,7 +19,7 @@ use iced::{Element, Length, Padding, Point, Task};
 use crate::core_link::{now_ms, CoreLink, LinkEvent, OkReply, Reply, Request, SearchHit};
 use crate::model::cid::Cid;
 use crate::model::feed::FeedItem;
-use crate::model::msg::MsgId;
+use crate::model::msg::{CoreMsgId, MsgId};
 use crate::model::store::Store;
 
 /// Лимит тела SEND_MESSAGE (str16 ≤ 4096, CORE-API.md §4.3).
@@ -70,6 +70,14 @@ pub enum ChatIn {
     SearchScope(bool),
     /// «Показать ещё»: следующая страница совпадений (offset растёт).
     SearchMore,
+    /// ПКМ по строке ленты — меню сообщения (S12).
+    OpenMsgMenu(MsgId),
+    /// Закрепить сообщение из меню пузыря (PIN_MESSAGE, ядро 2.2+).
+    PinMessage(MsgId),
+    /// Открепить сообщение (UNPIN_MESSAGE) — из меню или списка закрепов.
+    UnpinMessage(CoreMsgId),
+    /// Открыть список закреплённых сообщений (плашка под шапкой).
+    OpenPins,
     /// Лента прокручена; `true` — докатились до верха: догрузить более
     /// старые сообщения (S6; окно GET_HISTORY растёт от загруженного
     /// до потолка ядра).
@@ -98,6 +106,8 @@ pub enum MeetIn {
     OpenCard(Cid),
     /// Блок/разблок по текущему состоянию контакта.
     ToggleBlock(Cid),
+    /// Закрепить/открепить чат по текущему состоянию (API 2.2+, S12).
+    TogglePinChat(Cid),
     /// Правая кнопка на строке контакта (GUI_UI.md §4).
     OpenMenu(Cid),
     /// Движение мыши над строкой контакта — позиция для меню.
@@ -141,6 +151,10 @@ pub enum Overlay {
     Settings,
     /// Поиск по загруженному чату (Ctrl+F, S6).
     Search(SearchView),
+    /// Список закреплённых сообщений открытого чата (S12).
+    Pins,
+    /// Меню сообщения по ПКМ (S12): закрепить/открепить.
+    MsgMenu(MsgId),
 }
 
 /// Панель поиска: запрос живёт здесь; совпадения — либо из Store
@@ -240,6 +254,12 @@ impl<L: CoreLink> State<L> {
     /// Ctrl+F спрашивает демон по всей истории, а не Store по окну.
     pub fn kernel_search(&self) -> bool {
         self.kernel_api >= (2, 1)
+    }
+
+    /// Закрепы доступны (API 2.2+, §4.8): чат — один на демон, сообщения —
+    /// до 16 на чат. На 1.x пункты меню скрыты, плашки нет.
+    pub fn kernel_pins(&self) -> bool {
+        self.kernel_api >= (2, 2)
     }
 
     /// Оверлей закрыт — инвариант для тестов и сценариев.
@@ -464,9 +484,69 @@ fn on_link<L: CoreLink>(state: &mut State<L>, link: LinkIn) -> Task<Message> {
                 Task::none()
             }
             // Бутстрап-зонд: версия API демона гейтит ядерные фичи
-            // (поиск 2.1+, закрепы 2.2+).
+            // (поиск 2.1+, закрепы 2.2+). Узнав 2.2, сразу читаем закреп
+            // чата — он переживает рестарт демона.
             (Request::Version, Ok(OkReply::Version { major, minor, .. })) => {
                 state.kernel_api = (major, minor);
+                if state.kernel_pins() {
+                    request_task(state, Request::PinnedChat)
+                } else {
+                    Task::none()
+                }
+            }
+            (Request::PinnedChat, Ok(OkReply::PinnedChat { cid })) => {
+                state.store.set_pinned_chat(cid);
+                Task::none()
+            }
+            (Request::PinChat { cid }, Ok(OkReply::Done)) => {
+                state.store.set_pinned_chat(Some(cid));
+                Task::none()
+            }
+            (Request::UnpinChat, Ok(OkReply::Done)) => {
+                state.store.set_pinned_chat(None);
+                Task::none()
+            }
+            (Request::PinChat { cid }, Err(err)) => {
+                state
+                    .store
+                    .push_sys(cid, now_ms(), format!("не закреплено: {}", err.user_text()));
+                Task::none()
+            }
+            (Request::PinnedMessages { cid }, Ok(OkReply::PinnedMessages { ids })) => {
+                state.store.set_pin_ids(cid, &ids);
+                // Тела неразрешённых закрепов дозапрашиваются по одному.
+                let tasks: Vec<Task<Message>> = state
+                    .store
+                    .pins(cid)
+                    .iter()
+                    .filter(|p| p.body.is_none())
+                    .map(|p| request_task(state, Request::GetMessage { msg_id: p.msg_id }))
+                    .collect();
+                Task::batch(tasks)
+            }
+            (
+                Request::GetMessage { msg_id },
+                Ok(OkReply::Message {
+                    cid,
+                    mine,
+                    ts_ms,
+                    text,
+                    ..
+                }),
+            ) => {
+                state.store.fill_pin(cid, msg_id, ts_ms, mine, text);
+                Task::none()
+            }
+            (Request::PinMessage { cid, .. }, Ok(OkReply::Done))
+            | (Request::UnpinMessage { cid, .. }, Ok(OkReply::Done)) => {
+                // Состав закрепов перечитываем: источник правды — ядро.
+                request_task(state, Request::PinnedMessages { cid })
+            }
+            (Request::PinMessage { cid, .. }, Err(err))
+            | (Request::UnpinMessage { cid, .. }, Err(err)) => {
+                state
+                    .store
+                    .push_sys(cid, now_ms(), format!("закреп: {}", err.user_text()));
                 Task::none()
             }
             (
@@ -513,7 +593,15 @@ fn on_link<L: CoreLink>(state: &mut State<L>, link: LinkIn) -> Task<Message> {
 
 fn on_chat<L: CoreLink>(state: &mut State<L>, chat: ChatIn) -> Task<Message> {
     match chat {
-        ChatIn::Select(cid) => select_chat(state, cid),
+        ChatIn::Select(cid) => {
+            let task = select_chat(state, cid);
+            // На ядре 2.2+ читаем закрепы чата один раз за сессию.
+            if state.kernel_pins() && !state.store.pins_requested(cid) {
+                state.store.mark_pins_requested(cid);
+                return Task::batch([task, request_task(state, Request::PinnedMessages { cid })]);
+            }
+            task
+        }
         ChatIn::SelectIndex(index) => {
             let cid = state.store.contacts().nth(index).map(|c| c.cid);
             match cid {
@@ -591,6 +679,38 @@ fn on_chat<L: CoreLink>(state: &mut State<L>, chat: ChatIn) -> Task<Message> {
             } else {
                 Task::none()
             }
+        }
+        ChatIn::OpenMsgMenu(id) => {
+            // Меню модально; на ядрах < 2.2 закреплять нечем — не открываем.
+            if state.kernel_pins() && matches!(state.overlay, Overlay::None) {
+                state.overlay = Overlay::MsgMenu(id);
+            }
+            Task::none()
+        }
+        ChatIn::PinMessage(id) => {
+            state.overlay = Overlay::None;
+            let Some(cid) = state.store.selected() else {
+                return Task::none();
+            };
+            let Some(msg_id) = state.store.core_id_of(cid, id) else {
+                // Свое сообщение в полёте: msg_id ядра ещё нет — честно.
+                state
+                    .store
+                    .push_sys(cid, now_ms(), "закрепить можно после отправки".into());
+                return Task::none();
+            };
+            request_task(state, Request::PinMessage { cid, msg_id })
+        }
+        ChatIn::UnpinMessage(msg_id) => {
+            state.overlay = Overlay::None;
+            match state.store.selected() {
+                Some(cid) => request_task(state, Request::UnpinMessage { cid, msg_id }),
+                None => Task::none(),
+            }
+        }
+        ChatIn::OpenPins => {
+            state.overlay = Overlay::Pins;
+            Task::none()
         }
     }
 }
@@ -780,6 +900,21 @@ fn on_meet<L: CoreLink>(state: &mut State<L>, meet: MeetIn) -> Task<Message> {
                 request_task(state, Request::Block { cid })
             }
         }
+        MeetIn::TogglePinChat(cid) => {
+            if matches!(state.overlay, Overlay::Menu(_)) {
+                state.overlay = Overlay::None;
+            }
+            if !state.kernel_pins() {
+                return Task::none();
+            }
+            // Закреп один на демон: закрепление другого чата сдвигает
+            // закреп (§4.8) — запрос всегда по текущему состоянию Store.
+            if state.store.pinned_chat() == Some(cid) {
+                request_task(state, Request::UnpinChat)
+            } else {
+                request_task(state, Request::PinChat { cid })
+            }
+        }
         MeetIn::OpenMenu(cid) => {
             state.overlay = Overlay::Menu(MenuView {
                 cid,
@@ -933,6 +1068,8 @@ fn overlay_layer<'a, L: CoreLink>(
                 .map(|c| c.name.clone())
                 .unwrap_or_else(|| menu.cid.to_string());
             let blocked = contact.map(|c| c.blocked).unwrap_or(false);
+            let pinned = state.store.pinned_chat() == Some(menu.cid);
+            let can_pin = state.kernel_pins();
             // Меню у курсора; у нижней кромки окна — над курсором.
             let top = if menu.at.y > 380.0 {
                 menu.at.y - 108.0
@@ -945,6 +1082,8 @@ fn overlay_layer<'a, L: CoreLink>(
                     menu,
                     &name,
                     blocked,
+                    pinned,
+                    can_pin,
                     state.store.settings.font_scale
                 )))
                 .padding(Padding {
@@ -968,6 +1107,53 @@ fn overlay_layer<'a, L: CoreLink>(
             ))
         ]
         .into(),
+        Overlay::Pins => {
+            let entries = state
+                .store
+                .selected()
+                .map(|cid| state.store.pins(cid))
+                .unwrap_or(&[]);
+            stack![
+                widgets::backdrop(close()),
+                centered(widgets::pins_panel(
+                    entries,
+                    state.store.settings.font_scale
+                ))
+            ]
+            .into()
+        }
+        Overlay::MsgMenu(id) => {
+            // Меню привязано к выбранному чату: пункт «закрепить» виден,
+            // только когда у сообщения известен msg_id ядра.
+            let cid = state.store.selected();
+            let msg = cid.and_then(|cid| state.store.msg(cid, *id));
+            let pin = match (cid, msg.and_then(|m| m.core_id)) {
+                (Some(cid), Some(core_id)) => {
+                    if state.store.is_pinned(cid, core_id) {
+                        Some((
+                            "Открепить сообщение",
+                            Message::Chat(ChatIn::UnpinMessage(core_id)),
+                        ))
+                    } else {
+                        Some((
+                            "Закрепить сообщение",
+                            Message::Chat(ChatIn::PinMessage(*id)),
+                        ))
+                    }
+                }
+                _ => None,
+            };
+            let body = msg.map(|m| m.body.as_str()).unwrap_or("");
+            stack![
+                widgets::backdrop(close()),
+                centered(widgets::msg_menu(
+                    body,
+                    pin,
+                    state.store.settings.font_scale
+                ))
+            ]
+            .into()
+        }
         Overlay::Search(view) => {
             let kernel = state.kernel_search();
             // Ядерный режим (2.1+): совпадения из ответов демона по всей
@@ -1069,7 +1255,9 @@ fn sidebar<L: CoreLink>(state: &State<L>) -> Element<'_, Message> {
     let selected = state.store.selected();
     // Снимок строк + ключ ленивости: список перестраивается только при
     // изменении состава/статусов или масштаба (GUI_DEV.md §3 — lazy).
-    let rows: Vec<(Cid, String, bool, u32, bool)> = state
+    // Шестой элемент — закреп чата (S12): закреплённый идёт первым.
+    let pinned_chat = state.store.pinned_chat();
+    let mut rows: Vec<(Cid, String, bool, u32, bool, bool)> = state
         .store
         .contacts()
         .map(|c| {
@@ -1080,9 +1268,14 @@ fn sidebar<L: CoreLink>(state: &State<L>) -> Element<'_, Message> {
                 c.online,
                 unread,
                 selected == Some(c.cid),
+                pinned_chat == Some(c.cid),
             )
         })
         .collect();
+    if let Some(pos) = rows.iter().position(|row| row.5) {
+        let pinned = rows.remove(pos);
+        rows.insert(0, pinned);
+    }
     let has_contacts = !rows.is_empty();
 
     let list: Element<'static, Message> = if rows.is_empty() {
@@ -1124,15 +1317,18 @@ fn sidebar<L: CoreLink>(state: &State<L>) -> Element<'_, Message> {
         .into()
     } else {
         // Масштаб в ключе: смена настройки обязана перерисовать строки.
-        let key: Vec<(u32, i64, u32, bool, bool)> = rows
+        let key: Vec<(u32, i64, u32, bool, bool, bool)> = rows
             .iter()
-            .map(|(cid, _, online, unread, chosen)| {
-                (scale.to_bits(), cid.0, *unread, *online, *chosen)
+            .map(|(cid, _, online, unread, chosen, pinned)| {
+                (scale.to_bits(), cid.0, *unread, *online, *chosen, *pinned)
             })
             .collect();
         lazy(key, move |_| {
             let mut list = column![].spacing(2);
-            for (cid, name, online, unread, chosen) in &rows {
+            for (cid, name, online, unread, chosen, pinned) in &rows {
+                if *pinned {
+                    list = list.push(text("Закреплённый").size(10.0 * scale).color(palette::DIM));
+                }
                 // Правая кнопка — меню знакомства; on_move запоминает точку.
                 list = list.push(
                     mouse_area(widgets::contact_row(
@@ -1249,9 +1445,19 @@ fn main_pane<L: CoreLink>(state: &State<L>) -> Element<'_, Message> {
 
     let feed = feed_view(state, cid);
 
+    // Плашка закрепов под шапкой (S12): только на ядре 2.2+ и когда
+    // закрепы есть. Превью — последнее разрешённое тело.
+    let pins = state.store.pins(cid);
+    let mut content = column![header];
+    if state.kernel_pins() && !pins.is_empty() {
+        let preview = pins.iter().rev().find_map(|p| p.body.as_deref());
+        content = content.push(widgets::pins_bar(pins.len(), preview, scale));
+    }
+    let content = content.push(feed).push(composer(state));
+
     // Рамок у панелей больше нет: зазор между сайдбаром и лентой
     // не нужен, их разделяет контраст заливок (palette::panel/root).
-    container(column![header, feed, composer(state)])
+    container(content)
         .width(Length::Fill)
         .height(Length::Fill)
         .style(palette::root)
@@ -2014,5 +2220,215 @@ mod tests {
             "служебная строка ядра"
         );
         assert!(ui.find("привет").is_ok(), "пузырь сообщения");
+    }
+
+    // ---------- S12: закрепы (API 2.2+) ----------
+
+    fn replied(state: &mut State<MockLink>, request: Request, reply: OkReply) {
+        let _ = update(
+            state,
+            Message::Link(LinkIn::Replied {
+                request,
+                reply: Ok(reply),
+                tag: None,
+            }),
+        );
+    }
+
+    /// Закреп чата: пункт меню только на 2.2+; ответ ядра подписывает
+    /// чат в сайдбаре и поднимает его наверх; повтор — открепление.
+    #[test]
+    fn chat_pin_gated_menu_and_sidebar() {
+        let mut state = state();
+        state
+            .store
+            .replace_contacts(vec![contact(1, "Аня"), contact(2, "Борис")]);
+
+        // Ядро 1.x: пункта закрепа нет.
+        let _ = update(&mut state, Message::Meet(MeetIn::OpenMenu(Cid(1))));
+        {
+            let mut ui = render(&state);
+            assert!(ui.find("Закрепить чат").is_err(), "на 1.x пункта нет");
+        }
+        let _ = update(&mut state, Message::Meet(MeetIn::CloseOverlay));
+
+        // Ядро 2.2: пункт есть, ответ закрепляет.
+        state.kernel_api = (2, 2);
+        let _ = update(&mut state, Message::Meet(MeetIn::OpenMenu(Cid(1))));
+        {
+            let mut ui = render(&state);
+            assert!(ui.find("Закрепить чат").is_ok(), "на 2.2 пункт есть");
+        }
+        let _ = update(&mut state, Message::Meet(MeetIn::TogglePinChat(Cid(1))));
+        replied(&mut state, Request::PinChat { cid: Cid(1) }, OkReply::Done);
+        assert_eq!(state.store.pinned_chat(), Some(Cid(1)));
+        {
+            let mut ui = render(&state);
+            assert!(ui.find("Закреплённый").is_ok(), "подпись в сайдбаре");
+        }
+
+        // Повторный заход в меню закреплённого — «Открепить чат».
+        let _ = update(&mut state, Message::Meet(MeetIn::OpenMenu(Cid(1))));
+        let mut ui = render(&state);
+        assert!(ui.find("Открепить чат").is_ok(), "состояние из Store");
+    }
+
+    /// Закрепы сообщений: плашка под шапкой, тело из ленты сразу,
+    /// ПКМ-меню пузыря, откреп перечитывает состав у ядра.
+    #[test]
+    fn message_pins_bar_menu_and_unpin() {
+        let mut state = state();
+        state.kernel_api = (2, 2);
+        state.store.replace_contacts(vec![contact(1, "Аня")]);
+        let core = CoreMsgId([9; 16]);
+        state.store.load_history(
+            Cid(1),
+            1,
+            &[crate::core_link::HistoryMsg {
+                mine: false,
+                delivered: false,
+                msg_id: core,
+                ts_ms: 1_000,
+                text: "важное".into(),
+            }],
+        );
+        state.store.select(Some(Cid(1)));
+
+        replied(
+            &mut state,
+            Request::PinnedMessages { cid: Cid(1) },
+            OkReply::PinnedMessages { ids: vec![core] },
+        );
+        {
+            let mut ui = render(&state);
+            assert!(
+                ui.find("Закреплено: 1 · важное").is_ok(),
+                "плашка с телом из ленты"
+            );
+        }
+
+        // ПКМ-меню пузыря: сообщение закреплено → «Открепить сообщение».
+        let msg = state.store.thread(Cid(1)).unwrap().msgs[0].id;
+        let _ = update(&mut state, Message::Chat(ChatIn::OpenMsgMenu(msg)));
+        {
+            let mut ui = render(&state);
+            assert!(ui.find("Открепить сообщение").is_ok(), "пункт открепа");
+        }
+        let _ = update(&mut state, Message::Chat(ChatIn::UnpinMessage(core)));
+        assert!(
+            matches!(state.overlay, Overlay::None),
+            "меню закрылось по действию"
+        );
+        replied(
+            &mut state,
+            Request::UnpinMessage {
+                cid: Cid(1),
+                msg_id: core,
+            },
+            OkReply::Done,
+        );
+        // Ядро перечитано: состав пуст → плашка исчезает.
+        replied(
+            &mut state,
+            Request::PinnedMessages { cid: Cid(1) },
+            OkReply::PinnedMessages { ids: vec![] },
+        );
+        let mut ui = render(&state);
+        assert!(
+            ui.find("Закреплено: 0").is_err(),
+            "пустых закрепов не рисуем"
+        );
+    }
+
+    /// Тело закрепа, которого нет в ленте, дозапрашивается (GET_MESSAGE):
+    /// до ответа — число без превью, после — с превью. Список закрепов
+    /// открывается из плашки.
+    #[test]
+    fn pin_body_resolved_via_get_message() {
+        let mut state = state();
+        state.kernel_api = (2, 2);
+        state.store.replace_contacts(vec![contact(1, "Аня")]);
+        state.store.select(Some(Cid(1)));
+        let core = CoreMsgId([5; 16]);
+
+        replied(
+            &mut state,
+            Request::PinnedMessages { cid: Cid(1) },
+            OkReply::PinnedMessages { ids: vec![core] },
+        );
+        {
+            let mut ui = render(&state);
+            assert!(ui.find("Закреплено: 1").is_ok(), "число без превью");
+        }
+        replied(
+            &mut state,
+            Request::GetMessage { msg_id: core },
+            OkReply::Message {
+                cid: Cid(1),
+                mine: false,
+                delivered: false,
+                ts_ms: 2_000,
+                text: "старое важное".into(),
+            },
+        );
+        {
+            let mut ui = render(&state);
+            assert!(
+                ui.find("Закреплено: 1 · старое важное").is_ok(),
+                "превью после GET_MESSAGE"
+            );
+        }
+
+        let _ = update(&mut state, Message::Chat(ChatIn::OpenPins));
+        let mut ui = render(&state);
+        assert!(
+            ui.find("Закреплённые сообщения").is_ok(),
+            "заголовок списка"
+        );
+        assert!(ui.find("старое важное").is_ok(), "тело в списке");
+        assert!(ui.find("Открепить").is_ok(), "действие в списке");
+    }
+
+    /// На ядре < 2.2 ПКМ-меню сообщения не открывается, запросов
+    /// закрепов при выборе чата не шлём.
+    #[test]
+    fn pins_hidden_below_api_2_2() {
+        let mut state = state();
+        state.kernel_api = (2, 1);
+        state.store.replace_contacts(vec![contact(1, "Аня")]);
+        let _ = state.store.push_outgoing(Cid(1), 1_000, "привет".into());
+        state.store.select(Some(Cid(1)));
+        let msg = state.store.thread(Cid(1)).unwrap().msgs[0].id;
+
+        let _ = update(&mut state, Message::Chat(ChatIn::OpenMsgMenu(msg)));
+        assert!(
+            matches!(state.overlay, Overlay::None),
+            "меню не открылось на 1.x"
+        );
+    }
+
+    /// Ответ на закреп чужого чата не трогает открытый (состав хранится
+    /// по cid запроса).
+    #[test]
+    fn pins_reply_scoped_to_request_chat() {
+        let mut state = state();
+        state.kernel_api = (2, 2);
+        state
+            .store
+            .replace_contacts(vec![contact(1, "Аня"), contact(2, "Борис")]);
+        state.store.select(Some(Cid(1)));
+        replied(
+            &mut state,
+            Request::PinnedMessages { cid: Cid(2) },
+            OkReply::PinnedMessages {
+                ids: vec![CoreMsgId([3; 16])],
+            },
+        );
+        let mut ui = render(&state);
+        assert!(
+            ui.find("Закреплено: 1").is_err(),
+            "плашка открытого чата пуста"
+        );
+        assert_eq!(state.store.pins(Cid(2)).len(), 1, "состав у своего чата");
     }
 }

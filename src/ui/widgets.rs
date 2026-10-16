@@ -3,7 +3,8 @@
 
 use iced::alignment::Horizontal;
 use iced::widget::{
-    button, checkbox, column, container, qr_code, row, scrollable, space, text, text_input,
+    button, checkbox, column, container, mouse_area, qr_code, row, scrollable, space, text,
+    text_input,
 };
 use iced::{Element, Length, Padding};
 
@@ -11,6 +12,7 @@ use crate::model::cid::Cid;
 use crate::model::feed::FeedItem;
 use crate::model::msg::SendState;
 use crate::model::settings::Settings;
+use crate::model::store::PinEntry;
 use crate::ui::palette;
 use crate::ui::{time_hm, ChatIn, InviteView, MeetIn, MenuView, Message, SearchView, SettingsIn};
 
@@ -203,11 +205,16 @@ pub fn message_group(group: &FeedItem, scale: f32) -> Vec<Element<'static, Messa
     let mut pending: Option<iced::widget::Column<'static, Message>> = None;
     let count = bodies.len();
 
-    for (index, (_, body)) in bodies.iter().enumerate() {
+    for (index, (msg_id, body)) in bodies.iter().enumerate() {
         let last = index + 1 == count;
-        let body_text = text(body.to_owned())
-            .size(14.0 * scale)
-            .color(palette::TEXT);
+        // ПКМ по строке тела — меню сообщения (закрепить/открепить, S12);
+        // в слитом пузыре каждая строка адресует своё сообщение.
+        let body_text = mouse_area(
+            text(body.to_owned())
+                .size(14.0 * scale)
+                .color(palette::TEXT),
+        )
+        .on_right_press(Message::Chat(ChatIn::OpenMsgMenu(*msg_id)));
 
         // Длинные тексты — без пузыря, на всю ширину (GUI_STYLE.md §2).
         if body.len() > 300 {
@@ -277,12 +284,16 @@ pub fn compact_group(group: &FeedItem, scale: f32) -> Vec<Element<'static, Messa
         );
     }
     let indent = if *mine { 16.0 } else { 0.0 };
-    for (_, body) in bodies {
+    for (msg_id, body) in bodies {
+        // ПКМ по строке — меню сообщения (закрепить/открепить, S12).
         col = col.push(
             container(
-                text(body.to_owned())
-                    .size(14.0 * scale)
-                    .color(palette::TEXT),
+                mouse_area(
+                    text(body.to_owned())
+                        .size(14.0 * scale)
+                        .color(palette::TEXT),
+                )
+                .on_right_press(Message::Chat(ChatIn::OpenMsgMenu(*msg_id))),
             )
             .padding(Padding {
                 left: indent,
@@ -533,12 +544,14 @@ pub fn contact_card(
     .into()
 }
 
-/// Меню по правой кнопке на контакте: блок/разблок и информация
-/// (GUI_UI.md §4).
+/// Меню по правой кнопке на контакте: закреп чата (ядро 2.2+),
+/// блок/разблок и информация (GUI_UI.md §4).
 pub fn context_menu(
     menu: &MenuView,
     name: &str,
     blocked: bool,
+    pinned: bool,
+    can_pin: bool,
     scale: f32,
 ) -> Element<'static, Message> {
     let label = if blocked {
@@ -546,14 +559,23 @@ pub fn context_menu(
     } else {
         "Заблокировать"
     };
-    container(
-        column![
-            text(name.to_owned()).size(11.0 * scale).color(palette::DIM),
-            button(text(label).size(13.0 * scale).color(if blocked {
-                palette::TEXT
-            } else {
-                palette::ERR
-            }))
+    let mut items = column![
+        text(name.to_owned()).size(11.0 * scale).color(palette::DIM),
+        button(text(label).size(13.0 * scale).color(if blocked {
+            palette::TEXT
+        } else {
+            palette::ERR
+        }))
+        .width(Length::Fill)
+        .padding(Padding {
+            top: 6.0,
+            right: 10.0,
+            bottom: 6.0,
+            left: 10.0,
+        })
+        .style(palette::button_menu)
+        .on_press(Message::Meet(MeetIn::ToggleBlock(menu.cid))),
+        button(text("Информация").size(13.0 * scale).color(palette::TEXT))
             .width(Length::Fill)
             .padding(Padding {
                 top: 6.0,
@@ -562,8 +584,17 @@ pub fn context_menu(
                 left: 10.0,
             })
             .style(palette::button_menu)
-            .on_press(Message::Meet(MeetIn::ToggleBlock(menu.cid))),
-            button(text("Информация").size(13.0 * scale).color(palette::TEXT))
+            .on_press(Message::Meet(MeetIn::OpenCard(menu.cid))),
+    ]
+    .spacing(2);
+    if can_pin {
+        let pin_label = if pinned {
+            "Открепить чат"
+        } else {
+            "Закрепить чат"
+        };
+        items = items.push(
+            button(text(pin_label).size(13.0 * scale).color(palette::TEXT))
                 .width(Length::Fill)
                 .padding(Padding {
                     top: 6.0,
@@ -572,11 +603,139 @@ pub fn context_menu(
                     left: 10.0,
                 })
                 .style(palette::button_menu)
-                .on_press(Message::Meet(MeetIn::OpenCard(menu.cid))),
+                .on_press(Message::Meet(MeetIn::TogglePinChat(menu.cid))),
+        );
+    }
+    container(items)
+        .width(Length::Fixed(180.0))
+        .padding(8)
+        .style(palette::dialog)
+        .into()
+}
+
+/// Плашка закрепов под шапкой чата (S12): число и последнее тело;
+/// клик открывает список. Рисуется, только когда закрепы есть.
+pub fn pins_bar(count: usize, preview: Option<&str>, scale: f32) -> Element<'static, Message> {
+    let label = match preview {
+        Some(body) => format!("Закреплено: {count} · {body}"),
+        None => format!("Закреплено: {count}"),
+    };
+    button(
+        text(label)
+            .size(11.0 * scale)
+            .color(palette::DIM)
+            .wrapping(iced::widget::text::Wrapping::None),
+    )
+    .width(Length::Fill)
+    .padding(Padding {
+        top: 4.0,
+        right: 16.0,
+        bottom: 4.0,
+        left: 16.0,
+    })
+    .style(palette::button_dim)
+    .on_press(Message::Chat(ChatIn::OpenPins))
+    .into()
+}
+
+/// Список закреплённых сообщений (S12): время, тело, «Открепить».
+/// Записи без тела (GET_MESSAGE ещё в пути) не показываются.
+pub fn pins_panel(entries: &[PinEntry], scale: f32) -> Element<'static, Message> {
+    let mut list = column![text("Закреплённые сообщения")
+        .size(16.0 * scale)
+        .font(palette::bold())
+        .color(palette::TEXT)]
+    .spacing(6);
+    let resolved = entries.iter().filter(|p| p.body.is_some()).count();
+    for entry in entries {
+        let Some(body) = &entry.body else { continue };
+        list = list.push(
+            row![
+                column![
+                    text(time_hm(entry.ts_ms))
+                        .size(10.0 * scale)
+                        .color(palette::DIM),
+                    text(body.clone()).size(13.0 * scale).color(palette::TEXT),
+                ]
+                .spacing(1)
+                .width(Length::Fill),
+                button(text("Открепить").size(11.0 * scale).color(palette::DIM))
+                    .padding(Padding {
+                        top: 4.0,
+                        right: 8.0,
+                        bottom: 4.0,
+                        left: 8.0,
+                    })
+                    .style(palette::button_dim)
+                    .on_press(Message::Chat(ChatIn::UnpinMessage(entry.msg_id))),
+            ]
+            .spacing(8)
+            .align_y(iced::alignment::Vertical::Center),
+        );
+    }
+    if resolved < entries.len() {
+        list = list.push(
+            text(format!("Загружается: {} из {}", resolved, entries.len()))
+                .size(11.0 * scale)
+                .color(palette::DIM),
+        );
+    }
+    container(scrollable(list))
+        .width(Length::Fixed(420.0))
+        .padding(16)
+        .style(palette::dialog)
+        .into()
+}
+
+/// Меню сообщения по ПКМ (S12): закрепить/открепить. Пункт собирает
+/// view (он знает, закреплено ли сообщение и есть ли у него msg_id ядра);
+/// `pin = None` — свое сообщение в полёте, кнопка выключена.
+pub fn msg_menu(
+    body: &str,
+    pin: Option<(&'static str, Message)>,
+    scale: f32,
+) -> Element<'static, Message> {
+    let preview: String = body.chars().take(80).collect();
+    let (pin_label, pin_action) = match pin {
+        Some((label, message)) => (label, Some(message)),
+        None => ("Закрепить можно после отправки", None),
+    };
+    let mut pin_button = button(text(pin_label).size(13.0 * scale).color(
+        if pin_action.is_some() {
+            palette::TEXT
+        } else {
+            palette::DIM
+        },
+    ))
+    .width(Length::Fill)
+    .padding(Padding {
+        top: 6.0,
+        right: 10.0,
+        bottom: 6.0,
+        left: 10.0,
+    })
+    .style(palette::button_menu);
+    if let Some(message) = pin_action {
+        pin_button = pin_button.on_press(message);
+    }
+    container(
+        column![
+            text(preview).size(11.0 * scale).color(palette::DIM),
+            pin_button,
+            button(text("Отмена").size(13.0 * scale).color(palette::DIM))
+                .width(Length::Fill)
+                .padding(Padding {
+                    top: 6.0,
+                    right: 10.0,
+                    bottom: 6.0,
+                    left: 10.0,
+                })
+                .style(palette::button_menu)
+                .on_press(Message::Meet(MeetIn::CloseOverlay)),
         ]
         .spacing(2),
     )
-    .width(Length::Fixed(180.0))
+    .width(Length::Fixed(220.0))
     .padding(8)
     .style(palette::dialog)
     .into()
