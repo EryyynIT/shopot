@@ -560,11 +560,9 @@ async fn history_survives_daemon_restart() {
 }
 
 /// WAN-путь через relay: код с адресом релея, pairing по marker-у.
-/// НЕСТАБИЛЕН: pairing иногда не завершается, первая отправка через свежий
-/// relay-сеанс может зависнуть (CORE_FEEDBACK.md §5). Замер на ядре
-/// 3334fb8 с tail-фиксом: 3 из 8 прогонов (~37%), на acffb0e — ~17%.
-/// Ручной диагностический прогон: --ignored, не гейт CI.
-#[ignore = "relay-путь ядра acffb0e нестабилен — CORE_FEEDBACK.md §5"]
+/// Стабилизирован ядром 83ea91e (фикс мёртвых сессий f060116 + fake-TLS v2
+/// ea2528f): 5/5 прогонов зелёные; ранее нестабилен на acffb0e (~17%,
+/// CORE_FEEDBACK.md §5 — закрыт). Входит в гейт scripts/e2e.sh.
 #[tokio::test(flavor = "multi_thread")]
 async fn relay_invite_message_two_daemons() {
     let Ok(bin) = std::env::var("SHOPOT_BIN") else {
