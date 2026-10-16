@@ -1555,3 +1555,148 @@ async fn call_offer_answer_end_two_daemons() {
         "повторный END_CALL — NO_CALL: {reply:?}"
     );
 }
+
+/// Два демона: разметка доезжает (S14). A шлёт «**жирно**» как тело +
+/// entities; B получает MESSAGE_RECEIVED с теми же entities, история
+/// у B их же хранит. Entities — API 2.0+; моложе — пропуск.
+#[tokio::test]
+async fn formatted_message_entities_two_daemons() {
+    if std::env::var("SHOPOT_BIN").is_err() {
+        eprintln!("SHOPOT_BIN не задан — e2e против демона пропущен");
+        return;
+    }
+
+    let a = spawn_daemon("ea");
+    let b = spawn_daemon("eb");
+    let sock_a = wait_socket(&a.1).await;
+    let sock_b = wait_socket(&b.1).await;
+    let link_a = std::sync::Arc::new(UdsLink::with_config(
+        sock_a,
+        Duration::from_millis(100),
+        false,
+    ));
+    let link_b = std::sync::Arc::new(UdsLink::with_config(
+        sock_b,
+        Duration::from_millis(100),
+        false,
+    ));
+    let mut events_a = Box::pin(CoreLink::events(std::sync::Arc::clone(&link_a)));
+    let mut events_b = Box::pin(CoreLink::events(std::sync::Arc::clone(&link_b)));
+    for events in [&mut events_a, &mut events_b] {
+        wait_event(events, Duration::from_secs(10), |e| {
+            matches!(e, LinkEvent::Resync)
+        })
+        .await;
+    }
+
+    // Гейт: entities — API 2.0+.
+    let reply = CoreLink::execute(&*link_a, Request::Version).await;
+    let Ok(OkReply::Version { major, .. }) = reply else {
+        panic!("GET_VERSION не удался: {reply:?}")
+    };
+    if major < 2 {
+        eprintln!("ядро {major}.x < 2.0 — разметки нет, пропуск");
+        return;
+    }
+
+    // Знакомство A↔B по LAN-коду.
+    let code = match execute_retry(
+        &link_a,
+        Request::Invite {
+            relay: false,
+            addr: String::new(),
+        },
+    )
+    .await
+    {
+        Ok(OkReply::Code(code)) => code,
+        other => panic!("CREATE_INVITE не удался: {other:?}"),
+    };
+    let cid_a_at_b = match execute_retry(&link_b, Request::Add { code }).await {
+        Ok(OkReply::Added { cid }) => cid,
+        other => panic!("ACCEPT_INVITE не удался: {other:?}"),
+    };
+    let joined = wait_event(&mut events_a, Duration::from_secs(20), |e| {
+        matches!(e, LinkEvent::ContactJoined { .. })
+    })
+    .await;
+    let LinkEvent::ContactJoined { cid: cid_b, .. } = joined else {
+        unreachable!()
+    };
+
+    // Тело «жирно и тайна»: «жирно» bold [0..10], «тайна» spoiler [14..24]
+    // (байты UTF-8: кириллица по 2).
+    let entities = vec![
+        shopot_gui::core_link::Entity::new(shopot_gui::core_link::EntityKind::Bold, 0, 10),
+        shopot_gui::core_link::Entity::new(shopot_gui::core_link::EntityKind::Spoiler, 14, 10),
+    ];
+    let reply = execute_retry(
+        &link_a,
+        Request::SendMsg {
+            cid: cid_b,
+            text: "жирно и тайна".into(),
+            entities: entities.clone(),
+        },
+    )
+    .await;
+    let Ok(OkReply::Sent { .. }) = reply else {
+        panic!("SEND_MESSAGE с entities не удался: {reply:?}")
+    };
+
+    // Событие у B несёт те же entities.
+    let event = wait_event(&mut events_b, Duration::from_secs(20), |e| {
+        matches!(e, LinkEvent::MessageReceived { .. })
+    })
+    .await;
+    let LinkEvent::MessageReceived {
+        cid: from,
+        text,
+        entities: got,
+        ..
+    } = event
+    else {
+        unreachable!()
+    };
+    assert_eq!(from, cid_a_at_b);
+    assert_eq!(text, "жирно и тайна");
+    assert_eq!(got, entities, "entities доехали без искажений");
+
+    // История у B хранит entities (перечитываем с диска ядра).
+    let reply = execute_retry(
+        &link_b,
+        Request::History {
+            cid: cid_a_at_b,
+            limit: 10,
+        },
+    )
+    .await;
+    let Ok(OkReply::History { records, .. }) = reply else {
+        panic!("GET_HISTORY не удался: {reply:?}")
+    };
+    let record = records.iter().find(|r| r.text == "жирно и тайна");
+    assert_eq!(
+        record.map(|r| r.entities.as_slice()),
+        Some(entities.as_slice()),
+        "история хранит разметку"
+    );
+
+    // Кривая разметка — BAD_ARGS (правила §4.3 проверяет ядро).
+    let reply = CoreLink::execute(
+        &*link_a,
+        Request::SendMsg {
+            cid: cid_b,
+            text: "короткий".into(),
+            entities: vec![shopot_gui::core_link::Entity::new(
+                shopot_gui::core_link::EntityKind::Bold,
+                0,
+                999,
+            )],
+        },
+    )
+    .await;
+    assert_eq!(
+        reply,
+        Err(LinkError::Kernel(Status::BadArgs)),
+        "сущность за границей тела — BAD_ARGS: {reply:?}"
+    );
+}
