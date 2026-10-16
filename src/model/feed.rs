@@ -2,7 +2,7 @@
 //!
 //! Подряд идущие сообщения одного автора склеиваются; новая группа —
 //! сменился автор, прошло > 5 минут или настал новый день. Sys-строки
-//! всегда сами по себе.
+//! и визитки всегда сами по себе.
 
 use crate::model::cid::Cid;
 use crate::model::msg::{Dir, Msg, MsgId, SendState};
@@ -17,6 +17,8 @@ pub enum FeedItem {
     DateSep { ts_ms: i64 },
     /// Служебная строка ядра.
     Sys { text: String },
+    /// Визитка третьего лица (S13): имя из карточки; ts — для разрыва дня.
+    Card { name: String, ts_ms: i64 },
     /// Группа одного автора: метка (имя + время) у первой строки.
     Group {
         mine: bool,
@@ -55,6 +57,15 @@ pub fn group(msgs: &[Msg], day_of: impl Fn(i64) -> i64) -> Vec<FeedItem> {
                 }
                 items.push(FeedItem::Sys {
                     text: msg.body.clone(),
+                });
+            }
+            Dir::Card => {
+                if let Some(acc) = group.take() {
+                    items.push(acc.into_item());
+                }
+                items.push(FeedItem::Card {
+                    name: msg.body.clone(),
+                    ts_ms: msg.ts_ms,
                 });
             }
             Dir::Out | Dir::In(_) => {
@@ -160,6 +171,27 @@ mod tests {
             panic!()
         };
         assert_eq!(bodies.len(), 1);
+    }
+
+    /// Визитка (S13) — отдельный элемент: рвёт группу как sys-строка.
+    #[test]
+    fn card_splits_groups() {
+        let msgs = [
+            incoming(1, 0, "раз"),
+            Msg::card(1_000, "Вера".to_owned()),
+            incoming(2, 2_000, "два"),
+        ];
+        let items = group(&msgs, |_| 0);
+        assert!(matches!(items[1], FeedItem::Group { .. }));
+        let FeedItem::Card { name, ts_ms } = &items[2] else {
+            panic!("визитка")
+        };
+        assert_eq!(name, "Вера");
+        assert_eq!(*ts_ms, 1_000);
+        assert!(
+            matches!(items[3], FeedItem::Group { .. }),
+            "группа разорвана"
+        );
     }
 
     #[test]

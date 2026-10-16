@@ -1481,6 +1481,10 @@ fn feed_view<L: CoreLink>(state: &State<L>, cid: Cid) -> Element<'_, Message> {
         match item {
             FeedItem::DateSep { ts_ms } => list = list.push(widgets::date_sep(ts_ms, scale)),
             FeedItem::Sys { text } => list = list.push(widgets::sys_line(text, scale)),
+            // Склейка на время model-коммита S13; свой виджет — в ui-коммитете.
+            FeedItem::Card { name, .. } => {
+                list = list.push(widgets::sys_line(format!("визитка: {name}"), scale))
+            }
             group @ FeedItem::Group { .. } => {
                 let rows = if compact {
                     widgets::compact_group(&group, scale)

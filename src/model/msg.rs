@@ -39,6 +39,10 @@ pub enum Dir {
     In(Cid),
     /// Служебная строка ядра (sys).
     Sys,
+    /// Визитка третьего лица (CONTACT_CARD, S13): не сообщение — у ядра
+    /// нет ни msg_id, ни записи в истории, поэтому не группируется,
+    /// не закрепляется и не ищется.
+    Card,
 }
 
 /// Честный статус отправки — жизненный цикл моего сообщения
@@ -107,7 +111,20 @@ impl Msg {
         }
     }
 
+    /// Визитка в ленте (S13): body — имя из карточки.
+    pub fn card(ts_ms: i64, name: String) -> Self {
+        Self {
+            id: MsgId(0),
+            dir: Dir::Card,
+            ts_ms,
+            body: name,
+            send: SendState::Sent,
+            core_id: None,
+        }
+    }
+
     /// Автор группы: мои и sys всегда свои группы; чужие — по cid.
+    /// Визитки никогда не группируются (feed ставит их отдельно).
     pub fn is_same_group_as(&self, other: &Msg) -> bool {
         match (&self.dir, &other.dir) {
             (Dir::In(a), Dir::In(b)) => a == b,

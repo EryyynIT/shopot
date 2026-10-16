@@ -199,6 +199,35 @@ impl Store {
             .push(Msg::sys(ts_ms, text));
     }
 
+    /// Визитка от собеседника (CONTACT_CARD, S13): событие ядра, записи
+    /// в истории нет — переживает только текущий запуск GUI. Считается
+    /// непрочитанной, как входящее сообщение.
+    pub fn push_card(&mut self, cid: Cid, ts_ms: i64, name: String) {
+        if self.selected != Some(cid) {
+            self.threads.entry(cid).or_default().unread += 1;
+        }
+        self.threads
+            .entry(cid)
+            .or_default()
+            .msgs
+            .push(Msg::card(ts_ms, name));
+    }
+
+    /// DELETE_CHAT отвечен (API 2.2+): убираем контакт и всю его
+    /// проекцию — ленту, черновик, закрепы; закреплённый чат ядро
+    /// открепило само. Удалённый открытый чат закрывается.
+    pub fn delete_chat(&mut self, cid: Cid) {
+        self.contacts.remove(&cid);
+        self.order.retain(|c| *c != cid);
+        self.threads.remove(&cid);
+        if self.pinned_chat == Some(cid) {
+            self.pinned_chat = None;
+        }
+        if self.selected == Some(cid) {
+            self.selected = None;
+        }
+    }
+
     /// Состояние сессии с контактом — для подзаголовка шапки чата.
     pub fn session(&self, cid: Cid) -> Session {
         self.threads
@@ -414,7 +443,7 @@ impl Store {
     }
 
     /// Поиск по загруженной ленте чата (Ctrl+F, S6): регистр не важен,
-    /// служебные строки ядра не участвуют. Ядро не спрашивается —
+    /// служебные строки и визитки не участвуют. Ядро не спрашивается —
     /// серверный поиск появится со своим спринтом.
     pub fn search_loaded(&self, cid: Cid, query: &str) -> Vec<SearchHit> {
         let needle = query.trim().to_lowercase();
@@ -427,7 +456,7 @@ impl Store {
         thread
             .msgs
             .iter()
-            .filter(|m| !matches!(m.dir, Dir::Sys))
+            .filter(|m| !matches!(m.dir, Dir::Sys | Dir::Card))
             .filter(|m| m.body.to_lowercase().contains(&needle))
             .map(|m| SearchHit {
                 id: m.id,
@@ -900,5 +929,62 @@ mod tests {
         // Откреп: состав без known.
         store.set_pin_ids(Cid(1), &[in_feed, fresh]);
         assert!(!store.is_pinned(Cid(1), known));
+    }
+
+    /// Визитка (S13): отдельный элемент ленты, непрочитанная в фоновом
+    /// чате, в поиске по загруженному не участвует.
+    #[test]
+    fn card_lands_in_feed_and_counts_unread() {
+        let mut store = Store::default();
+        store.replace_contacts(vec![contact(1, "Аня", true), contact(2, "Борис", true)]);
+        store.select(Some(Cid(1)));
+
+        store.push_card(Cid(2), 1_000, "Вера".into());
+        assert_eq!(
+            store.thread(Cid(2)).unwrap().unread,
+            1,
+            "фоновая — непрочитанная"
+        );
+        let items = store.feed(Cid(2), |ts| ts / DAY);
+        assert!(
+            matches!(&items[1], FeedItem::Card { name, .. } if name == "Вера"),
+            "визитка в ленте после разделителя дня"
+        );
+        assert!(
+            store.search_loaded(Cid(2), "вера").is_empty(),
+            "визитка не ищется, как у ядра"
+        );
+
+        // Открытая — сразу прочитанная.
+        store.push_card(Cid(1), 2_000, "Вера".into());
+        assert_eq!(store.thread(Cid(1)).unwrap().unread, 0);
+    }
+
+    /// Удаление чата (S13): контакт, лента и черновик исчезают, закреп
+    /// чата сброшен, открытый удалённый чат закрывается.
+    #[test]
+    fn delete_chat_drops_projection() {
+        let mut store = Store::default();
+        store.replace_contacts(vec![contact(1, "Аня", true), contact(2, "Борис", true)]);
+        store.push_incoming(Cid(1), "Аня", MsgId(1), 1_000, "привет".into());
+        store.set_draft(Cid(1), "черновик".into());
+        store.set_pinned_chat(Some(Cid(1)));
+        store.select(Some(Cid(1)));
+
+        store.delete_chat(Cid(1));
+        assert!(store.contact(Cid(1)).is_none());
+        assert_eq!(
+            store.contacts().map(|c| c.cid).collect::<Vec<_>>(),
+            vec![Cid(2)],
+            "порядок сохранён без удалённого"
+        );
+        assert!(store.thread(Cid(1)).is_none(), "лента и черновик стёрты");
+        assert_eq!(store.pinned_chat(), None, "закреп сброшен, как у ядра");
+        assert_eq!(store.selected(), None, "открытый чат закрыт");
+
+        // Повторное удаление и удаление чужого — тихо.
+        store.delete_chat(Cid(1));
+        store.delete_chat(Cid(99));
+        assert_eq!(store.selected(), None);
     }
 }
