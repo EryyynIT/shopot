@@ -680,3 +680,197 @@ async fn relay_invite_message_two_daemons() {
 
     drop(relay);
 }
+
+/// S11: поиск по истории (API 2.1+, SEARCH_MESSAGE/GLOBAL_SEARCH_MESSAGE)
+/// против реального демона. Ядра < 2.1 метод не знают — тест честно
+/// пропускается по зонду GET_VERSION (обратная совместимость гейта).
+#[tokio::test(flavor = "multi_thread")]
+async fn search_finds_messages_two_daemons() {
+    let Ok(bin) = std::env::var("SHOPOT_BIN") else {
+        eprintln!("SHOPOT_BIN не задан — e2e против демона пропущен");
+        return;
+    };
+    let _ = bin;
+
+    let a = spawn_daemon("sa");
+    let b = spawn_daemon("sb");
+    let sock_a = wait_socket(&a.1).await;
+    let sock_b = wait_socket(&b.1).await;
+
+    let link_a = std::sync::Arc::new(UdsLink::with_config(
+        sock_a,
+        Duration::from_millis(100),
+        false,
+    ));
+    let link_b = std::sync::Arc::new(UdsLink::with_config(
+        sock_b,
+        Duration::from_millis(100),
+        false,
+    ));
+
+    let events_a = CoreLink::events(std::sync::Arc::clone(&link_a));
+    let mut events_a = Box::pin(events_a);
+    let events_b = CoreLink::events(std::sync::Arc::clone(&link_b));
+    let mut events_b = Box::pin(events_b);
+    wait_event(&mut events_a, Duration::from_secs(10), |e| {
+        matches!(e, LinkEvent::Resync)
+    })
+    .await;
+    wait_event(&mut events_b, Duration::from_secs(10), |e| {
+        matches!(e, LinkEvent::Resync)
+    })
+    .await;
+
+    // Гейт: поиск появился в API 2.1; моложе — тест не о чём говорить.
+    let reply = CoreLink::execute(&*link_a, Request::Version).await;
+    let Ok(OkReply::Version { major, minor, .. }) = reply else {
+        panic!("GET_VERSION не удался: {reply:?}")
+    };
+    if (major, minor) < (2, 1) {
+        eprintln!("ядро {major}.{minor} < 2.1 — поиск не поддержан, пропуск");
+        return;
+    }
+
+    // Знакомство по LAN-коду.
+    let code = match CoreLink::execute(
+        &*link_a,
+        Request::Invite {
+            relay: false,
+            addr: String::new(),
+        },
+    )
+    .await
+    {
+        Ok(OkReply::Code(code)) => code,
+        other => panic!("CREATE_INVITE не удался: {other:?}"),
+    };
+    let cid_b = match CoreLink::execute(&*link_b, Request::Add { code }).await {
+        Ok(OkReply::Added { cid }) => cid,
+        other => panic!("ACCEPT_INVITE не удался: {other:?}"),
+    };
+    let joined = wait_event(&mut events_a, Duration::from_secs(20), |e| {
+        matches!(e, LinkEvent::ContactJoined { .. })
+    })
+    .await;
+    let LinkEvent::ContactJoined { cid: cid_a, .. } = joined else {
+        unreachable!()
+    };
+    wait_event(&mut events_b, Duration::from_secs(20), |e| {
+        matches!(e, LinkEvent::Presence { online: true, .. })
+    })
+    .await;
+
+    // B пишет A два сообщения с маркером и одно без.
+    for text in [
+        "маркер: первая записка",
+        "пустое место без пометки",
+        "маркер: вторая записка",
+    ] {
+        let reply = CoreLink::execute(
+            &*link_b,
+            Request::SendMsg {
+                cid: cid_b,
+                text: text.into(),
+            },
+        )
+        .await;
+        assert!(matches!(reply, Ok(OkReply::Sent { .. })), "{reply:?}");
+        wait_event(
+            &mut events_a,
+            Duration::from_secs(20),
+            |e| matches!(e, LinkEvent::MessageReceived { text: t, .. } if t == text),
+        )
+        .await;
+    }
+
+    // Чатовый поиск у A: два совпадения, новое первым (§4.3).
+    let reply = CoreLink::execute(
+        &*link_a,
+        Request::Search {
+            cid: Some(cid_a),
+            query: "маркер".into(),
+            limit: 0,
+            offset: 0,
+        },
+    )
+    .await;
+    let Ok(OkReply::Search { total, hits }) = reply else {
+        panic!("SEARCH_MESSAGE не удался: {reply:?}")
+    };
+    assert_eq!(total, 2, "ровно два совпадения");
+    assert_eq!(hits.len(), 2);
+    assert_eq!(hits[0].body, "маркер: вторая записка", "новые первыми");
+    assert_eq!(hits[1].body, "маркер: первая записка");
+    assert!(
+        hits.iter().all(|h| h.cid == cid_a && !h.mine && !h.fuzzy),
+        "чужие точные совпадения, cid восстановлен из запроса: {hits:?}"
+    );
+
+    // Пагинация: вторая страница того же запроса.
+    let reply = CoreLink::execute(
+        &*link_a,
+        Request::Search {
+            cid: Some(cid_a),
+            query: "маркер".into(),
+            limit: 1,
+            offset: 1,
+        },
+    )
+    .await;
+    let Ok(OkReply::Search { total, hits }) = reply else {
+        panic!("SEARCH_MESSAGE страница не удалась: {reply:?}")
+    };
+    assert_eq!(total, 2);
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].body, "маркер: первая записка");
+
+    // Глобальный поиск: те же записи с cid в каждой.
+    let reply = CoreLink::execute(
+        &*link_a,
+        Request::Search {
+            cid: None,
+            query: "записка".into(),
+            limit: 0,
+            offset: 0,
+        },
+    )
+    .await;
+    let Ok(OkReply::Search { total, hits }) = reply else {
+        panic!("GLOBAL_SEARCH_MESSAGE не удался: {reply:?}")
+    };
+    assert_eq!(total, 2);
+    assert!(
+        hits.iter().all(|h| h.cid == cid_a),
+        "глобальный ответ несёт cid: {hits:?}"
+    );
+
+    // Регистр не важен, промах — честный ноль.
+    let reply = CoreLink::execute(
+        &*link_a,
+        Request::Search {
+            cid: Some(cid_a),
+            query: "МАРКЕР".into(),
+            limit: 0,
+            offset: 0,
+        },
+    )
+    .await;
+    assert!(
+        matches!(&reply, Ok(OkReply::Search { total: 2, .. })),
+        "регистронезависимо: {reply:?}"
+    );
+    let reply = CoreLink::execute(
+        &*link_a,
+        Request::Search {
+            cid: Some(cid_a),
+            query: "неттакогослова".into(),
+            limit: 0,
+            offset: 0,
+        },
+    )
+    .await;
+    assert!(
+        matches!(&reply, Ok(OkReply::Search { total: 0, hits }) if hits.is_empty()),
+        "промах — пусто: {reply:?}"
+    );
+}
