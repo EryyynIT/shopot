@@ -198,6 +198,7 @@ async fn invite_message_delivery_two_daemons() {
         Request::SendMsg {
             cid: cid_b,
             text: "привет из e2e".into(),
+            entities: Vec::new(),
         },
     )
     .await;
@@ -245,6 +246,7 @@ async fn invite_message_delivery_two_daemons() {
         Request::SendMsg {
             cid: cid_b,
             text: "не уйдёт".into(),
+            entities: Vec::new(),
         },
     )
     .await;
@@ -259,6 +261,7 @@ async fn invite_message_delivery_two_daemons() {
         Request::SendMsg {
             cid: cid_b,
             text: "снова уходит".into(),
+            entities: Vec::new(),
         },
     )
     .await;
@@ -379,6 +382,7 @@ async fn addr_invite_message_two_daemons() {
         Request::SendMsg {
             cid: cid_b,
             text: "привет по адресному коду".into(),
+            entities: Vec::new(),
         },
     )
     .await;
@@ -474,6 +478,7 @@ async fn history_survives_daemon_restart() {
             Request::SendMsg {
                 cid: cid_b,
                 text: text.into(),
+                entities: Vec::new(),
             },
         )
         .await;
@@ -490,6 +495,7 @@ async fn history_survives_daemon_restart() {
         Request::SendMsg {
             cid: cid_a,
             text: "ответ A".into(),
+            entities: Vec::new(),
         },
     )
     .await;
@@ -675,6 +681,7 @@ async fn relay_invite_message_two_daemons() {
         Request::SendMsg {
             cid: cid_b,
             text: "привет через релей".into(),
+            entities: Vec::new(),
         },
     )
     .await;
@@ -787,6 +794,7 @@ async fn search_finds_messages_two_daemons() {
             Request::SendMsg {
                 cid: cid_b,
                 text: text.into(),
+                entities: Vec::new(),
             },
         )
         .await;
@@ -970,6 +978,7 @@ async fn pins_survive_daemon_restart() {
         Request::SendMsg {
             cid: cid_b,
             text: "закрепи меня".into(),
+            entities: Vec::new(),
         },
     )
     .await;
@@ -1251,6 +1260,7 @@ async fn cards_and_chat_delete_two_daemons() {
         Request::SendMsg {
             cid: cid_b,
             text: "уже некому".into(),
+            entities: Vec::new(),
         },
     )
     .await;

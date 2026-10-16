@@ -739,6 +739,7 @@ mod tests {
             msg_id: CoreMsgId([id; 16]),
             ts_ms: ts,
             text: text.to_owned(),
+            entities: Vec::new(),
         }
     }
 
@@ -909,6 +910,7 @@ mod tests {
                 msg_id: in_feed,
                 ts_ms: 1_000,
                 text: "в ленте".into(),
+                entities: Vec::new(),
             }],
         );
         store.set_pin_ids(Cid(1), &[known]);

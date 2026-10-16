@@ -37,8 +37,14 @@ pub enum Request {
     /// Список контактов (LIST_CONTACTS).
     Contacts,
     /// Отправить сообщение (SEND_MESSAGE). Офлайн-контакт — не ошибка:
-    /// ответ `queued` означает outbox ядра.
-    SendMsg { cid: Cid, text: String },
+    /// ответ `queued` означает outbox ядра. Entities — разметка тела
+    /// (API 2.0+, §4.3); на ядрах 1.x tail не кодируется, список должен
+    /// быть пуст (ui гейтит ввод разметки по версии).
+    SendMsg {
+        cid: Cid,
+        text: String,
+        entities: Vec<Entity>,
+    },
     /// Добавить контакт по инвайт-коду (ACCEPT_INVITE).
     Add { code: String },
     /// Выдать свой инвайт-код (CREATE_INVITE). Пустой addr — код для одной
@@ -123,6 +129,126 @@ pub struct SearchHit {
     pub msg_id: CoreMsgId,
     pub ts_ms: i64,
     pub body: String,
+    /// Разметка тела (API 2.0+).
+    pub entities: Vec<Entity>,
+}
+
+/// Вид разметки (CORE-API.md §4.3, kind u8 на проводе). Неизвестный kind
+/// из будущего ядра при разборе пропускается — рендерить всё равно нечего.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EntityKind {
+    Bold,
+    Italic,
+    Underline,
+    Strike,
+    Spoiler,
+    Code,
+    CodeBlock,
+    Link,
+}
+
+impl EntityKind {
+    /// kind с провода (§4.3): None — вид из будущего ядра, пропускаем.
+    pub fn from_wire(code: u8) -> Option<Self> {
+        Some(match code {
+            1 => Self::Bold,
+            2 => Self::Italic,
+            3 => Self::Underline,
+            4 => Self::Strike,
+            5 => Self::Spoiler,
+            6 => Self::Code,
+            7 => Self::CodeBlock,
+            8 => Self::Link,
+            _ => return None,
+        })
+    }
+
+    /// kind на провод.
+    pub fn to_wire(self) -> u8 {
+        match self {
+            Self::Bold => 1,
+            Self::Italic => 2,
+            Self::Underline => 3,
+            Self::Strike => 4,
+            Self::Spoiler => 5,
+            Self::Code => 6,
+            Self::CodeBlock => 7,
+            Self::Link => 8,
+        }
+    }
+}
+
+/// Сущность разметки тела: offset/len — БАЙТЫ UTF-8 (§4.3), value —
+/// URL у ссылки (обязателен) или язык у блока кода (опционален), у
+/// остальных пуст.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Entity {
+    pub kind: EntityKind,
+    pub offset: u16,
+    pub len: u16,
+    pub value: String,
+}
+
+impl Entity {
+    /// Короткая запись для тестов и ui-парсера.
+    pub fn new(kind: EntityKind, offset: u16, len: u16) -> Self {
+        Self {
+            kind,
+            offset,
+            len,
+            value: String::new(),
+        }
+    }
+
+    /// Ссылка с URL (§4.3: value обязателен, ≤ 255 байт).
+    pub fn link(offset: u16, len: u16, url: String) -> Self {
+        Self {
+            kind: EntityKind::Link,
+            offset,
+            len,
+            value: url,
+        }
+    }
+}
+
+/// Правила ядра к хвосту entities (§4.3): ≤ 32 записей, len ≥ 1,
+/// offset + len ≤ длины тела в байтах, записи отсортированы по offset
+/// (пересечения разрешены), value по kind (URL у ссылки обязателен и
+/// ≤ 255 байт, язык блока кода опционален, у остальных пуст). Нарушение
+/// ядро отвечает BAD_ARGS — проверяем до отправки и в заглушке.
+pub fn entities_valid(body: &str, entities: &[Entity]) -> Result<(), &'static str> {
+    if entities.len() > 32 {
+        return Err("больше 32 сущностей");
+    }
+    let body_len = body.len();
+    let mut prev_offset = 0u16;
+    for (index, entity) in entities.iter().enumerate() {
+        if entity.len == 0 {
+            return Err("len = 0");
+        }
+        if usize::from(entity.offset) + usize::from(entity.len) > body_len {
+            return Err("сущность за границей тела");
+        }
+        if index > 0 && entity.offset < prev_offset {
+            return Err("сущности не отсортированы по offset");
+        }
+        prev_offset = entity.offset;
+        match entity.kind {
+            EntityKind::Link if entity.value.is_empty() => {
+                return Err("ссылка без URL");
+            }
+            EntityKind::Link if entity.value.len() > 255 => {
+                return Err("URL длиннее 255 байт");
+            }
+            EntityKind::CodeBlock => {} // язык опционален
+            EntityKind::Link => {}
+            _ if !entity.value.is_empty() => {
+                return Err("value у простого вида разметки");
+            }
+            _ => {}
+        }
+    }
+    Ok(())
 }
 
 /// Ошибка канала с ядром (GUI_DEV.md §2: типизированные варианты).
@@ -186,7 +312,6 @@ impl LinkError {
 }
 
 /// Запись GET_HISTORY: что ядро помнит о сообщении чата (CORE-API.md §4.3).
-/// Сущности разметки ядро отдаёт в tail — клиент их пока не использует.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HistoryMsg {
     pub mine: bool,
@@ -195,6 +320,8 @@ pub struct HistoryMsg {
     pub msg_id: CoreMsgId,
     pub ts_ms: i64,
     pub text: String,
+    /// Разметка тела (API 2.0+; у записей ядра 1.x пусто).
+    pub entities: Vec<Entity>,
 }
 
 /// Содержательный ответ при OK. Ошибки — через `Err(LinkError)`.
@@ -229,6 +356,7 @@ pub enum OkReply {
         delivered: bool,
         ts_ms: i64,
         text: String,
+        entities: Vec<Entity>,
     },
     /// START_CALL: идентификатор звонка — им же помечены события
     /// CALL_STATE этого разговора.
@@ -266,6 +394,8 @@ pub enum LinkEvent {
         msg_id: CoreMsgId,
         ts_ms: i64,
         text: String,
+        /// Разметка тела (API 2.0+).
+        entities: Vec<Entity>,
     },
     /// ACK: сообщение доставлено на устройство пира.
     MessageDelivered { cid: Cid, msg_id: CoreMsgId },
@@ -410,5 +540,67 @@ mod tests {
             "обрыв соединения — совет перезапуска: {}",
             texts[0]
         );
+    }
+
+    /// Правила ядра к entities (§4.3) проверяются до отправки — честный
+    /// BAD_ARGS от заглушки совпадает с ядерным.
+    #[test]
+    fn entities_valid_enforces_kernel_rules() {
+        let body = "привет, мир"; // 20 байт UTF-8
+        assert!(entities_valid(body, &[]).is_ok(), "без разметки — ок");
+        // Пересечения и равные offset разрешены (жирный + курсив).
+        assert!(
+            entities_valid(
+                body,
+                &[
+                    Entity::new(EntityKind::Bold, 0, 6),
+                    Entity::new(EntityKind::Italic, 0, 6),
+                    Entity::link(7, 4, "https://x".into()),
+                ],
+            )
+            .is_ok(),
+            "пересечения легальны"
+        );
+        assert!(entities_valid(body, &[Entity::new(EntityKind::Bold, 0, 0)]).is_err());
+        assert!(entities_valid(body, &[Entity::new(EntityKind::Bold, 15, 8)]).is_err());
+        // Не отсортированы по offset.
+        assert!(entities_valid(
+            body,
+            &[
+                Entity::new(EntityKind::Bold, 7, 2),
+                Entity::new(EntityKind::Italic, 0, 2),
+            ],
+        )
+        .is_err());
+        // Ссылка без URL / с длинным URL.
+        assert!(entities_valid(body, &[Entity::link(0, 2, String::new())]).is_err());
+        assert!(entities_valid(body, &[Entity::link(0, 2, "x".repeat(256))]).is_err());
+        // value у простого вида.
+        assert!(entities_valid(
+            body,
+            &[Entity {
+                kind: EntityKind::Bold,
+                offset: 0,
+                len: 2,
+                value: "лишнее".into(),
+            }]
+        )
+        .is_err());
+        // Больше 32 записей.
+        let many: Vec<Entity> = (0..33)
+            .map(|i| Entity::new(EntityKind::Bold, 0, 1 + (i == 0) as u16))
+            .collect();
+        assert!(entities_valid(body, &many).is_err());
+        // Язык блока кода — опционален.
+        assert!(entities_valid(
+            body,
+            &[Entity {
+                kind: EntityKind::CodeBlock,
+                offset: 0,
+                len: 6,
+                value: "rust".into(),
+            }]
+        )
+        .is_ok());
     }
 }

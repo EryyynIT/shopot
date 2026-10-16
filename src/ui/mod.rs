@@ -620,6 +620,9 @@ fn on_link<L: CoreLink>(state: &mut State<L>, link: LinkIn) -> Task<Message> {
                 msg_id,
                 ts_ms,
                 text,
+                // Склейка (S14): entities появятся в модели со следующим
+                // коммитом спринта; здесь поле пока игнорируется.
+                entities: _,
             } => {
                 let opened = state.store.selected() == Some(cid);
                 state
@@ -1405,7 +1408,13 @@ fn send_current<L: CoreLink>(state: &mut State<L>) -> Task<Message> {
         return Task::none();
     }
 
-    let request = Request::SendMsg { cid, text };
+    // Склейка (S14): разметка введётся в ui-коммите спринта; пока
+    // отправка всегда без entities.
+    let request = Request::SendMsg {
+        cid,
+        text,
+        entities: Vec::new(),
+    };
     let reply_request = request.clone();
     let link = Arc::clone(&state.link);
     Task::batch([
@@ -2296,6 +2305,7 @@ mod tests {
             msg_id: crate::model::msg::CoreMsgId([n; 16]),
             ts_ms: ts,
             text: text.to_owned(),
+            entities: Vec::new(),
         };
         let history_reply = |records: Vec<crate::core_link::HistoryMsg>| {
             Message::Link(LinkIn::Replied {
@@ -2397,6 +2407,7 @@ mod tests {
             msg_id: crate::model::msg::CoreMsgId([id; 16]),
             ts_ms,
             text: text.to_owned(),
+            entities: Vec::new(),
         }
     }
 
@@ -2467,6 +2478,7 @@ mod tests {
             msg_id: crate::model::msg::CoreMsgId([n; 16]),
             ts_ms: 1_000 + i64::from(n) * 1_000,
             body: format!("найдено {n} про хвост"),
+            entities: Vec::new(),
         }
     }
 
@@ -2810,6 +2822,7 @@ mod tests {
                 msg_id: core,
                 ts_ms: 1_000,
                 text: "важное".into(),
+                entities: Vec::new(),
             }],
         );
         state.store.select(Some(Cid(1)));
@@ -2889,6 +2902,7 @@ mod tests {
                 delivered: false,
                 ts_ms: 2_000,
                 text: "старое важное".into(),
+                entities: Vec::new(),
             },
         );
         {

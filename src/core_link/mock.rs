@@ -17,7 +17,8 @@ use tokio::time;
 
 use crate::core_link::api::Status;
 use crate::core_link::{
-    CallSignal, CoreLink, HistoryMsg, LinkError, LinkEvent, OkReply, Reply, Request, SearchHit,
+    entities_valid, CallSignal, CoreLink, Entity, EntityKind, HistoryMsg, LinkError, LinkEvent,
+    OkReply, Reply, Request, SearchHit,
 };
 use crate::model::cid::Cid;
 use crate::model::msg::CoreMsgId;
@@ -84,6 +85,7 @@ impl Scene {
                         msg_id: core_id(1001),
                         ts_ms: crate::core_link::now_ms(),
                         text: "привет!".into(),
+                        entities: Vec::new(),
                     },
                 ),
                 (
@@ -94,6 +96,7 @@ impl Scene {
                         msg_id: core_id(1002),
                         ts_ms: crate::core_link::now_ms(),
                         text: "как дела?".into(),
+                        entities: Vec::new(),
                     },
                 ),
                 (
@@ -104,6 +107,7 @@ impl Scene {
                         msg_id: core_id(1003),
                         ts_ms: crate::core_link::now_ms(),
                         text: "есть минута?".into(),
+                        entities: Vec::new(),
                     },
                 ),
                 (
@@ -116,6 +120,13 @@ impl Scene {
                         msg_id: core_id(1004),
                         ts_ms: crate::core_link::now_ms(),
                         text: "Жёсткий дедлайн. Шёпотом: переждём.".into(),
+                        // Демо-разметка (S14): жирный + спойлер + код —
+                        // скриншот демо-сцены показывает рендер spans.
+                        entities: vec![
+                            Entity::new(EntityKind::Bold, 0, 16),
+                            Entity::new(EntityKind::Spoiler, 35, "переждём.".len() as u16),
+                            Entity::new(EntityKind::Code, 18, "Шёпотом".len() as u16),
+                        ],
                     },
                 ),
             ],
@@ -143,6 +154,7 @@ impl Scene {
                     msg_id: core_id(2001),
                     ts_ms: crate::core_link::now_ms(),
                     text: "пинг".into(),
+                    entities: Vec::new(),
                 },
             )],
             flip_presence: None,
@@ -168,6 +180,7 @@ fn demo_history() -> HashMap<i64, Vec<HistoryMsg>> {
                     msg_id: core_id(900),
                     ts_ms: yesterday,
                     text: "слушай, ты вчера был на созвоне?".into(),
+                    entities: Vec::new(),
                 },
                 HistoryMsg {
                     mine: true,
@@ -175,6 +188,7 @@ fn demo_history() -> HashMap<i64, Vec<HistoryMsg>> {
                     msg_id: core_id(901),
                     ts_ms: yesterday + 60_000,
                     text: "был. договорились о сроках".into(),
+                    entities: Vec::new(),
                 },
                 HistoryMsg {
                     mine: false,
@@ -182,6 +196,7 @@ fn demo_history() -> HashMap<i64, Vec<HistoryMsg>> {
                     msg_id: core_id(902),
                     ts_ms: yesterday + 120_000,
                     text: "отлично, тогда жду макет".into(),
+                    entities: Vec::new(),
                 },
             ],
         ),
@@ -193,6 +208,7 @@ fn demo_history() -> HashMap<i64, Vec<HistoryMsg>> {
                 msg_id: core_id(910),
                 ts_ms: yesterday + 3_600_000,
                 text: "напиши, как доберёшься".into(),
+                entities: Vec::new(),
             }],
         ),
     ])
@@ -362,7 +378,15 @@ impl MockLink {
                     .collect();
                 Ok(OkReply::Contacts(contacts))
             }
-            Request::SendMsg { cid, text: _ } => {
+            Request::SendMsg {
+                cid,
+                text,
+                entities,
+            } => {
+                // Семантика ядра: кривая разметка — BAD_ARGS до отправки.
+                if entities_valid(&text, &entities).is_err() {
+                    return Err(LinkError::Kernel(Status::BadArgs));
+                }
                 let (online, name) = {
                     let state = inner.state.lock().expect("стейт не отравлен");
                     match state.contacts.iter().find(|c| c.cid == cid) {
@@ -416,6 +440,7 @@ impl MockLink {
                             msg_id,
                             ts_ms: crate::core_link::now_ms(),
                             text: reply_text,
+                            entities: Vec::new(),
                         })
                         .await;
                 });
@@ -523,6 +548,7 @@ impl MockLink {
                                 msg_id: record.msg_id,
                                 ts_ms: record.ts_ms,
                                 body: record.text.clone(),
+                                entities: record.entities.clone(),
                             });
                         }
                     }
@@ -606,6 +632,7 @@ impl MockLink {
                             delivered: record.delivered,
                             ts_ms: record.ts_ms,
                             text: record.text.clone(),
+                            entities: record.entities.clone(),
                         });
                     }
                 }
@@ -864,6 +891,7 @@ mod tests {
             .execute(Request::SendMsg {
                 cid: Cid(1),
                 text: "привет".into(),
+                entities: Vec::new(),
             })
             .await;
         let Ok(OkReply::Sent { queued, .. }) = reply else {
@@ -895,6 +923,7 @@ mod tests {
             .execute(Request::SendMsg {
                 cid: Cid(2),
                 text: "привет".into(),
+                entities: Vec::new(),
             })
             .await;
         let Ok(OkReply::Sent { queued, .. }) = reply else {
@@ -1003,6 +1032,7 @@ mod tests {
             .execute(Request::SendMsg {
                 cid: Cid(99),
                 text: "эй".into(),
+                entities: Vec::new(),
             })
             .await;
         assert_eq!(reply, Err(LinkError::Kernel(Status::NoContact)));
@@ -1023,6 +1053,7 @@ mod tests {
                     msg_id: core_id(n),
                     ts_ms: n as i64 * 1000,
                     text: format!("строка {n}"),
+                    entities: Vec::new(),
                 })
                 .collect(),
         );
@@ -1076,6 +1107,7 @@ mod tests {
             msg_id: core_id(n),
             ts_ms: n as i64 * 1000,
             text: text.to_owned(),
+            entities: Vec::new(),
         }
     }
 
@@ -1385,5 +1417,19 @@ mod tests {
         assert_eq!(reply, Err(LinkError::Kernel(Status::NoCall)));
         let reply = link.execute(Request::AnswerCall).await;
         assert_eq!(reply, Err(LinkError::Kernel(Status::NoCall)));
+    }
+
+    /// S14: кривая разметка — BAD_ARGS от заглушки, как у ядра.
+    #[tokio::test(start_paused = true)]
+    async fn send_with_invalid_entities_is_bad_args() {
+        let link = MockLink::new(scene());
+        let reply = link
+            .execute(Request::SendMsg {
+                cid: Cid(1),
+                text: "привет".into(),
+                entities: vec![Entity::new(EntityKind::Bold, 0, 99)],
+            })
+            .await;
+        assert_eq!(reply, Err(LinkError::Kernel(Status::BadArgs)));
     }
 }

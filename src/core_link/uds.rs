@@ -24,8 +24,8 @@ use tokio::time::timeout;
 
 use super::api::{self, Header, Kind, Method, Status};
 use super::{
-    CallSignal, CoreLink, HistoryMsg, LinkError, LinkEvent, OkReply, RecvStream, Reply, Request,
-    SearchHit,
+    CallSignal, CoreLink, Entity, EntityKind, HistoryMsg, LinkError, LinkEvent, OkReply,
+    RecvStream, Reply, Request, SearchHit,
 };
 use crate::model::cid::Cid;
 use crate::model::msg::CoreMsgId;
@@ -349,14 +349,22 @@ fn encode_request(request: &Request, api2: bool) -> (Method, Vec<u8>) {
     let method = match request {
         Request::Contacts => Method::ListContacts,
         Request::Version => Method::GetVersion,
-        Request::SendMsg { cid, text } => {
+        Request::SendMsg {
+            cid,
+            text,
+            entities,
+        } => {
             api::put::u32(&mut payload, cid.0 as u32);
             api::put::str16(&mut payload, text).expect("текст уже проверен на 4096");
             if api2 {
-                // Entity tail (API 2.x): список сущностей разметки — у
-                // нас их нет. API 1.x лишний байт отвергает, поэтому
-                // хвост ставится только после BadFrame от демона.
-                payload.push(0);
+                // Entity tail (API 2.x, §4.3). API 1.x лишний байт
+                // отвергает, поэтому хвост ставится только после BadFrame
+                // от демона; на 1.x разметки нет (ui гейтит ввод).
+                debug_assert!(
+                    entities.iter().all(|e| e.value.len() <= 255),
+                    "value_len u8"
+                );
+                put_entity_tail(&mut payload, entities);
             }
             Method::SendMessage
         }
@@ -523,15 +531,18 @@ fn decode_reply(method: Method, raw: RawReply, api2: bool) -> Reply {
                 let text = r.read_str16().map_err(|_| LinkError::BadFrame("body"))?;
                 // Entity tail есть только у API 2.x; позиционно отличить его
                 // от флагов следующей записи нельзя — решает версия зонда.
-                if api2 {
-                    skip_entity_tail(&mut r)?;
-                }
+                let entities = if api2 {
+                    read_entity_tail(&mut r)?
+                } else {
+                    Vec::new()
+                };
                 records.push(HistoryMsg {
                     mine: flags & 0b01 != 0,
                     delivered: flags & 0b10 != 0,
                     msg_id: CoreMsgId(msg_id),
                     ts_ms,
                     text: String::from_utf8_lossy(text).into_owned(),
+                    entities,
                 });
             }
             OkReply::History { total, records }
@@ -560,7 +571,7 @@ fn decode_reply(method: Method, raw: RawReply, api2: bool) -> Reply {
                 );
                 let ts_ms = r.read_u64().map_err(|_| LinkError::BadFrame("ts"))? as i64;
                 let body = r.read_str16().map_err(|_| LinkError::BadFrame("body"))?;
-                skip_entity_tail(&mut r)?;
+                let entities = read_entity_tail(&mut r)?;
                 hits.push(SearchHit {
                     cid: Cid(i64::from(cid)),
                     mine: flags & 0b001 != 0,
@@ -569,6 +580,7 @@ fn decode_reply(method: Method, raw: RawReply, api2: bool) -> Reply {
                     msg_id: CoreMsgId(msg_id),
                     ts_ms,
                     body: String::from_utf8_lossy(body).into_owned(),
+                    entities,
                 });
             }
             OkReply::Search { total, hits }
@@ -614,8 +626,12 @@ fn decode_reply(method: Method, raw: RawReply, api2: bool) -> Reply {
             let flags = r.read_u8().map_err(|_| LinkError::BadFrame("flags"))?;
             let ts_ms = r.read_u64().map_err(|_| LinkError::BadFrame("ts"))? as i64;
             let body = r.read_str16().map_err(|_| LinkError::BadFrame("body"))?;
+            let entities = if api2 {
+                read_entity_tail(&mut r)?
+            } else {
+                Vec::new()
+            };
             if api2 {
-                skip_entity_tail(&mut r)?;
                 // Реакции: [react_count u32] × {[flags u8][codepoint u32][ts u64]}.
                 let reacts = r.read_u32().map_err(|_| LinkError::BadFrame("reacts"))?;
                 for _ in 0..reacts {
@@ -632,6 +648,7 @@ fn decode_reply(method: Method, raw: RawReply, api2: bool) -> Reply {
                 delivered: flags & 0b10 != 0,
                 ts_ms,
                 text: String::from_utf8_lossy(body).into_owned(),
+                entities,
             }
         }
         _ => OkReply::Done,
@@ -639,23 +656,52 @@ fn decode_reply(method: Method, raw: RawReply, api2: bool) -> Reply {
     Ok(reply)
 }
 
-/// Пропустить entity tail записи (API 2.x):
+/// Разобрать entity tail записи (API 2.0+, §4.3):
 /// `[ent_count u8] × {[kind u8][offset u16][len u16][value_len u8][value]}`.
-/// Клиент разметку не рендерит — до своего спринта.
-fn skip_entity_tail(r: &mut api::Reader<'_>) -> Result<(), LinkError> {
+/// Неизвестный kind из будущего ядра пропускается (рендерить его всё
+/// равно нечем), обрезанная структура — BadFrame. Семантику (границы,
+/// сортировку) ядро уже проверило — клиент доверяет проводу.
+fn read_entity_tail(r: &mut api::Reader<'_>) -> Result<Vec<Entity>, LinkError> {
     let count = r.read_u8().map_err(|_| LinkError::BadFrame("ent_count"))?;
+    let mut entities = Vec::with_capacity(count as usize);
     for _ in 0..count {
-        r.read_u8().map_err(|_| LinkError::BadFrame("ent_kind"))?;
-        r.read_u16()
+        let kind = r.read_u8().map_err(|_| LinkError::BadFrame("ent_kind"))?;
+        let offset = r
+            .read_u16()
             .map_err(|_| LinkError::BadFrame("ent_offset"))?;
-        r.read_u16().map_err(|_| LinkError::BadFrame("ent_len"))?;
+        let len = r.read_u16().map_err(|_| LinkError::BadFrame("ent_len"))?;
         let value_len = r
             .read_u8()
             .map_err(|_| LinkError::BadFrame("ent_value_len"))? as usize;
-        r.read_bytes(value_len)
+        let value = r
+            .read_bytes(value_len)
             .map_err(|_| LinkError::BadFrame("ent_value"))?;
+        let Some(kind) = EntityKind::from_wire(kind) else {
+            continue; // kind из будущего ядра — пропускаем запись
+        };
+        entities.push(Entity {
+            kind,
+            offset,
+            len,
+            value: String::from_utf8_lossy(value).into_owned(),
+        });
     }
-    Ok(())
+    Ok(entities)
+}
+
+/// Закодировать entity tail (§4.3). Список обязан пройти
+/// [`entities_valid`] — ui строит его парсером разметки, mock и ядро
+/// валидируют повторно; здесь — только раскладка байтов.
+fn put_entity_tail(payload: &mut Vec<u8>, entities: &[Entity]) {
+    debug_assert!(entities.len() <= 32, "ent_count u8");
+    payload.push(entities.len() as u8);
+    for entity in entities {
+        payload.push(entity.kind.to_wire());
+        api::put::u16(payload, entity.offset);
+        api::put::u16(payload, entity.len);
+        payload.push(entity.value.len() as u8);
+        payload.extend_from_slice(entity.value.as_bytes());
+    }
 }
 
 /// LIST_CONTACTS: count × {cid u32, flags u8, last_seen i64, name str16}.
@@ -690,12 +736,22 @@ fn decode_event(header: &Header, payload: &[u8]) -> Option<LinkEvent> {
             let ts_ms = r.read_u64().ok()? as i64;
             let name = r.read_str16().ok()?;
             let text = r.read_str16().ok()?;
+            // Entity tail только у ядра 2.0+ (§4.3); версия зонда до
+            // события не доходит (decode_event её не знает), поэтому
+            // решаем по остатку: байтов нет — ядро 1.x, есть — tail;
+            // обрезанный tail — событие пропускаем, поток не рвём.
+            let entities = if r.has_more() {
+                read_entity_tail(&mut r).ok()?
+            } else {
+                Vec::new()
+            };
             Some(LinkEvent::MessageReceived {
                 cid: Cid(i64::from(cid)),
                 name: String::from_utf8_lossy(name).into_owned(),
                 msg_id: CoreMsgId(msg_id),
                 ts_ms,
                 text: String::from_utf8_lossy(text).into_owned(),
+                entities,
             })
         }
         api::Event::MessageDelivered => {
@@ -945,6 +1001,7 @@ mod tests {
                     Request::SendMsg {
                         cid: Cid(3),
                         text: "привет".into(),
+                        entities: Vec::new(),
                     },
                 )
                 .await
@@ -995,6 +1052,7 @@ mod tests {
                     Request::SendMsg {
                         cid: Cid(3),
                         text: "ещё".into(),
+                        entities: Vec::new(),
                     },
                 )
                 .await
@@ -1076,6 +1134,7 @@ mod tests {
                 msg_id: CoreMsgId([0x11; 16]),
                 ts_ms: 1_700_000_000_000,
                 text: "привет, мир".into(),
+                entities: Vec::new(),
             }
         );
         cleanup(&path);
@@ -1331,6 +1390,15 @@ mod tests {
                         msg_id: CoreMsgId([0x01; 16]),
                         ts_ms: 1_700_000_000_000,
                         text: "моё старое".into(),
+                        // Сущность с провода разобрана (S14); value у
+                        // жирного неконтрактно, но семантику проверяет
+                        // ядро — клиент доверяет проводу.
+                        entities: vec![Entity {
+                            kind: EntityKind::Bold,
+                            offset: 0,
+                            len: 4,
+                            value: "bold".into(),
+                        }],
                     },
                     HistoryMsg {
                         mine: false,
@@ -1338,10 +1406,11 @@ mod tests {
                         msg_id: CoreMsgId([0x02; 16]),
                         ts_ms: 1_700_000_005_000,
                         text: "чужое".into(),
+                        entities: Vec::new(),
                     },
                 ],
             }),
-            "tails пропущены, поля разобраны"
+            "tails разобраны в entities, поля на местах"
         );
         cleanup(&path);
     }
@@ -1403,6 +1472,7 @@ mod tests {
                     msg_id: CoreMsgId([0x02; 16]),
                     ts_ms: 1_700_000_005_000,
                     text: "старое ядро".into(),
+                    entities: Vec::new(),
                 }],
             }),
             "записи 1.x без tail разбираются"
@@ -1900,6 +1970,136 @@ mod tests {
         let header = Header {
             kind: Kind::Event,
             id: api::Event::CallState as u16,
+            request_id: 0,
+            status: Status::Ok,
+            payload_len: payload.len() as u32,
+        };
+        assert_eq!(decode_event(&header, &payload), None);
+    }
+
+    /// S14: SEND_MESSAGE с разметкой — tail на проводе по §4.3
+    /// (счётчик, kind, offset/len, value ссылки).
+    #[tokio::test]
+    async fn send_message_encodes_entity_tail() {
+        let path = temp_socket("send_ent");
+        cleanup(&path);
+        let listener = UnixListener::bind(&path).expect("сокет забинден");
+        let link = Arc::new(UdsLink::with_config(
+            path.clone(),
+            Duration::from_millis(10),
+            false,
+        ));
+        let _events = CoreLink::events(Arc::clone(&link));
+        let (mut stream, _) = listener.accept().await.expect("коннект");
+
+        let task = {
+            let link = Arc::clone(&link);
+            tokio::spawn(async move {
+                CoreLink::execute(
+                    &*link,
+                    Request::SendMsg {
+                        cid: Cid(3),
+                        text: "жирная ссылка".into(),
+                        entities: vec![
+                            Entity::new(EntityKind::Bold, 0, 6),
+                            Entity::link(7, 6, "https://shopot.dev".into()),
+                        ],
+                    },
+                )
+                .await
+            })
+        };
+        answer_version(&mut stream, 2).await;
+        let (header, payload) = read_frame(&mut stream).await;
+        assert_eq!(header.id, Method::SendMessage as u16);
+        let mut r = api::Reader::new(&payload);
+        assert_eq!(r.read_u32(), Ok(3));
+        assert_eq!(
+            r.read_str16().map(|b| std::str::from_utf8(b).unwrap()),
+            Ok("жирная ссылка")
+        );
+        assert_eq!(r.read_u8(), Ok(2), "ent_count");
+        // Bold: kind 1, offset 0, len 6, без value.
+        assert_eq!(r.read_u8(), Ok(1));
+        assert_eq!(r.read_u16(), Ok(0));
+        assert_eq!(r.read_u16(), Ok(6));
+        assert_eq!(r.read_u8(), Ok(0));
+        // Link: kind 8, value = URL.
+        assert_eq!(r.read_u8(), Ok(8));
+        assert_eq!(r.read_u16(), Ok(7));
+        assert_eq!(r.read_u16(), Ok(6));
+        let url_len = r.read_u8().expect("value_len");
+        assert_eq!(
+            r.read_bytes(url_len as usize).unwrap(),
+            b"https://shopot.dev"
+        );
+        assert!(!r.has_more(), "после tail payload исчерпан");
+        task.abort();
+        cleanup(&path);
+    }
+
+    /// S14: MESSAGE_RECEIVED ядра 2.x несёт entities; неизвестный kind
+    /// (из будущего ядра) пропускается, событие живёт.
+    #[test]
+    fn message_received_decodes_entities_and_skips_unknown_kinds() {
+        let mut payload = Vec::new();
+        api::put::u32(&mut payload, 7);
+        payload.extend_from_slice(&[0x11; 16]);
+        api::put::u64(&mut payload, 1_700_000_000_000);
+        api::put::str16(&mut payload, "Аня").expect("str16");
+        api::put::str16(&mut payload, "смотри код").expect("str16");
+        // tail: спойлер (kind 5) + неизвестный kind 42 + ссылка.
+        api::put::u8(&mut payload, 3);
+        api::put::u8(&mut payload, 5);
+        api::put::u16(&mut payload, 0);
+        api::put::u16(&mut payload, 6);
+        api::put::u8(&mut payload, 0);
+        api::put::u8(&mut payload, 42);
+        api::put::u16(&mut payload, 1);
+        api::put::u16(&mut payload, 2);
+        api::put::u8(&mut payload, 3);
+        payload.extend_from_slice(b"foo");
+        api::put::u8(&mut payload, 8);
+        api::put::u16(&mut payload, 7);
+        api::put::u16(&mut payload, 3);
+        api::put::u8(&mut payload, 8);
+        payload.extend_from_slice(b"https://");
+
+        let header = Header {
+            kind: Kind::Event,
+            id: api::Event::MessageReceived as u16,
+            request_id: 0,
+            status: Status::Ok,
+            payload_len: payload.len() as u32,
+        };
+        let Some(LinkEvent::MessageReceived { entities, .. }) = decode_event(&header, &payload)
+        else {
+            panic!("событие не разобрано");
+        };
+        assert_eq!(
+            entities,
+            vec![
+                Entity::new(EntityKind::Spoiler, 0, 6),
+                Entity::link(7, 3, "https://".into()),
+            ],
+            "kind 42 пропущен, остальные разобраны"
+        );
+    }
+
+    /// S14: обрезанный entity tail в событии — событие пропускаем,
+    /// поток не рвётся.
+    #[test]
+    fn message_received_with_truncated_tail_is_dropped() {
+        let mut payload = Vec::new();
+        api::put::u32(&mut payload, 7);
+        payload.extend_from_slice(&[0x11; 16]);
+        api::put::u64(&mut payload, 1_700_000_000_000);
+        api::put::str16(&mut payload, "Аня").expect("str16");
+        api::put::str16(&mut payload, "текст").expect("str16");
+        api::put::u8(&mut payload, 2); // заявлено 2 сущности, данных нет
+        let header = Header {
+            kind: Kind::Event,
+            id: api::Event::MessageReceived as u16,
             request_id: 0,
             status: Status::Ok,
             payload_len: payload.len() as u32,
