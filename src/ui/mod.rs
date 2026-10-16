@@ -256,9 +256,9 @@ impl<L: CoreLink> State<L> {
         self.kernel_api >= (2, 1)
     }
 
-    /// Закрепы доступны (API 2.2+, §4.8): чат — один на демон, сообщения —
-    /// до 16 на чат. На 1.x пункты меню скрыты, плашки нет.
-    pub fn kernel_pins(&self) -> bool {
+    /// Фичи API 2.2+ (§4.8): закрепы, визитки, удаление чата. На ядрах
+    /// младше пункты меню скрыты целиком, а не выключены.
+    pub fn kernel_v22(&self) -> bool {
         self.kernel_api >= (2, 2)
     }
 
@@ -491,7 +491,7 @@ fn on_link<L: CoreLink>(state: &mut State<L>, link: LinkIn) -> Task<Message> {
             // чата — он переживает рестарт демона.
             (Request::Version, Ok(OkReply::Version { major, minor, .. })) => {
                 state.kernel_api = (major, minor);
-                if state.kernel_pins() {
+                if state.kernel_v22() {
                     request_task(state, Request::PinnedChat)
                 } else {
                     Task::none()
@@ -599,7 +599,7 @@ fn on_chat<L: CoreLink>(state: &mut State<L>, chat: ChatIn) -> Task<Message> {
         ChatIn::Select(cid) => {
             let task = select_chat(state, cid);
             // На ядре 2.2+ читаем закрепы чата один раз за сессию.
-            if state.kernel_pins() && !state.store.pins_requested(cid) {
+            if state.kernel_v22() && !state.store.pins_requested(cid) {
                 state.store.mark_pins_requested(cid);
                 return Task::batch([task, request_task(state, Request::PinnedMessages { cid })]);
             }
@@ -685,7 +685,7 @@ fn on_chat<L: CoreLink>(state: &mut State<L>, chat: ChatIn) -> Task<Message> {
         }
         ChatIn::OpenMsgMenu(id) => {
             // Меню модально; на ядрах < 2.2 закреплять нечем — не открываем.
-            if state.kernel_pins() && matches!(state.overlay, Overlay::None) {
+            if state.kernel_v22() && matches!(state.overlay, Overlay::None) {
                 state.overlay = Overlay::MsgMenu(id);
             }
             Task::none()
@@ -907,7 +907,7 @@ fn on_meet<L: CoreLink>(state: &mut State<L>, meet: MeetIn) -> Task<Message> {
             if matches!(state.overlay, Overlay::Menu(_)) {
                 state.overlay = Overlay::None;
             }
-            if !state.kernel_pins() {
+            if !state.kernel_v22() {
                 return Task::none();
             }
             // Закреп один на демон: закрепление другого чата сдвигает
@@ -1072,7 +1072,7 @@ fn overlay_layer<'a, L: CoreLink>(
                 .unwrap_or_else(|| menu.cid.to_string());
             let blocked = contact.map(|c| c.blocked).unwrap_or(false);
             let pinned = state.store.pinned_chat() == Some(menu.cid);
-            let can_pin = state.kernel_pins();
+            let can_pin = state.kernel_v22();
             // Меню у курсора; у нижней кромки окна — над курсором.
             let top = if menu.at.y > 380.0 {
                 menu.at.y - 108.0
@@ -1452,7 +1452,7 @@ fn main_pane<L: CoreLink>(state: &State<L>) -> Element<'_, Message> {
     // закрепы есть. Превью — последнее разрешённое тело.
     let pins = state.store.pins(cid);
     let mut content = column![header];
-    if state.kernel_pins() && !pins.is_empty() {
+    if state.kernel_v22() && !pins.is_empty() {
         let preview = pins.iter().rev().find_map(|p| p.body.as_deref());
         content = content.push(widgets::pins_bar(pins.len(), preview, scale));
     }
