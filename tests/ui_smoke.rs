@@ -166,7 +166,12 @@ where
 /// глазами»: пустое/чёрное окно и потерянная тема ловятся без человека.
 fn busy_share(shot: &iced_test::core::window::Screenshot) -> f64 {
     let i = (2 * shot.size.width + 2) as usize * 4;
-    let bg = (shot.rgba[i], shot.rgba[i + 1], shot.rgba[i + 2], shot.rgba[i + 3]);
+    let bg = (
+        shot.rgba[i],
+        shot.rgba[i + 1],
+        shot.rgba[i + 2],
+        shot.rgba[i + 3],
+    );
     let mut total = 0usize;
     let mut busy = 0usize;
     for px in shot.rgba.chunks_exact(16) {
@@ -185,13 +190,28 @@ fn busy_share(shot: &iced_test::core::window::Screenshot) -> f64 {
 const SCENARIOS: &[(&str, fn())] = &[
     ("contacts→сайдбар", contacts_reply_populates_sidebar),
     ("входящее→непрочитанность", incoming_message_counts_unread),
-    ("отправка→ACK→автоответ", send_flow_shows_delivered_and_autoreply),
-    ("история→восстановление ленты", history_restores_on_chat_open),
-    ("инвайт: выдать и добавить", invite_dialog_cycles_issue_and_add),
+    (
+        "отправка→ACK→автоответ",
+        send_flow_shows_delivered_and_autoreply,
+    ),
+    (
+        "история→восстановление ленты",
+        history_restores_on_chat_open,
+    ),
+    (
+        "инвайт: выдать и добавить",
+        invite_dialog_cycles_issue_and_add,
+    ),
     ("инвайт: адрес + relay", invite_with_address_and_relay),
-    ("ПКМ: блок и карточка", right_click_menu_blocks_and_opens_card),
+    (
+        "ПКМ: блок и карточка",
+        right_click_menu_blocks_and_opens_card,
+    ),
     ("Esc закрывает оверлей", escape_closes_overlay),
-    ("настройки: галки и масштаб", settings_overlay_toggles_and_closes),
+    (
+        "настройки: галки и масштаб",
+        settings_overlay_toggles_and_closes,
+    ),
 ];
 
 #[test]
@@ -485,8 +505,14 @@ fn history_restores_on_chat_open() {
         6,
         "3 из истории + 3 живых входящих демо-сцены"
     );
-    assert!(anna.msgs.iter().any(|m| m.body == "слушай, ты вчера был на созвоне?"));
-    assert!(anna.msgs.iter().any(|m| m.body == "был. договорились о сроках"));
+    assert!(anna
+        .msgs
+        .iter()
+        .any(|m| m.body == "слушай, ты вчера был на созвоне?"));
+    assert!(anna
+        .msgs
+        .iter()
+        .any(|m| m.body == "был. договорились о сроках"));
     assert!(
         !state.store.has_more_history(Cid(1)),
         "total == loaded — потолок ядра не достигнут"

@@ -365,19 +365,15 @@ pub fn invite_panel(view: &InviteView, scale: f32) -> Element<'_, Message> {
             .color(palette::DIM),
     );
     body = body.push(
-        button(
-            text("Выдать код")
-                .size(12.0 * scale)
-                .font(palette::bold())
-        )
-        .padding(Padding {
-            top: 8.0,
-            right: 14.0,
-            bottom: 8.0,
-            left: 14.0,
-        })
-        .style(palette::button_accent)
-        .on_press_maybe((!view.submitting).then_some(Message::Meet(MeetIn::IssueInvite))),
+        button(text("Выдать код").size(12.0 * scale).font(palette::bold()))
+            .padding(Padding {
+                top: 8.0,
+                right: 14.0,
+                bottom: 8.0,
+                left: 14.0,
+            })
+            .style(palette::button_accent)
+            .on_press_maybe((!view.submitting).then_some(Message::Meet(MeetIn::IssueInvite))),
     );
 
     body = body.push(text("Мой код").size(11.0 * scale).color(palette::DIM));
@@ -395,7 +391,7 @@ pub fn invite_panel(view: &InviteView, scale: f32) -> Element<'_, Message> {
         let copy = button(
             text("Скопировать код")
                 .size(12.0 * scale)
-                .font(palette::bold())
+                .font(palette::bold()),
         )
         .padding(Padding {
             top: 8.0,
@@ -442,22 +438,18 @@ pub fn invite_panel(view: &InviteView, scale: f32) -> Element<'_, Message> {
                     .padding(8)
                     .style(palette::input)
                     .width(Length::Fill),
-                button(
-                    text("Добавить")
-                        .size(12.0 * scale)
-                        .font(palette::bold())
-                        )
-                .padding(Padding {
-                    top: 8.0,
-                    right: 14.0,
-                    bottom: 8.0,
-                    left: 14.0,
-                })
-                .style(palette::button_accent)
-                .on_press_maybe(
-                    (!view.submitting && !view.foreign.trim().is_empty())
-                        .then_some(Message::Meet(MeetIn::SubmitForeign)),
-                ),
+                button(text("Добавить").size(12.0 * scale).font(palette::bold()))
+                    .padding(Padding {
+                        top: 8.0,
+                        right: 14.0,
+                        bottom: 8.0,
+                        left: 14.0,
+                    })
+                    .style(palette::button_accent)
+                    .on_press_maybe(
+                        (!view.submitting && !view.foreign.trim().is_empty())
+                            .then_some(Message::Meet(MeetIn::SubmitForeign)),
+                    ),
             ]
             .spacing(8)
             .align_y(iced::alignment::Vertical::Center),

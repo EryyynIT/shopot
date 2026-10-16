@@ -1545,10 +1545,18 @@ mod tests {
     fn feed_renders_honest_send_states() {
         let mut state = state();
         state.store.replace_contacts(vec![contact(1, "Аня")]);
-        let _ = state.store.push_outgoing(Cid(1), 1_000, "уходит сейчас".into());
-        let queued = state.store.push_outgoing(Cid(1), 6_000_000, "ждёт очереди".into());
-        let delivered = state.store.push_outgoing(Cid(1), 12_000_000, "уехало".into());
-        let failed = state.store.push_outgoing(Cid(1), 18_000_000, "не проехало".into());
+        let _ = state
+            .store
+            .push_outgoing(Cid(1), 1_000, "уходит сейчас".into());
+        let queued = state
+            .store
+            .push_outgoing(Cid(1), 6_000_000, "ждёт очереди".into());
+        let delivered = state
+            .store
+            .push_outgoing(Cid(1), 12_000_000, "уехало".into());
+        let failed = state
+            .store
+            .push_outgoing(Cid(1), 18_000_000, "не проехало".into());
         state.store.mark_queued(Cid(1), queued);
         state
             .store
@@ -1574,7 +1582,9 @@ mod tests {
         let mut state = state();
         state.store.replace_contacts(vec![contact(1, "Аня")]);
         let now = now_ms();
-        state.store.push_sys(Cid(1), now, "сессия установлена".to_owned());
+        state
+            .store
+            .push_sys(Cid(1), now, "сессия установлена".to_owned());
         let _ = state.store.push_outgoing(Cid(1), now, "привет".into());
         state.store.select(Some(Cid(1)));
 
