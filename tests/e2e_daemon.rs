@@ -1300,3 +1300,115 @@ async fn cards_and_chat_delete_two_daemons() {
     );
     assert!(contacts_a.iter().any(|x| x.cid == cid_c));
 }
+
+/// Имя профиля (S13.1, SET_NAME): A задаёт имя и шлёт B свою визитку —
+/// карточка у B приходит с этим именем, а не безымянной (квирк ядра из
+/// CORE_FEEDBACK §7 обходится именно так).
+#[tokio::test]
+async fn own_card_carries_set_name() {
+    if std::env::var("SHOPOT_BIN").is_err() {
+        eprintln!("SHOPOT_BIN не задан — e2e против демона пропущен");
+        return;
+    }
+
+    let a = spawn_daemon("na");
+    let b = spawn_daemon("nb");
+    let sock_a = wait_socket(&a.1).await;
+    let sock_b = wait_socket(&b.1).await;
+    let link_a = std::sync::Arc::new(UdsLink::with_config(
+        sock_a,
+        Duration::from_millis(100),
+        false,
+    ));
+    let link_b = std::sync::Arc::new(UdsLink::with_config(
+        sock_b,
+        Duration::from_millis(100),
+        false,
+    ));
+    let mut events_a = Box::pin(CoreLink::events(std::sync::Arc::clone(&link_a)));
+    let mut events_b = Box::pin(CoreLink::events(std::sync::Arc::clone(&link_b)));
+    wait_event(&mut events_a, Duration::from_secs(10), |e| {
+        matches!(e, LinkEvent::Resync)
+    })
+    .await;
+    wait_event(&mut events_b, Duration::from_secs(10), |e| {
+        matches!(e, LinkEvent::Resync)
+    })
+    .await;
+
+    // Визитка — API 2.2; моложе — тест не о чём говорить.
+    let reply = CoreLink::execute(&*link_a, Request::Version).await;
+    let Ok(OkReply::Version { major, minor, .. }) = reply else {
+        panic!("GET_VERSION не удался: {reply:?}")
+    };
+    if (major, minor) < (2, 2) {
+        eprintln!("ядро {major}.{minor} < 2.2 — визитки не поддержаны, пропуск");
+        return;
+    }
+
+    // Знакомство A↔B по LAN-коду.
+    let code = match execute_retry(
+        &link_a,
+        Request::Invite {
+            relay: false,
+            addr: String::new(),
+        },
+    )
+    .await
+    {
+        Ok(OkReply::Code(code)) => code,
+        other => panic!("CREATE_INVITE не удался: {other:?}"),
+    };
+    let cid_a_at_b = match execute_retry(&link_b, Request::Add { code }).await {
+        Ok(OkReply::Added { cid }) => cid,
+        other => panic!("ACCEPT_INVITE не удался: {other:?}"),
+    };
+    let joined = wait_event(&mut events_a, Duration::from_secs(20), |e| {
+        matches!(e, LinkEvent::ContactJoined { .. })
+    })
+    .await;
+    let LinkEvent::ContactJoined { cid: cid_b, .. } = joined else {
+        unreachable!()
+    };
+    wait_event(&mut events_b, Duration::from_secs(20), |e| {
+        matches!(e, LinkEvent::Presence { online: true, .. })
+    })
+    .await;
+
+    // A задаёт имя (кириллица — str16 UTF-8) и шлёт свою визитку.
+    let reply = execute_retry(
+        &link_a,
+        Request::SetName {
+            name: "Михаил e2e".into(),
+        },
+    )
+    .await;
+    assert_eq!(reply, Ok(OkReply::Done), "SET_NAME: {reply:?}");
+    let reply = execute_retry(
+        &link_a,
+        Request::SendContact {
+            to: cid_b,
+            contact: None,
+        },
+    )
+    .await;
+    assert_eq!(reply, Ok(OkReply::Done), "SEND_CONTACT своей: {reply:?}");
+
+    let card = wait_event(&mut events_b, Duration::from_secs(20), |e| {
+        matches!(e, LinkEvent::ContactCard { .. })
+    })
+    .await;
+    let LinkEvent::ContactCard {
+        cid: card_from,
+        name: card_name,
+        ..
+    } = card
+    else {
+        unreachable!()
+    };
+    assert_eq!(card_from, cid_a_at_b, "cid события — отправитель визитки");
+    assert_eq!(
+        card_name, "Михаил e2e",
+        "своя визитка несёт заданное имя, а не дефолт ядра"
+    );
+}
