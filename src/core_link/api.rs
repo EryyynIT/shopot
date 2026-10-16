@@ -73,6 +73,10 @@ pub enum Method {
     PinChat = 25,
     GetPinnedChat = 26,
     UnpinChat = 27,
+    /// API 2.2+: удалить чат и контакт безвозвратно (§4.8).
+    DeleteChat = 28,
+    /// API 2.2+: переслать визитку (§4.8); получатель видит CONTACT_CARD.
+    SendContact = 29,
     /// API 2.2+: закрепы сообщений (≤16 на чат) (§4.8).
     PinMessage = 30,
     UnpinMessage = 31,
@@ -109,6 +113,8 @@ impl Method {
             25 => Self::PinChat,
             26 => Self::GetPinnedChat,
             27 => Self::UnpinChat,
+            28 => Self::DeleteChat,
+            29 => Self::SendContact,
             30 => Self::PinMessage,
             31 => Self::UnpinMessage,
             32 => Self::GetPinnedMessages,
@@ -231,6 +237,8 @@ pub enum Event {
     ContactJoined = 8,
     ContactProfile = 9,
     BlockedByPeer = 10,
+    /// API 2.2+: пир переслал визитку третьего лица (SEND_CONTACT).
+    ContactCard = 12,
 }
 
 impl Event {
@@ -246,6 +254,8 @@ impl Event {
             8 => Self::ContactJoined,
             9 => Self::ContactProfile,
             10 => Self::BlockedByPeer,
+            // 11 (FILE_SENT) — спринт S10.
+            12 => Self::ContactCard,
             _ => return None,
         })
     }
@@ -570,12 +580,14 @@ mod tests {
         assert_eq!(Method::from_u16(24), Some(Method::GlobalSearchMessage));
         assert_eq!(Method::from_u16(25), Some(Method::PinChat));
         assert_eq!(Method::from_u16(32), Some(Method::GetPinnedMessages));
-        assert_eq!(Method::from_u16(28), None, "DELETE_CHAT — спринт S13");
+        assert_eq!(Method::from_u16(28), Some(Method::DeleteChat));
+        assert_eq!(Method::from_u16(29), Some(Method::SendContact));
         assert_eq!(Method::from_u16(33), None);
         assert_eq!(Status::from_u16(4), Status::NoContact);
         assert_eq!(Status::from_u16(600), Status::Unknown(600));
         assert_eq!(Event::from_u16(10), Some(Event::BlockedByPeer));
-        assert_eq!(Event::from_u16(11), None);
+        assert_eq!(Event::from_u16(11), None, "FILE_SENT — спринт S10");
+        assert_eq!(Event::from_u16(12), Some(Event::ContactCard));
     }
 
     #[test]

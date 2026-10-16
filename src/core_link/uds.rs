@@ -433,6 +433,17 @@ fn encode_request(request: &Request, api2: bool) -> (Method, Vec<u8>) {
             payload.extend_from_slice(&msg_id.0);
             Method::GetMessage
         }
+        // Визитки и удаление чата (API 2.2+, §4.8).
+        Request::DeleteChat { cid } => {
+            api::put::u32(&mut payload, cid.0 as u32);
+            Method::DeleteChat
+        }
+        Request::SendContact { to, contact } => {
+            api::put::u32(&mut payload, to.0 as u32);
+            // None — моя карточка, на проводе contact_cid = 0.
+            api::put::u32(&mut payload, contact.map_or(0, |c| c.0 as u32));
+            Method::SendContact
+        }
     };
     (method, payload)
 }
@@ -705,6 +716,21 @@ fn decode_event(header: &Header, payload: &[u8]) -> Option<LinkEvent> {
             let cid = r.read_u32().ok()?;
             Some(LinkEvent::BlockedByPeer {
                 cid: Cid(i64::from(cid)),
+            })
+        }
+        // CONTACT_CARD (12, API 2.2+): [cid u32 — чат-отправитель]
+        // [name str16][bundle 64][addr str16]; addr пуст, если неизвестен.
+        api::Event::ContactCard => {
+            let cid = r.read_u32().ok()?;
+            let name = r.read_str16().ok()?;
+            let mut bundle = [0u8; 64];
+            bundle.copy_from_slice(r.read_bytes(64).ok()?);
+            let addr = r.read_str16().ok()?;
+            Some(LinkEvent::ContactCard {
+                cid: Cid(i64::from(cid)),
+                name: String::from_utf8_lossy(name).into_owned(),
+                bundle,
+                addr: String::from_utf8_lossy(addr).into_owned(),
             })
         }
         api::Event::Reaction
@@ -1666,5 +1692,85 @@ mod tests {
         assert_eq!(cid, Cid(7));
         assert!(mine && delivered);
         assert_eq!(text, "тело закрепа");
+    }
+
+    /// Визитки и удаление чата (S13, §4.8): раскладки запросов.
+    #[test]
+    fn cards_and_delete_codec_matches_contract() {
+        // DELETE_CHAT: [cid u32].
+        let (method, payload) = encode_request(&Request::DeleteChat { cid: Cid(7) }, true);
+        assert_eq!(method, Method::DeleteChat);
+        assert_eq!(payload, 7u32.to_le_bytes());
+
+        // SEND_CONTACT чужой карточки: [to_cid u32][contact_cid u32].
+        let (method, payload) = encode_request(
+            &Request::SendContact {
+                to: Cid(3),
+                contact: Some(Cid(9)),
+            },
+            true,
+        );
+        assert_eq!(method, Method::SendContact);
+        assert_eq!(&payload[..4], 3u32.to_le_bytes());
+        assert_eq!(&payload[4..], 9u32.to_le_bytes());
+
+        // Своя карточка — contact_cid = 0.
+        let (_, payload) = encode_request(
+            &Request::SendContact {
+                to: Cid(3),
+                contact: None,
+            },
+            true,
+        );
+        assert_eq!(&payload[4..], 0u32.to_le_bytes());
+    }
+
+    /// CONTACT_CARD (событие 12): [cid][name str16][bundle 64][addr str16];
+    /// пустой адрес остаётся пустым, cid — чат-отправитель.
+    #[test]
+    fn contact_card_event_decodes() {
+        let mut payload = Vec::new();
+        api::put::u32(&mut payload, 5);
+        api::put::str16(&mut payload, "Вера").expect("str16");
+        payload.extend_from_slice(&[0x42; 64]);
+        api::put::str16(&mut payload, "host:7777").expect("str16");
+        let header = Header {
+            kind: Kind::Event,
+            id: api::Event::ContactCard as u16,
+            request_id: 0,
+            status: Status::Ok,
+            payload_len: payload.len() as u32,
+        };
+        let Some(LinkEvent::ContactCard {
+            cid,
+            name,
+            bundle,
+            addr,
+        }) = decode_event(&header, &payload)
+        else {
+            panic!("событие не разобрано")
+        };
+        assert_eq!(cid, Cid(5), "cid — отправитель визитки");
+        assert_eq!(name, "Вера");
+        assert_eq!(bundle, [0x42; 64]);
+        assert_eq!(addr, "host:7777");
+
+        // Адрес неизвестен — пустая строка, а не ошибка.
+        let mut payload = Vec::new();
+        api::put::u32(&mut payload, 5);
+        api::put::str16(&mut payload, "Вера").expect("str16");
+        payload.extend_from_slice(&[0x42; 64]);
+        api::put::str16(&mut payload, "").expect("str16");
+        let Some(LinkEvent::ContactCard { addr, .. }) = decode_event(&header, &payload) else {
+            panic!("событие не разобрано")
+        };
+        assert_eq!(addr, "");
+
+        // Урезанный bundle — событие выбрасывается, поток не рвём.
+        let mut short = Vec::new();
+        api::put::u32(&mut short, 5);
+        api::put::str16(&mut short, "Вера").expect("str16");
+        short.extend_from_slice(&[0x42; 10]);
+        assert_eq!(decode_event(&header, &short), None);
     }
 }

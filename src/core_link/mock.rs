@@ -601,6 +601,41 @@ impl MockLink {
                 }
                 Err(LinkError::Kernel(Status::NotFound))
             }
+            Request::DeleteChat { cid } => {
+                // Семантика ядра: контакт исчезает из списка, закрепы
+                // и очередь офлайн-отправок чата чистятся.
+                let mut state = inner.state.lock().expect("стейт не отравлен");
+                let Some(pos) = state.contacts.iter().position(|c| c.cid == cid) else {
+                    return Err(LinkError::Kernel(Status::NoContact));
+                };
+                state.contacts.remove(pos);
+                if state.pinned_chat == Some(cid) {
+                    state.pinned_chat = None;
+                }
+                state.pinned_msgs.remove(&cid);
+                inner.queued.lock().expect("queue не отравлен").remove(&cid);
+                Ok(OkReply::Done)
+            }
+            Request::SendContact { to, contact } => {
+                // Семантика ядра: карточка уходит только по живой сессии;
+                // contact = None — моя карточка, всегда существует.
+                let state = inner.state.lock().expect("стейт не отравлен");
+                let Some(target) = state.contacts.iter().find(|c| c.cid == to) else {
+                    return Err(LinkError::Kernel(Status::NoContact));
+                };
+                if target.blocked {
+                    return Err(LinkError::Kernel(Status::ContactBlocked));
+                }
+                if let Some(card) = contact {
+                    if !state.contacts.iter().any(|c| c.cid == card) {
+                        return Err(LinkError::Kernel(Status::NoContact));
+                    }
+                }
+                if !target.online {
+                    return Err(LinkError::Kernel(Status::NoSession));
+                }
+                Ok(OkReply::Done)
+            }
         }
     }
 }
@@ -1065,5 +1100,76 @@ mod tests {
         }
         let reply = link.execute(Request::PinnedMessages { cid: Cid(1) }).await;
         assert_eq!(reply, Ok(OkReply::PinnedMessages { ids: vec![second] }));
+    }
+
+    /// Визитки и удаление чата (S13): семантика §4.8 — карточка только
+    /// по живому соединению, удаление стирает контакт и его закрепы.
+    #[tokio::test(start_paused = true)]
+    async fn cards_and_delete_match_kernel_semantics() {
+        let link = MockLink::new(scene());
+
+        // Отправка: чужая и своя карточки онлайн-контакту — ок.
+        let reply = link
+            .execute(Request::SendContact {
+                to: Cid(1),
+                contact: Some(Cid(2)),
+            })
+            .await;
+        assert_eq!(reply, Ok(OkReply::Done));
+        let reply = link
+            .execute(Request::SendContact {
+                to: Cid(1),
+                contact: None,
+            })
+            .await;
+        assert_eq!(reply, Ok(OkReply::Done), "своя карточка — contact = None");
+
+        // Ошибки: неизвестные cid, офлайн получателя.
+        let reply = link
+            .execute(Request::SendContact {
+                to: Cid(99),
+                contact: None,
+            })
+            .await;
+        assert_eq!(reply, Err(LinkError::Kernel(Status::NoContact)));
+        let reply = link
+            .execute(Request::SendContact {
+                to: Cid(1),
+                contact: Some(Cid(99)),
+            })
+            .await;
+        assert_eq!(reply, Err(LinkError::Kernel(Status::NoContact)));
+        // scene(): контакт 2 офлайн.
+        let reply = link
+            .execute(Request::SendContact {
+                to: Cid(2),
+                contact: None,
+            })
+            .await;
+        assert_eq!(
+            reply,
+            Err(LinkError::Kernel(Status::NoSession)),
+            "карточка уходит только по живому соединению"
+        );
+
+        // Удаление: контакт исчезает, его закрепы и закреп чата чистятся.
+        let _ = link.execute(Request::PinChat { cid: Cid(1) }).await;
+        let reply = link.execute(Request::DeleteChat { cid: Cid(1) }).await;
+        assert_eq!(reply, Ok(OkReply::Done));
+        let reply = link.execute(Request::PinnedChat).await;
+        assert_eq!(reply, Ok(OkReply::PinnedChat { cid: None }));
+        let reply = link.execute(Request::DeleteChat { cid: Cid(1) }).await;
+        assert_eq!(
+            reply,
+            Err(LinkError::Kernel(Status::NoContact)),
+            "повторное удаление — контакта уже нет"
+        );
+        let Ok(OkReply::Contacts(contacts)) = link.execute(Request::Contacts).await else {
+            panic!("contacts")
+        };
+        assert!(
+            contacts.iter().all(|c| c.cid != Cid(1)),
+            "удалённый не возвращается в списке"
+        );
     }
 }

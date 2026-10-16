@@ -378,6 +378,9 @@ fn on_link<L: CoreLink>(state: &mut State<L>, link: LinkIn) -> Task<Message> {
                 state.store.set_presence(cid, false);
                 Task::none()
             }
+            // Обработчик появится в ui-коммитете S13; без руки событие
+            // просто игнорируется, как незнакомые события кодека.
+            LinkEvent::ContactCard { .. } => Task::none(),
             LinkEvent::Down => {
                 state.link_up = false;
                 Task::none()
