@@ -32,6 +32,18 @@ use crate::ui::{
 /// капсульная заливка всей строки (стиль chat_row), без полос с краю.
 /// Высота карточки фиксированная (правка осмотра окна: строки
 /// растягивались на всю высоту сайдбара).
+/// Аватарка из байтов кэша (S8б): квадрат size×size; без байтов — None
+/// (рисуем как раньше, без заглушек).
+pub fn avatar_thumb(bytes: Option<&[u8]>, size: f32) -> Option<Element<'static, Message>> {
+    let bytes = bytes?;
+    Some(
+        iced::widget::image(iced::widget::image::Handle::from_bytes(bytes.to_vec()))
+            .width(Length::Fixed(size))
+            .height(Length::Fixed(size))
+            .into(),
+    )
+}
+
 pub fn contact_row(
     cid: Cid,
     name: &str,
@@ -39,10 +51,15 @@ pub fn contact_row(
     unread: u32,
     selected: bool,
     scale: f32,
+    avatar: Option<Vec<u8>>,
 ) -> Element<'static, Message> {
     let dot = text(if online { "●" } else { "○" })
         .size(10.0 * scale)
         .color(if online { palette::OK } else { palette::DIM });
+    let icon: Element<'static, Message> = match avatar_thumb(avatar.as_deref(), 28.0 * scale) {
+        Some(image) => image,
+        None => dot.into(),
+    };
 
     let has_unread = unread > 0;
     // to_owned: фрагмент текста должен владеть строкой (Element 'static
@@ -62,7 +79,7 @@ pub fn contact_row(
         })
         .width(Length::Fill);
 
-    let mut cells = row![dot, name]
+    let mut cells = row![icon, name]
         .spacing(8)
         .height(Length::Fill)
         .align_y(iced::alignment::Vertical::Center);
@@ -549,6 +566,7 @@ pub fn contact_card(
     online: bool,
     blocked: bool,
     scale: f32,
+    avatar: Option<Vec<u8>>,
 ) -> Element<'static, Message> {
     let (status, color) = if blocked {
         ("заблокирован", palette::ERR)
@@ -563,8 +581,13 @@ pub fn contact_card(
         "Заблокировать"
     };
 
+    let mut head = column![].spacing(10);
+    if let Some(image) = avatar_thumb(avatar.as_deref(), 64.0 * scale) {
+        head = head.push(image);
+    }
     container(
         column![
+            head,
             text(name.to_owned())
                 .size(15.0 * scale)
                 .font(palette::bold())
@@ -1090,6 +1113,7 @@ pub fn settings_panel<'a>(
     view: &'a SettingsView,
     profile_name: Option<&'a str>,
     scale: f32,
+    own_avatar: Option<&'a [u8]>,
 ) -> Element<'a, Message> {
     use crate::model::settings::{FONT_SCALE_MAX, FONT_SCALE_MIN, FONT_SCALE_STEP};
 
@@ -1150,6 +1174,30 @@ pub fn settings_panel<'a>(
             text(name_note.unwrap_or_default())
                 .size(10.0 * scale)
                 .color(palette::DIM),
+            // Аватарка (S8б): своё фото в визитках; 96×96 JPEG ≤ 16 КБ —
+            // лимит ядра, сжатие при выборе.
+            text("Фото в визитках")
+                .size(12.0 * scale)
+                .color(palette::TEXT),
+            {
+                let mut avatar_row = row![]
+                    .spacing(10)
+                    .align_y(iced::alignment::Vertical::Center);
+                if let Some(image) = avatar_thumb(own_avatar, 48.0 * scale) {
+                    avatar_row = avatar_row.push(image);
+                }
+                avatar_row.push(
+                    button(text("Выбрать фото").size(12.0 * scale).color(palette::TEXT))
+                        .padding(Padding {
+                            top: 6.0,
+                            right: 14.0,
+                            bottom: 6.0,
+                            left: 14.0,
+                        })
+                        .style(palette::button_dim)
+                        .on_press(Message::Settings(SettingsIn::PickAvatar)),
+                )
+            },
             iced::widget::checkbox(settings.hide_notification_text)
                 .label("Скрывать текст в уведомлениях")
                 .on_toggle(|on| Message::Settings(SettingsIn::ToggleNotificationText(on)))

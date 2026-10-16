@@ -3548,6 +3548,7 @@ dependencies = [
  "futures-util",
  "iced",
  "iced_test",
+ "image",
  "png 0.17.16",
  "rfd",
  "tokio",

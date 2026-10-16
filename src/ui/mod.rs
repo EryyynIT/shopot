@@ -17,7 +17,9 @@ use iced::widget::{
 };
 use iced::{Element, Length, Padding, Point, Task};
 
-use crate::core_link::{now_ms, CoreLink, LinkEvent, OkReply, Reply, Request, SearchHit};
+use crate::core_link::{
+    now_ms, CoreLink, LinkError, LinkEvent, OkReply, Reply, Request, SearchHit,
+};
 use crate::model::cid::Cid;
 use crate::model::feed::FeedItem;
 use crate::model::msg::{CoreMsgId, MsgId};
@@ -193,6 +195,13 @@ pub enum SettingsIn {
     Open,
     /// Галка «скрывать текст в уведомлениях».
     ToggleNotificationText(bool),
+    /// «Фото» в настройках — выбрать аватарку (S8б), диалог нативный.
+    PickAvatar,
+    /// Диалог выбора аватарки закрылся: Some — путь, None — отмена.
+    AvatarPicked(Option<std::path::PathBuf>),
+    /// Сжатие аватарки закончено: Ok — байты ≤16 КБ, Err — честный
+    /// текст причины для заметки в настройках.
+    AvatarReady(Result<Vec<u8>, String>),
     /// Галка «компактная лента».
     ToggleCompact(bool),
     /// Кнопка масштаба: +шаг или −шаг (границы удерживает Store).
@@ -618,6 +627,46 @@ fn on_settings<L: CoreLink>(state: &mut State<L>, settings: SettingsIn) -> Task<
             }
             request_task(state, Request::SetName { name })
         }
+        SettingsIn::PickAvatar => {
+            if !matches!(state.overlay, Overlay::Settings(_)) {
+                return Task::none();
+            }
+            Task::perform(
+                async {
+                    rfd::AsyncFileDialog::new()
+                        .add_filter("Картинка", &["png", "jpg", "jpeg", "webp"])
+                        .pick_file()
+                        .await
+                },
+                |handle| {
+                    Message::Settings(SettingsIn::AvatarPicked(
+                        handle.map(|h| h.path().to_path_buf()),
+                    ))
+                },
+            )
+        }
+        SettingsIn::AvatarPicked(picked) => {
+            let Some(path) = picked else {
+                return Task::none();
+            };
+            // Сжатие тяжёлое и может упасть — вне update, честный текст
+            // ошибки приедет с результатом.
+            Task::perform(async move { prepare_avatar(&path) }, |result| {
+                Message::Settings(SettingsIn::AvatarReady(result))
+            })
+        }
+        SettingsIn::AvatarReady(result) => {
+            let data = match result {
+                Ok(data) => data,
+                Err(note) => {
+                    if let Overlay::Settings(view) = &mut state.overlay {
+                        view.note = Some(note);
+                    }
+                    return Task::none();
+                }
+            };
+            request_task(state, Request::SetAvatar { data })
+        }
         SettingsIn::ToggleNotificationText(on) => {
             state.store.settings.hide_notification_text = on;
             Task::none()
@@ -672,8 +721,15 @@ fn on_link<L: CoreLink>(state: &mut State<L>, link: LinkIn) -> Task<Message> {
                 state.store.mark_delivered(cid, msg_id);
                 Task::none()
             }
-            // Склейка: аватарки применит ui-коммит спринта (S8б).
-            LinkEvent::AvatarReceived { .. } => Task::none(),
+            // Аватарка приехала (S8б): кэш по id; вьюхи перечитают.
+            LinkEvent::AvatarReceived {
+                cid,
+                avatar_id,
+                data,
+            } => {
+                state.store.apply_avatar(cid, avatar_id, data);
+                Task::none()
+            }
             // Входящий файл (S10): ядро сохранил в ~/.shopot/files/<hex>;
             // пузырь с кнопкой открытия, уведомление как у сообщения.
             LinkEvent::FileReceived {
@@ -748,8 +804,14 @@ fn on_link<L: CoreLink>(state: &mut State<L>, link: LinkIn) -> Task<Message> {
                 state.invite_code = None;
                 Task::none()
             }
-            LinkEvent::ContactProfile { cid, name, .. } => {
-                state.store.rename_contact(cid, &name);
+            LinkEvent::ContactProfile {
+                cid,
+                name,
+                avatar_id,
+            } => {
+                // Имя и avatar_id атомарно из профиля (S8б); байты
+                // дотащит ядро событием AVATAR_RECEIVED.
+                state.store.apply_profile(cid, name, avatar_id.0);
                 Task::none()
             }
             LinkEvent::BlockedByPeer { cid } => {
@@ -1005,6 +1067,24 @@ fn on_link<L: CoreLink>(state: &mut State<L>, link: LinkIn) -> Task<Message> {
                 state.profile_name = Some(name);
                 if let Overlay::Settings(view) = &mut state.overlay {
                     view.note = Some("Имя сохранено — будет в ваших визитках.".into());
+                }
+                Task::none()
+            }
+            (Request::SetAvatar { data }, Ok(OkReply::AvatarSet { avatar_id, .. })) => {
+                state.store.set_own_avatar(avatar_id, data.clone());
+                if let Overlay::Settings(view) = &mut state.overlay {
+                    view.note = Some("Фото обновлено.".into());
+                }
+                Task::none()
+            }
+            (Request::SetAvatar { .. }, Err(err)) => {
+                if let Overlay::Settings(view) = &mut state.overlay {
+                    view.note = Some(match err {
+                        LinkError::Kernel(crate::core_link::api::Status::TooBig) => {
+                            "Фото не влезло в лимит ядра — попробуйте меньше.".into()
+                        }
+                        _ => format!("Фото не сохранилось: {}", err.user_text()),
+                    });
                 }
                 Task::none()
             }
@@ -1665,6 +1745,25 @@ fn send_current<L: CoreLink>(state: &mut State<L>) -> Task<Message> {
     ])
 }
 
+/// Аватарка из выбранного файла (S8б): декод → 96×96 → JPEG, лимит
+/// ядра 16000 Б. Err — честный текст для заметки (без «ядра»).
+fn prepare_avatar(path: &std::path::Path) -> Result<Vec<u8>, String> {
+    let img = image::ImageReader::open(path)
+        .map_err(|_| "Файл не читается.".to_owned())?
+        .decode()
+        .map_err(|_| "Это не картинка — выберите фото.".to_owned())?;
+    let thumb = img.thumbnail(96, 96);
+    let mut buf = std::io::Cursor::new(Vec::new());
+    thumb
+        .write_to(&mut buf, image::ImageFormat::Jpeg)
+        .map_err(|_| "Картинка не сжалась.".to_owned())?;
+    let data = buf.into_inner();
+    if data.len() > 16000 {
+        return Err("Фото не влезло в лимит 16 КБ — попробуйте меньше.".into());
+    }
+    Ok(data)
+}
+
 /// Путь входящего файла: ядро кладёт в ~/.shopot/files/<hex file_id>.
 fn files_path(file_id: &[u8; 16]) -> String {
     let hex: String = file_id.iter().map(|b| format!("{b:02x}")).collect();
@@ -1765,7 +1864,8 @@ fn overlay_layer<'a, L: CoreLink>(
                     &name,
                     online,
                     blocked,
-                    state.store.settings.font_scale
+                    state.store.settings.font_scale,
+                    state.store.avatar(*cid).map(<[u8]>::to_vec),
                 )),
             ]
             .into()
@@ -1814,7 +1914,8 @@ fn overlay_layer<'a, L: CoreLink>(
                 &state.store.settings,
                 view,
                 state.profile_name.as_deref(),
-                state.store.settings.font_scale
+                state.store.settings.font_scale,
+                state.store.own_avatar()
             ))
         ]
         .into(),
@@ -2028,6 +2129,31 @@ fn title_bar<L: CoreLink>(state: &State<L>) -> Element<'static, Message> {
     .into()
 }
 
+/// Строка сайдбара для lazy-снимка (S8б добавил аватарку — tuple
+/// распух, clippy прав).
+struct SidebarRow {
+    cid: Cid,
+    name: String,
+    online: bool,
+    unread: u32,
+    chosen: bool,
+    pinned: bool,
+    avatar: Option<Vec<u8>>,
+    avatar_id: Option<[u8; 16]>,
+}
+
+/// Ключ ленивости строки сайдбара: скаляры + avatar_id (u128).
+#[derive(PartialEq, Eq, Hash)]
+struct SidebarKey {
+    scale_bits: u32,
+    cid: i64,
+    unread: u32,
+    online: bool,
+    chosen: bool,
+    pinned: bool,
+    avatar_id: Option<u128>,
+}
+
 fn sidebar<L: CoreLink>(state: &State<L>) -> Element<'_, Message> {
     let scale = state.store.settings.font_scale;
     let selected = state.store.selected();
@@ -2035,22 +2161,26 @@ fn sidebar<L: CoreLink>(state: &State<L>) -> Element<'_, Message> {
     // изменении состава/статусов или масштаба (GUI_DEV.md §3 — lazy).
     // Шестой элемент — закреп чата (S12): закреплённый идёт первым.
     let pinned_chat = state.store.pinned_chat();
-    let mut rows: Vec<(Cid, String, bool, u32, bool, bool)> = state
+    let mut rows: Vec<SidebarRow> = state
         .store
         .contacts()
         .map(|c| {
             let unread = state.store.thread(c.cid).map(|t| t.unread).unwrap_or(0);
-            (
-                c.cid,
-                c.name.clone(),
-                c.online,
+            SidebarRow {
+                cid: c.cid,
+                name: c.name.clone(),
+                online: c.online,
                 unread,
-                selected == Some(c.cid),
-                pinned_chat == Some(c.cid),
-            )
+                chosen: selected == Some(c.cid),
+                pinned: pinned_chat == Some(c.cid),
+                // Аватарка из кэша (S8б): байты клонируем в строку
+                // (≤16 КБ на контакт, список маленький); id в ключ lazy.
+                avatar: state.store.avatar(c.cid).map(<[u8]>::to_vec),
+                avatar_id: c.avatar_id,
+            }
         })
         .collect();
-    if let Some(pos) = rows.iter().position(|row| row.5) {
+    if let Some(pos) = rows.iter().position(|row| row.pinned) {
         let pinned = rows.remove(pos);
         rows.insert(0, pinned);
     }
@@ -2095,24 +2225,36 @@ fn sidebar<L: CoreLink>(state: &State<L>) -> Element<'_, Message> {
         .into()
     } else {
         // Масштаб в ключе: смена настройки обязана перерисовать строки.
-        let key: Vec<(u32, i64, u32, bool, bool, bool)> = rows
+        let key: Vec<SidebarKey> = rows
             .iter()
-            .map(|(cid, _, online, unread, chosen, pinned)| {
-                (scale.to_bits(), cid.0, *unread, *online, *chosen, *pinned)
+            .map(|row| SidebarKey {
+                scale_bits: scale.to_bits(),
+                cid: row.cid.0,
+                unread: row.unread,
+                online: row.online,
+                chosen: row.chosen,
+                pinned: row.pinned,
+                avatar_id: row.avatar_id.map(u128::from_le_bytes),
             })
             .collect();
         lazy(key, move |_| {
             let mut list = column![].spacing(2);
-            for (cid, name, online, unread, chosen, pinned) in &rows {
-                if *pinned {
+            for row in &rows {
+                if row.pinned {
                     list = list.push(text("Закреплённый").size(10.0 * scale).color(palette::DIM));
                 }
                 // Правая кнопка — меню знакомства; on_move запоминает точку.
                 list = list.push(
                     mouse_area(widgets::contact_row(
-                        *cid, name, *online, *unread, *chosen, scale,
+                        row.cid,
+                        &row.name,
+                        row.online,
+                        row.unread,
+                        row.chosen,
+                        scale,
+                        row.avatar.clone(),
                     ))
-                    .on_right_press(Message::Meet(MeetIn::OpenMenu(*cid)))
+                    .on_right_press(Message::Meet(MeetIn::OpenMenu(row.cid)))
                     .on_move(|point| Message::Meet(MeetIn::Cursor(point))),
                 );
             }
@@ -2176,27 +2318,35 @@ fn main_pane<L: CoreLink>(state: &State<L>) -> Element<'_, Message> {
     let header = container(
         row![
             // Клик по имени открывает карточку контакта (GUI_UI.md §1).
-            button(
-                column![
-                    text(name.clone())
-                        .size(14.0 * scale)
-                        .font(palette::bold())
-                        .color(palette::TEXT),
-                    {
-                        // Presence и сессия здесь одно и то же: ядро не
-                        // шлёт сессию отдельно, она выводится из PRESENCE
-                        // (store.rs). Пользователю — простые слова.
-                        let (label, color) = if online {
-                            ("в сети", palette::OK)
-                        } else {
-                            ("не в сети", palette::DIM)
-                        };
-                        text(label).size(10.0 * scale).color(color)
-                    },
-                ]
-                .spacing(1)
-                .align_x(Horizontal::Left),
-            )
+            button({
+                // Аватарка слева от имени, когда байты уже у ядра
+                // приехали (S8б).
+                let mut title = row![].spacing(10).align_y(Vertical::Center);
+                if let Some(image) = widgets::avatar_thumb(state.store.avatar(cid), 32.0 * scale) {
+                    title = title.push(image);
+                }
+                title.push(
+                    column![
+                        text(name.clone())
+                            .size(14.0 * scale)
+                            .font(palette::bold())
+                            .color(palette::TEXT),
+                        {
+                            // Presence и сессия здесь одно и то же: ядро не
+                            // шлёт сессию отдельно, она выводится из PRESENCE
+                            // (store.rs). Пользователю — простые слова.
+                            let (label, color) = if online {
+                                ("в сети", palette::OK)
+                            } else {
+                                ("не в сети", palette::DIM)
+                            };
+                            text(label).size(10.0 * scale).color(color)
+                        },
+                    ]
+                    .spacing(1)
+                    .align_x(Horizontal::Left),
+                )
+            })
             .padding(Padding {
                 top: 2.0,
                 right: 6.0,
@@ -3997,5 +4147,94 @@ mod tests {
         assert_eq!(human_size(900), "900 Б");
         assert_eq!(human_size(254_000), "249 КБ");
         assert_eq!(human_size(3 * 1024 * 1024), "3.0 МБ");
+    }
+
+    // ---------- S8б: аватарки ----------
+
+    /// AVATAR_RECEIVED: байты в кэш, контакту — id; CONTACT_PROFILE
+    /// несёт новый id атомарно с именем.
+    #[test]
+    fn avatar_event_lands_in_store() {
+        let mut state = state();
+        state.store.replace_contacts(vec![contact(1, "Аня")]);
+        let _ = update(
+            &mut state,
+            Message::Link(LinkIn::Event(LinkEvent::AvatarReceived {
+                cid: Cid(1),
+                avatar_id: [0xA1; 16],
+                data: vec![1, 2, 3],
+            })),
+        );
+        assert_eq!(state.store.avatar(Cid(1)), Some(&[1, 2, 3][..]));
+
+        let _ = update(
+            &mut state,
+            Message::Link(LinkIn::Event(LinkEvent::ContactProfile {
+                cid: Cid(1),
+                name: "Анна".into(),
+                avatar_id: CoreMsgId([0xB2; 16]),
+            })),
+        );
+        let contact = state.store.contact(Cid(1)).unwrap();
+        assert_eq!(contact.name, "Анна");
+        assert_eq!(contact.avatar_id, Some([0xB2; 16]));
+        // Байты нового id ещё не приехали — аватарки нет (без заглушек).
+        assert!(state.store.avatar(Cid(1)).is_none());
+    }
+
+    /// Своя аватарка: OK ядра → байты в кэш + заметка в настройках;
+    /// ошибка — честная заметка.
+    #[test]
+    fn own_avatar_set_reply_and_error() {
+        let mut state = state();
+        state.overlay = Overlay::Settings(Default::default());
+        let _ = update(
+            &mut state,
+            Message::Link(LinkIn::Replied {
+                request: Request::SetAvatar { data: vec![9; 10] },
+                reply: Ok(OkReply::AvatarSet {
+                    avatar_id: [0xC3; 16],
+                    size: 10,
+                }),
+                tag: None,
+            }),
+        );
+        assert_eq!(state.store.own_avatar(), Some(&[9; 10][..]));
+
+        let _ = update(
+            &mut state,
+            Message::Link(LinkIn::Replied {
+                request: Request::SetAvatar { data: vec![9; 10] },
+                reply: Err(LinkError::Kernel(crate::core_link::api::Status::TooBig)),
+                tag: None,
+            }),
+        );
+        let Overlay::Settings(view) = &state.overlay else {
+            panic!()
+        };
+        assert!(view.note.as_deref().unwrap_or("").contains("лимит"));
+    }
+
+    /// prepare_avatar: картинка сжимается до лимита ядра; не-картинка —
+    /// честный текст.
+    #[test]
+    fn prepare_avatar_scales_and_refuses() {
+        // 400×400 PNG → JPEG ≤ 16000 Б.
+        let img = image::RgbImage::from_fn(400, 400, |x, y| {
+            image::Rgb([(x % 251) as u8, (y % 239) as u8, 128])
+        });
+        let tmp = std::env::temp_dir().join(format!("shopot-avatar-{}.png", std::process::id()));
+        img.save(&tmp).expect("png записан");
+        let data = prepare_avatar(&tmp).expect("сжалась");
+        assert!(data.len() <= 16000, "{} > 16000", data.len());
+        assert_eq!(&data[0..2], &[0xFF, 0xD8], "jpeg");
+        std::fs::remove_file(&tmp).ok();
+
+        // Не картинка — честный отказ.
+        let tmp = std::env::temp_dir().join(format!("shopot-notimg-{}.bin", std::process::id()));
+        std::fs::write(&tmp, b"hello").expect("записан");
+        let err = prepare_avatar(&tmp).expect_err("не картинка");
+        assert!(err.contains("не картинка"), "{err}");
+        std::fs::remove_file(&tmp).ok();
     }
 }

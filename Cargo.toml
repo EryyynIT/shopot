@@ -29,6 +29,9 @@ cpal = "0.17"
 # Файловый диалог (S10): нативный через xdg-portal (D-Bus, без gtk),
 # асинхронный — update не блокируется.
 rfd = { version = "0.17", default-features = false, features = ["xdg-portal"] }
+# Аватарки (S8б): выбранное фото сжимаем до 96×96 JPEG ≤ 16 КБ — лимит
+# кадра ядра (§4.4). Та же версия, что тащит iced.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 
 [dev-dependencies]
 futures-util = "0.3"
