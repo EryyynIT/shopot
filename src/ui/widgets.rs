@@ -544,14 +544,15 @@ pub fn contact_card(
     .into()
 }
 
-/// Меню по правой кнопке на контакте: закреп чата (ядро 2.2+),
-/// блок/разблок и информация (GUI_UI.md §4).
+/// Меню по правой кнопке на контакте: блок/разблок, информация и —
+/// на ядре 2.2+ (`v22`) — закреп, отправка визитки, удаление чата
+/// (GUI_UI.md §4).
 pub fn context_menu(
     menu: &MenuView,
     name: &str,
     blocked: bool,
     pinned: bool,
-    can_pin: bool,
+    v22: bool,
     scale: f32,
 ) -> Element<'static, Message> {
     let label = if blocked {
@@ -587,7 +588,7 @@ pub fn context_menu(
             .on_press(Message::Meet(MeetIn::OpenCard(menu.cid))),
     ]
     .spacing(2);
-    if can_pin {
+    if v22 {
         let pin_label = if pinned {
             "Открепить чат"
         } else {
@@ -605,12 +606,154 @@ pub fn context_menu(
                 .style(palette::button_menu)
                 .on_press(Message::Meet(MeetIn::TogglePinChat(menu.cid))),
         );
+        items = items.push(
+            button(
+                text("Отправить визитку…")
+                    .size(13.0 * scale)
+                    .color(palette::TEXT),
+            )
+            .width(Length::Fill)
+            .padding(Padding {
+                top: 6.0,
+                right: 10.0,
+                bottom: 6.0,
+                left: 10.0,
+            })
+            .style(palette::button_menu)
+            .on_press(Message::Meet(MeetIn::OpenSendCard(menu.cid))),
+        );
+        items = items.push(
+            button(text("Удалить чат").size(13.0 * scale).color(palette::ERR))
+                .width(Length::Fill)
+                .padding(Padding {
+                    top: 6.0,
+                    right: 10.0,
+                    bottom: 6.0,
+                    left: 10.0,
+                })
+                .style(palette::button_menu)
+                .on_press(Message::Meet(MeetIn::AskDeleteChat(menu.cid))),
+        );
     }
     container(items)
-        .width(Length::Fixed(180.0))
+        .width(Length::Fixed(200.0))
         .padding(8)
         .style(palette::dialog)
         .into()
+}
+
+/// Визитка третьего лица в ленте (S13): карточка знакомит, но не
+/// подключает — добавить человека можно только его приглашением
+/// (CORE-API §4.8), поэтому визитка не интерактивна.
+pub fn card_bubble(name: String, scale: f32) -> Element<'static, Message> {
+    container(
+        column![
+            text(name)
+                .size(14.0 * scale)
+                .font(palette::bold())
+                .color(palette::TEXT),
+            text("визитка · добавить можно по приглашению")
+                .size(10.0 * scale)
+                .color(palette::DIM),
+        ]
+        .spacing(2),
+    )
+    .padding(Padding {
+        top: 8.0,
+        right: 14.0,
+        bottom: 8.0,
+        left: 14.0,
+    })
+    .style(palette::bubble_theirs)
+    .into()
+}
+
+/// Выбор визитки для отправки в чат (S13): «Моя визитка» (ядро пошлёт
+/// карточку профиля) или карточка другого контакта; чат-получатель
+/// из списка исключён (view его отрезал).
+pub fn send_card_panel(rows: Vec<(Option<Cid>, String)>, scale: f32) -> Element<'static, Message> {
+    let mut list = column![text("Чья визитка?")
+        .size(16.0 * scale)
+        .font(palette::bold())
+        .color(palette::TEXT)]
+    .spacing(2);
+    for (contact, name) in rows {
+        list = list.push(
+            button(text(name).size(13.0 * scale).color(palette::TEXT))
+                .width(Length::Fill)
+                .padding(Padding {
+                    top: 6.0,
+                    right: 10.0,
+                    bottom: 6.0,
+                    left: 10.0,
+                })
+                .style(palette::button_menu)
+                .on_press(Message::Meet(MeetIn::PickSendCard(contact))),
+        );
+    }
+    list = list.push(
+        button(text("Отмена").size(13.0 * scale).color(palette::DIM))
+            .width(Length::Fill)
+            .padding(Padding {
+                top: 6.0,
+                right: 10.0,
+                bottom: 6.0,
+                left: 10.0,
+            })
+            .style(palette::button_menu)
+            .on_press(Message::Meet(MeetIn::CloseOverlay)),
+    );
+    container(scrollable(list))
+        .width(Length::Fixed(320.0))
+        .padding(16)
+        .style(palette::dialog)
+        .into()
+}
+
+/// Честное подтверждение удаления чата (S13, DELETE_CHAT): действие
+/// необратимо и удаляет только нашу сторону — у собеседника всё останется.
+pub fn confirm_delete_panel(cid: Cid, name: &str, scale: f32) -> Element<'static, Message> {
+    container(
+        column![
+            text(format!("Удалить чат с {name}?"))
+                .size(15.0 * scale)
+                .font(palette::bold())
+                .color(palette::TEXT),
+            text(
+                "История и контакт удалятся безвозвратно — только у вас. \
+                 Написать снова можно будет по новому приглашению."
+            )
+            .size(12.0 * scale)
+            .color(palette::MUTED),
+            row![
+                button(text("Удалить").size(12.0 * scale).color(palette::ERR))
+                    .padding(Padding {
+                        top: 8.0,
+                        right: 14.0,
+                        bottom: 8.0,
+                        left: 14.0,
+                    })
+                    .style(palette::button_dim)
+                    .on_press(Message::Meet(MeetIn::ConfirmDeleteChat(cid))),
+                space::Space::new().width(Length::Fill),
+                button(text("Отмена").size(12.0 * scale).color(palette::TEXT))
+                    .padding(Padding {
+                        top: 8.0,
+                        right: 14.0,
+                        bottom: 8.0,
+                        left: 14.0,
+                    })
+                    .style(palette::button_plain)
+                    .on_press(Message::Meet(MeetIn::CloseOverlay)),
+            ]
+            .align_y(iced::alignment::Vertical::Center),
+        ]
+        .spacing(10),
+    )
+    .width(Length::Fixed(420.0))
+    .padding(16)
+    .style(palette::dialog)
+    .into()
 }
 
 /// Плашка закрепов под шапкой чата (S12): число и последнее тело;

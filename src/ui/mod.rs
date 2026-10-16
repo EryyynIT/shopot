@@ -108,6 +108,14 @@ pub enum MeetIn {
     ToggleBlock(Cid),
     /// Закрепить/открепить чат по текущему состоянию (API 2.2+, S12).
     TogglePinChat(Cid),
+    /// Открыть выбор визитки для отправки в этот чат (API 2.2+, S13).
+    OpenSendCard(Cid),
+    /// Выбрана визитка: чужая (Some) или моя (None) — SEND_CONTACT.
+    PickSendCard(Option<Cid>),
+    /// Спросить подтверждение удаления чата (API 2.2+, S13).
+    AskDeleteChat(Cid),
+    /// Удаление подтверждено — DELETE_CHAT.
+    ConfirmDeleteChat(Cid),
     /// Правая кнопка на строке контакта (GUI_UI.md §4).
     OpenMenu(Cid),
     /// Движение мыши над строкой контакта — позиция для меню.
@@ -155,6 +163,10 @@ pub enum Overlay {
     Pins,
     /// Меню сообщения по ПКМ (S12): закрепить/открепить.
     MsgMenu(MsgId),
+    /// Выбор визитки для отправки в чат (S13): cid чата-получателя.
+    SendCard(Cid),
+    /// Подтверждение удаления чата (S13): действие необратимо.
+    ConfirmDelete(Cid),
 }
 
 /// Панель поиска: запрос живёт здесь; совпадения — либо из Store
@@ -378,9 +390,31 @@ fn on_link<L: CoreLink>(state: &mut State<L>, link: LinkIn) -> Task<Message> {
                 state.store.set_presence(cid, false);
                 Task::none()
             }
-            // Обработчик появится в ui-коммитете S13; без руки событие
-            // просто игнорируется, как незнакомые события кодека.
-            LinkEvent::ContactCard { .. } => Task::none(),
+            // Визитка (S13): запись в ленту + уведомление, как входящее.
+            // bundle/addr не показываем: добавить человека из визитки
+            // нельзя — нужно его приглашение (§4.8).
+            LinkEvent::ContactCard { cid, name, .. } => {
+                let opened = state.store.selected() == Some(cid);
+                state.store.push_card(cid, now_ms(), name.clone());
+                let mut task = if opened {
+                    scroll_feed(state)
+                } else {
+                    Task::none()
+                };
+                if notify::should_notify(state.store.selected(), state.window_focused, cid) {
+                    let title = state
+                        .store
+                        .contact(cid)
+                        .map(|c| c.name.clone())
+                        .unwrap_or_else(|| cid.to_string());
+                    let body = notify::notification_body(
+                        &format!("визитка: {name}"),
+                        state.store.settings.hide_notification_text,
+                    );
+                    task = Task::batch([task, notify::os_notify(title, body)]);
+                }
+                task
+            }
             LinkEvent::Down => {
                 state.link_up = false;
                 Task::none()
@@ -550,6 +584,42 @@ fn on_link<L: CoreLink>(state: &mut State<L>, link: LinkIn) -> Task<Message> {
                 state
                     .store
                     .push_sys(cid, now_ms(), format!("закреп: {}", err.user_text()));
+                Task::none()
+            }
+            // Удаление чата подтверждено ядром (S13): проекция стирается
+            // целиком; ошибка — честная sys-строка, чат остаётся.
+            (Request::DeleteChat { cid }, Ok(OkReply::Done)) => {
+                state.store.delete_chat(cid);
+                Task::none()
+            }
+            (Request::DeleteChat { cid }, Err(err)) => {
+                state
+                    .store
+                    .push_sys(cid, now_ms(), format!("чат не удалён: {}", err.user_text()));
+                Task::none()
+            }
+            // Визитка ушла (S13): ядро эха не шлёт — отметка в ленте
+            // получателя. Ошибка (нет контакта, блок, офлайн) — sys-строка.
+            (Request::SendContact { to, contact }, Ok(OkReply::Done)) => {
+                let name = match contact {
+                    Some(c) => state
+                        .store
+                        .contact(c)
+                        .map(|x| x.name.clone())
+                        .unwrap_or_else(|| c.to_string()),
+                    None => "моя".to_owned(),
+                };
+                state
+                    .store
+                    .push_sys(to, now_ms(), format!("визитка отправлена: {name}"));
+                Task::none()
+            }
+            (Request::SendContact { to, .. }, Err(err)) => {
+                state.store.push_sys(
+                    to,
+                    now_ms(),
+                    format!("визитка не отправлена: {}", err.user_text()),
+                );
                 Task::none()
             }
             (
@@ -918,6 +988,32 @@ fn on_meet<L: CoreLink>(state: &mut State<L>, meet: MeetIn) -> Task<Message> {
                 request_task(state, Request::PinChat { cid })
             }
         }
+        MeetIn::OpenSendCard(to) => {
+            if !state.kernel_v22() {
+                return Task::none();
+            }
+            // Выбор заменяет контекстное меню, из которого пришли.
+            state.overlay = Overlay::SendCard(to);
+            Task::none()
+        }
+        MeetIn::PickSendCard(contact) => {
+            let Overlay::SendCard(to) = state.overlay else {
+                return Task::none();
+            };
+            state.overlay = Overlay::None;
+            request_task(state, Request::SendContact { to, contact })
+        }
+        MeetIn::AskDeleteChat(cid) => {
+            if !state.kernel_v22() {
+                return Task::none();
+            }
+            state.overlay = Overlay::ConfirmDelete(cid);
+            Task::none()
+        }
+        MeetIn::ConfirmDeleteChat(cid) => {
+            state.overlay = Overlay::None;
+            request_task(state, Request::DeleteChat { cid })
+        }
         MeetIn::OpenMenu(cid) => {
             state.overlay = Overlay::Menu(MenuView {
                 cid,
@@ -1072,10 +1168,11 @@ fn overlay_layer<'a, L: CoreLink>(
                 .unwrap_or_else(|| menu.cid.to_string());
             let blocked = contact.map(|c| c.blocked).unwrap_or(false);
             let pinned = state.store.pinned_chat() == Some(menu.cid);
-            let can_pin = state.kernel_v22();
-            // Меню у курсора; у нижней кромки окна — над курсором.
-            let top = if menu.at.y > 380.0 {
-                menu.at.y - 108.0
+            let v22 = state.kernel_v22();
+            // Меню у курсора; у нижней кромки окна — над курсором. Высота
+            // выросла с пунктами 2.2 (закреп, визитка, удаление).
+            let top = if menu.at.y > 420.0 {
+                menu.at.y - 210.0
             } else {
                 menu.at.y + 6.0
             };
@@ -1086,7 +1183,7 @@ fn overlay_layer<'a, L: CoreLink>(
                     &name,
                     blocked,
                     pinned,
-                    can_pin,
+                    v22,
                     state.store.settings.font_scale
                 )))
                 .padding(Padding {
@@ -1152,6 +1249,44 @@ fn overlay_layer<'a, L: CoreLink>(
                 centered(widgets::msg_menu(
                     body,
                     pin,
+                    state.store.settings.font_scale
+                ))
+            ]
+            .into()
+        }
+        Overlay::SendCard(to) => {
+            // Моя визитка первой; чат-получатель из списка исключён —
+            // отправлять человеку его же карточку бессмысленно.
+            let rows: Vec<(Option<Cid>, String)> =
+                std::iter::once((None, "Моя визитка".to_owned()))
+                    .chain(
+                        state
+                            .store
+                            .contacts()
+                            .filter(|c| c.cid != *to)
+                            .map(|c| (Some(c.cid), c.name.clone())),
+                    )
+                    .collect();
+            stack![
+                widgets::backdrop(close()),
+                centered(widgets::send_card_panel(
+                    rows,
+                    state.store.settings.font_scale
+                ))
+            ]
+            .into()
+        }
+        Overlay::ConfirmDelete(cid) => {
+            let name = state
+                .store
+                .contact(*cid)
+                .map(|c| c.name.clone())
+                .unwrap_or_else(|| cid.to_string());
+            stack![
+                widgets::backdrop(close()),
+                centered(widgets::confirm_delete_panel(
+                    *cid,
+                    &name,
                     state.store.settings.font_scale
                 ))
             ]
@@ -1481,10 +1616,7 @@ fn feed_view<L: CoreLink>(state: &State<L>, cid: Cid) -> Element<'_, Message> {
         match item {
             FeedItem::DateSep { ts_ms } => list = list.push(widgets::date_sep(ts_ms, scale)),
             FeedItem::Sys { text } => list = list.push(widgets::sys_line(text, scale)),
-            // Склейка на время model-коммита S13; свой виджет — в ui-коммитете.
-            FeedItem::Card { name, .. } => {
-                list = list.push(widgets::sys_line(format!("визитка: {name}"), scale))
-            }
+            FeedItem::Card { name, .. } => list = list.push(widgets::card_bubble(name, scale)),
             group @ FeedItem::Group { .. } => {
                 let rows = if compact {
                     widgets::compact_group(&group, scale)
@@ -2437,5 +2569,221 @@ mod tests {
             "плашка открытого чата пуста"
         );
         assert_eq!(state.store.pins(Cid(2)).len(), 1, "состав у своего чата");
+    }
+
+    // ---------- S13: визитки и удаление чата (API 2.2+) ----------
+
+    /// Событие CONTACT_CARD: запись в ленте с честной подсказкой
+    /// (визитка знакомит, не добавляет), в фоновом чате — непрочитанная.
+    #[test]
+    fn card_event_lands_in_feed_with_honest_hint() {
+        let mut state = state();
+        state.store.replace_contacts(vec![contact(1, "Аня")]);
+
+        let _ = update(
+            &mut state,
+            Message::Link(LinkIn::Event(LinkEvent::ContactCard {
+                cid: Cid(1),
+                name: "Вера".into(),
+                bundle: [0x42; 64],
+                addr: String::new(),
+            })),
+        );
+        assert_eq!(
+            state.store.thread(Cid(1)).unwrap().unread,
+            1,
+            "фоновая визитка непрочитанная"
+        );
+
+        let _ = update(&mut state, Message::Chat(ChatIn::Select(Cid(1))));
+        let mut ui = render(&state);
+        assert!(ui.find("Вера").is_ok(), "имя из визитки в ленте");
+        assert!(
+            ui.find("визитка · добавить можно по приглашению").is_ok(),
+            "честная подсказка"
+        );
+        // Адрес и bundle на экран не выносим: добавить человека из
+        // визитки всё равно нельзя.
+        assert_eq!(state.store.thread(Cid(1)).unwrap().unread, 0);
+    }
+
+    /// Отправка визитки: пункт в меню чата, выбор (своя/чужая), честные
+    /// sys-строки об успехе и ошибке.
+    #[test]
+    fn send_card_picker_and_reply_lines() {
+        let mut state = state();
+        state.kernel_api = (2, 2);
+        state.store.replace_contacts(vec![
+            contact(1, "Аня"),
+            contact(2, "Борис"),
+            contact(3, "Вера"),
+        ]);
+        state.store.select(Some(Cid(1)));
+
+        // Меню чата → выбор визитки.
+        let _ = update(&mut state, Message::Meet(MeetIn::OpenMenu(Cid(1))));
+        {
+            let mut ui = render(&state);
+            assert!(ui.find("Отправить визитку…").is_ok(), "пункт в меню");
+        }
+        let _ = update(&mut state, Message::Meet(MeetIn::OpenSendCard(Cid(1))));
+        assert!(
+            matches!(state.overlay, Overlay::SendCard(Cid(1))),
+            "выбор открыт для чата 1"
+        );
+        {
+            let mut ui = render(&state);
+            assert!(ui.find("Чья визитка?").is_ok(), "заголовок выбора");
+            assert!(ui.find("Моя визитка").is_ok(), "своя карточка в списке");
+        }
+
+        // Чужая карточка: ответ ядра — sys-строка в чате-получателе.
+        let _ = update(
+            &mut state,
+            Message::Meet(MeetIn::PickSendCard(Some(Cid(2)))),
+        );
+        assert!(state.overlay_closed(), "выбор закрылся после выбора");
+        replied(
+            &mut state,
+            Request::SendContact {
+                to: Cid(1),
+                contact: Some(Cid(2)),
+            },
+            OkReply::Done,
+        );
+        {
+            let mut ui = render(&state);
+            assert!(
+                ui.find("визитка отправлена: Борис").is_ok(),
+                "отметка об успехе"
+            );
+        }
+
+        // Своя карточка.
+        let _ = update(&mut state, Message::Meet(MeetIn::OpenSendCard(Cid(1))));
+        let _ = update(&mut state, Message::Meet(MeetIn::PickSendCard(None)));
+        replied(
+            &mut state,
+            Request::SendContact {
+                to: Cid(1),
+                contact: None,
+            },
+            OkReply::Done,
+        );
+        {
+            let mut ui = render(&state);
+            assert!(ui.find("визитка отправлена: моя").is_ok(), "своя — «моя»");
+        }
+
+        // Ошибка (получатель офлайн) — честная строка, не молчание.
+        let _ = update(
+            &mut state,
+            Message::Link(LinkIn::Replied {
+                request: Request::SendContact {
+                    to: Cid(1),
+                    contact: None,
+                },
+                reply: Err(crate::core_link::LinkError::Kernel(
+                    crate::core_link::api::Status::NoSession,
+                )),
+                tag: None,
+            }),
+        );
+        let mut ui = render(&state);
+        assert!(
+            ui.find("визитка не отправлена: Контакт не в сети. Напишите, когда он появится.")
+                .is_ok(),
+            "ошибка с причиной"
+        );
+    }
+
+    /// Удаление чата: пункт меню, честное подтверждение (только наша
+    /// сторона, новое приглашение), ответ ядра стирает проекцию.
+    #[test]
+    fn delete_chat_confirms_and_drops_projection() {
+        let mut state = state();
+        state.kernel_api = (2, 2);
+        state
+            .store
+            .replace_contacts(vec![contact(1, "Аня"), contact(2, "Борис")]);
+        state.store.select(Some(Cid(1)));
+
+        let _ = update(&mut state, Message::Meet(MeetIn::OpenMenu(Cid(1))));
+        let _ = update(&mut state, Message::Meet(MeetIn::AskDeleteChat(Cid(1))));
+        assert!(matches!(state.overlay, Overlay::ConfirmDelete(Cid(1))));
+        {
+            let mut ui = render(&state);
+            assert!(ui.find("Удалить чат с Аня?").is_ok(), "вопрос");
+            assert!(
+                ui.find("История и контакт удалятся безвозвратно — только у вас. Написать снова можно будет по новому приглашению.")
+                    .is_ok(),
+                "честные последствия"
+            );
+        }
+
+        // Отмена оставляет всё как было.
+        let _ = update(&mut state, Message::Meet(MeetIn::CloseOverlay));
+        assert!(state.store.contact(Cid(1)).is_some(), "отмена не удаляет");
+
+        // Подтверждение → ответ ядра стирает контакт и закрывает чат.
+        let _ = update(&mut state, Message::Meet(MeetIn::AskDeleteChat(Cid(1))));
+        let _ = update(&mut state, Message::Meet(MeetIn::ConfirmDeleteChat(Cid(1))));
+        assert!(state.overlay_closed());
+        replied(
+            &mut state,
+            Request::DeleteChat { cid: Cid(1) },
+            OkReply::Done,
+        );
+        assert!(state.store.contact(Cid(1)).is_none());
+        assert_eq!(state.store.selected(), None, "открытый чат закрыт");
+        {
+            let mut ui = render(&state);
+            assert!(ui.find("Борис").is_ok(), "соседний чат на месте");
+        }
+
+        // Ошибка удаления: чат остаётся, причина — sys-строкой.
+        let _ = update(
+            &mut state,
+            Message::Link(LinkIn::Replied {
+                request: Request::DeleteChat { cid: Cid(2) },
+                reply: Err(crate::core_link::LinkError::Kernel(
+                    crate::core_link::api::Status::NoContact,
+                )),
+                tag: None,
+            }),
+        );
+        assert!(state.store.contact(Cid(2)).is_some(), "ошибка не удаляет");
+        let _ = update(&mut state, Message::Chat(ChatIn::Select(Cid(2))));
+        let mut ui = render(&state);
+        assert!(
+            ui.find("чат не удалён: Контакт не найден.").is_ok(),
+            "причина в ленте"
+        );
+    }
+
+    /// На ядре < 2.2 пунктов визитки и удаления в меню нет вообще.
+    #[test]
+    fn cards_and_delete_hidden_below_api_2_2() {
+        let mut state = state();
+        state.kernel_api = (2, 1);
+        state.store.replace_contacts(vec![contact(1, "Аня")]);
+
+        let _ = update(&mut state, Message::Meet(MeetIn::OpenMenu(Cid(1))));
+        {
+            let mut ui = render(&state);
+            assert!(ui.find("Отправить визитку…").is_err());
+            assert!(ui.find("Удалить чат").is_err());
+            assert!(ui.find("Закрепить чат").is_err(), "заодно и закреп");
+        }
+        // Действия под гейтом молча не проходят.
+        let _ = update(&mut state, Message::Meet(MeetIn::OpenSendCard(Cid(1))));
+        let _ = update(&mut state, Message::Meet(MeetIn::AskDeleteChat(Cid(1))));
+        assert!(
+            !matches!(
+                state.overlay,
+                Overlay::SendCard(_) | Overlay::ConfirmDelete(_)
+            ),
+            "оверлеи 2.2 не открываются"
+        );
     }
 }
