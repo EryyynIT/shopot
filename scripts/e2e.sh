@@ -21,7 +21,10 @@ run_against() {
         (cd "$root/zig" && "$ZIG_BIN" build -Doptimize=ReleaseFast)
     fi
     echo "== e2e против $bin"
-    SHOPOT_BIN="$bin" cargo test --test e2e_daemon
+    # Демоны тестов — отдельные процессы; под параллельной нагрузкой
+    # сьюта таймауты знакомства флакили. Сериализуем: e2e и так медленный,
+    # честный гейт важнее секунд.
+    SHOPOT_BIN="$bin" cargo test --test e2e_daemon -- --test-threads=1
 }
 
 run_against core

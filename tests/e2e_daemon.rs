@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 use futures_util::StreamExt;
 use shopot_gui::core_link::api::Status;
 use shopot_gui::core_link::uds::UdsLink;
-use shopot_gui::core_link::{CoreLink, LinkError, LinkEvent, OkReply, Request};
+use shopot_gui::core_link::{CoreLink, LinkError, LinkEvent, OkReply, Reply, Request};
 
 struct Daemon(Child, PathBuf);
 
@@ -92,6 +92,22 @@ async fn wait_event(
     }
 }
 
+/// Запрос с повтором при Disconnected: под параллельной нагрузкой
+/// e2e-сьюта первый запрос к свежеподнятому демону иногда прилетает
+/// до того, как линк восстановил соединение. Ретраи только на обрыв;
+/// машинные статусы ядра возвращаются как есть.
+async fn execute_retry(link: &UdsLink, request: Request) -> Reply {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        match CoreLink::execute(link, request.clone()).await {
+            Err(LinkError::Disconnected) if Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+            other => return other,
+        }
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn invite_message_delivery_two_daemons() {
     let Ok(bin) = std::env::var("SHOPOT_BIN") else {
@@ -139,8 +155,8 @@ async fn invite_message_delivery_two_daemons() {
     );
 
     // A выдаёт инвайт-код, B гасит его — контакт появляется у обоих.
-    let code = match CoreLink::execute(
-        &*link_a,
+    let code = match execute_retry(
+        &link_a,
         Request::Invite {
             relay: false,
             addr: String::new(),
@@ -330,8 +346,8 @@ async fn addr_invite_message_two_daemons() {
     .await;
 
     // A выдаёт код со своим адресом: B дозвонится напрямую, минуя LAN-поиск.
-    let code = match CoreLink::execute(
-        &*link_a,
+    let code = match execute_retry(
+        &link_a,
         Request::Invite {
             relay: false,
             addr: format!("127.0.0.1:{port_a}"),
@@ -343,7 +359,7 @@ async fn addr_invite_message_two_daemons() {
         other => panic!("CREATE_INVITE с адресом не удался: {other:?}"),
     };
 
-    let cid_b = match CoreLink::execute(&*link_b, Request::Add { code }).await {
+    let cid_b = match execute_retry(&link_b, Request::Add { code }).await {
         Ok(OkReply::Added { cid }) => cid,
         other => panic!("ACCEPT_INVITE по адресному коду не удался: {other:?}"),
     };
@@ -422,8 +438,8 @@ async fn history_survives_daemon_restart() {
     .await;
 
     // Знакомство: A выдаёт LAN-код, B гасит.
-    let code = match CoreLink::execute(
-        &*link_a,
+    let code = match execute_retry(
+        &link_a,
         Request::Invite {
             relay: false,
             addr: String::new(),
@@ -434,7 +450,7 @@ async fn history_survives_daemon_restart() {
         Ok(OkReply::Code(code)) => code,
         other => panic!("CREATE_INVITE не удался: {other:?}"),
     };
-    let cid_b = match CoreLink::execute(&*link_b, Request::Add { code }).await {
+    let cid_b = match execute_retry(&link_b, Request::Add { code }).await {
         Ok(OkReply::Added { cid }) => cid,
         other => panic!("ACCEPT_INVITE не удался: {other:?}"),
     };
@@ -624,8 +640,8 @@ async fn relay_invite_message_two_daemons() {
     .await;
 
     // A выдаёт relay-код: соединение пойдёт через релей, IP A скрыт.
-    let code = match CoreLink::execute(
-        &*link_a,
+    let code = match execute_retry(
+        &link_a,
         Request::Invite {
             relay: true,
             addr: addr.to_owned(),
@@ -638,7 +654,7 @@ async fn relay_invite_message_two_daemons() {
     };
 
     // B гасит код; ядро дозванивается через релей само.
-    let cid_b = match CoreLink::execute(&*link_b, Request::Add { code }).await {
+    let cid_b = match execute_retry(&link_b, Request::Add { code }).await {
         Ok(OkReply::Added { cid }) => cid,
         other => panic!("ACCEPT_INVITE по relay-коду не удался: {other:?}"),
     };
@@ -732,8 +748,8 @@ async fn search_finds_messages_two_daemons() {
     }
 
     // Знакомство по LAN-коду.
-    let code = match CoreLink::execute(
-        &*link_a,
+    let code = match execute_retry(
+        &link_a,
         Request::Invite {
             relay: false,
             addr: String::new(),
@@ -744,7 +760,7 @@ async fn search_finds_messages_two_daemons() {
         Ok(OkReply::Code(code)) => code,
         other => panic!("CREATE_INVITE не удался: {other:?}"),
     };
-    let cid_b = match CoreLink::execute(&*link_b, Request::Add { code }).await {
+    let cid_b = match execute_retry(&link_b, Request::Add { code }).await {
         Ok(OkReply::Added { cid }) => cid,
         other => panic!("ACCEPT_INVITE не удался: {other:?}"),
     };
@@ -920,8 +936,8 @@ async fn pins_survive_daemon_restart() {
     }
 
     // Знакомство по LAN-коду.
-    let code = match CoreLink::execute(
-        &*link_a,
+    let code = match execute_retry(
+        &link_a,
         Request::Invite {
             relay: false,
             addr: String::new(),
@@ -932,7 +948,7 @@ async fn pins_survive_daemon_restart() {
         Ok(OkReply::Code(code)) => code,
         other => panic!("CREATE_INVITE не удался: {other:?}"),
     };
-    let cid_b = match CoreLink::execute(&*link_b, Request::Add { code }).await {
+    let cid_b = match execute_retry(&link_b, Request::Add { code }).await {
         Ok(OkReply::Added { cid }) => cid,
         other => panic!("ACCEPT_INVITE не удался: {other:?}"),
     };
