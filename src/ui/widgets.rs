@@ -14,7 +14,9 @@ use crate::model::msg::SendState;
 use crate::model::settings::Settings;
 use crate::model::store::PinEntry;
 use crate::ui::palette;
-use crate::ui::{time_hm, ChatIn, InviteView, MeetIn, MenuView, Message, SearchView, SettingsIn};
+use crate::ui::{
+    time_hm, ChatIn, InviteView, MeetIn, MenuView, Message, SearchView, SettingsIn, SettingsView,
+};
 
 /// Строка сайдбара: точка presence, имя, бейдж непрочитанных. Выбор —
 /// капсульная заливка всей строки (стиль chat_row), без полос с краю.
@@ -896,9 +898,14 @@ pub fn msg_menu(
 }
 
 /// Панель настроек: приватность уведомлений, компактная лента, масштаб
-/// шрифта (S3, GUI_UI.md §4). Возвращает Element, заимствующий settings —
-/// значения читаются из Store на каждый кадр.
-pub fn settings_panel(settings: &Settings, scale: f32) -> Element<'_, Message> {
+/// шрифта (S3, GUI_UI.md §4) и имя профиля (SET_NAME, S13.1). Возвращает
+/// Element, заимствующий settings — значения читаются на каждый кадр.
+pub fn settings_panel<'a>(
+    settings: &'a Settings,
+    view: &'a SettingsView,
+    profile_name: Option<&'a str>,
+    scale: f32,
+) -> Element<'a, Message> {
     use crate::model::settings::{FONT_SCALE_MAX, FONT_SCALE_MIN, FONT_SCALE_STEP};
 
     let percent = (settings.font_scale * 100.0).round() as i32;
@@ -916,12 +923,48 @@ pub fn settings_panel(settings: &Settings, scale: f32) -> Element<'_, Message> {
             )
     };
 
+    // Имя профиля (§4.4): ядро кладёт его в нашу визитку; без имени
+    // карточка уходит с дефолтом «shopot» — про это честная подсказка.
+    let name_len = view.name_input.trim().chars().count();
+    let name_ok = (1..=32).contains(&name_len);
+    let name_note = view.note.clone().or_else(|| {
+        Some(match profile_name {
+            Some(name) => format!("Сейчас задано: {name}"),
+            None => "Без имени визитка уходит с именем «shopot».".to_owned(),
+        })
+    });
+
     container(
         column![
             text("Настройки")
                 .size(14.0 * scale)
                 .font(palette::bold())
                 .color(palette::TEXT),
+            text("Имя в визитках")
+                .size(12.0 * scale)
+                .color(palette::TEXT),
+            row![
+                text_input("Как вас видят получатели визитки", &view.name_input)
+                    .on_input(|value| Message::Settings(SettingsIn::NameInput(value)))
+                    .on_submit(Message::Settings(SettingsIn::SaveName))
+                    .size(13.0 * scale)
+                    .padding(8)
+                    .style(palette::input)
+                    .width(Length::Fill),
+                button(text("Сохранить").size(12.0 * scale).font(palette::bold()))
+                    .padding(Padding {
+                        top: 8.0,
+                        right: 14.0,
+                        bottom: 8.0,
+                        left: 14.0,
+                    })
+                    .style(palette::button_accent)
+                    .on_press_maybe(name_ok.then_some(Message::Settings(SettingsIn::SaveName))),
+            ]
+            .spacing(8),
+            text(name_note.unwrap_or_default())
+                .size(10.0 * scale)
+                .color(palette::DIM),
             iced::widget::checkbox(settings.hide_notification_text)
                 .label("Скрывать текст в уведомлениях")
                 .on_toggle(|on| Message::Settings(SettingsIn::ToggleNotificationText(on)))

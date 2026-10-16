@@ -136,6 +136,10 @@ pub enum SettingsIn {
     ToggleCompact(bool),
     /// Кнопка масштаба: +шаг или −шаг (границы удерживает Store).
     ChangeFontScale(f32),
+    /// Ввод имени профиля (SET_NAME, S13.1).
+    NameInput(String),
+    /// Сохранить имя профиля (SET_NAME).
+    SaveName,
 }
 
 /// События окна и глобальные команды: фокус для правила уведомлений,
@@ -155,8 +159,9 @@ pub enum Overlay {
     Invite(Box<InviteView>),
     Card(Cid),
     Menu(MenuView),
-    /// Настройки: собственного стейта нет, всё живёт в Store.settings.
-    Settings,
+    /// Настройки: галки и масштаб живут в Store.settings, черновик
+    /// имени профиля — в SettingsView.
+    Settings(SettingsView),
     /// Поиск по загруженному чату (Ctrl+F, S6).
     Search(SearchView),
     /// Список закреплённых сообщений открытого чата (S12).
@@ -167,6 +172,16 @@ pub enum Overlay {
     SendCard(Cid),
     /// Подтверждение удаления чата (S13): действие необратимо.
     ConfirmDelete(Cid),
+}
+
+/// Стейт панели настроек: черновик имени профиля (S13.1) и итог
+/// последнего сохранения — строкой под полем.
+#[derive(Debug, Default)]
+pub struct SettingsView {
+    /// Черновик имени (SET_NAME, §4.4).
+    pub name_input: String,
+    /// «Имя сохранено…» / «Имя не сохранено: …» — честный итог.
+    pub note: Option<String>,
 }
 
 /// Панель поиска: запрос живёт здесь; совпадения — либо из Store
@@ -242,6 +257,9 @@ pub struct State<L: CoreLink> {
     /// Версия API демона из бутстрап-зонда GET_VERSION; (0, 0) — ещё не
     /// выяснена. Гейт ядерных фич: поиск — с (2, 1), закрепы — с (2, 2).
     pub kernel_api: (u16, u16),
+    /// Имя профиля, сохранённое в этом запуске (SET_NAME, §4.4). Ядро
+    /// имя обратно не отдаёт (GET_NAME нет) — помним только свою запись.
+    pub profile_name: Option<String>,
 }
 
 impl<L: CoreLink> State<L> {
@@ -259,6 +277,7 @@ impl<L: CoreLink> State<L> {
             window_focused: true,
             history_in_flight: false,
             kernel_api: (0, 0),
+            profile_name: None,
         }
     }
 
@@ -306,8 +325,26 @@ fn on_window<L: CoreLink>(state: &mut State<L>, window: WindowIn) -> Task<Messag
 fn on_settings<L: CoreLink>(state: &mut State<L>, settings: SettingsIn) -> Task<Message> {
     match settings {
         SettingsIn::Open => {
-            state.overlay = Overlay::Settings;
+            state.overlay = Overlay::Settings(SettingsView::default());
             Task::none()
+        }
+        SettingsIn::NameInput(value) => {
+            if let Overlay::Settings(view) = &mut state.overlay {
+                view.name_input = value;
+                view.note = None;
+            }
+            Task::none()
+        }
+        SettingsIn::SaveName => {
+            let Overlay::Settings(view) = &state.overlay else {
+                return Task::none();
+            };
+            let name = view.name_input.trim().to_owned();
+            // Кнопка выключена вне 1..=32; прямой вызов молча гасим.
+            if !(1..=32).contains(&name.chars().count()) {
+                return Task::none();
+            }
+            request_task(state, Request::SetName { name })
         }
         SettingsIn::ToggleNotificationText(on) => {
             state.store.settings.hide_notification_text = on;
@@ -620,6 +657,21 @@ fn on_link<L: CoreLink>(state: &mut State<L>, link: LinkIn) -> Task<Message> {
                     now_ms(),
                     format!("визитка не отправлена: {}", err.user_text()),
                 );
+                Task::none()
+            }
+            // Имя профиля сохранено (S13.1): помним на сессию (ядро его
+            // обратно не отдаёт), итог — строкой в панели настроек.
+            (Request::SetName { name }, Ok(OkReply::Done)) => {
+                state.profile_name = Some(name);
+                if let Overlay::Settings(view) = &mut state.overlay {
+                    view.note = Some("Имя сохранено — будет в ваших визитках.".into());
+                }
+                Task::none()
+            }
+            (Request::SetName { .. }, Err(err)) => {
+                if let Overlay::Settings(view) = &mut state.overlay {
+                    view.note = Some(format!("Имя не сохранено: {}", err.user_text()));
+                }
                 Task::none()
             }
             (
@@ -1199,10 +1251,12 @@ fn overlay_layer<'a, L: CoreLink>(
             ]
             .into()
         }
-        Overlay::Settings => stack![
+        Overlay::Settings(view) => stack![
             widgets::backdrop(close()),
             centered(widgets::settings_panel(
                 &state.store.settings,
+                view,
+                state.profile_name.as_deref(),
                 state.store.settings.font_scale
             ))
         ]
@@ -2784,6 +2838,81 @@ mod tests {
                 Overlay::SendCard(_) | Overlay::ConfirmDelete(_)
             ),
             "оверлеи 2.2 не открываются"
+        );
+    }
+
+    // ---------- S13.1: имя профиля (SET_NAME) ----------
+
+    /// Имя профиля: честная подсказка без имени, сохранение через
+    /// SET_NAME, итог — строкой в панели; на сессию имя запоминается.
+    #[test]
+    fn profile_name_saved_with_honest_note() {
+        let mut state = state();
+
+        let _ = update(&mut state, Message::Settings(SettingsIn::Open));
+        assert!(matches!(state.overlay, Overlay::Settings(_)));
+        {
+            let mut ui = render(&state);
+            assert!(
+                ui.find("Без имени визитка уходит с именем «shopot».").is_ok(),
+                "подсказка, зачем имя"
+            );
+        }
+
+        let _ = update(
+            &mut state,
+            Message::Settings(SettingsIn::NameInput("Михаил".into())),
+        );
+        let _ = update(&mut state, Message::Settings(SettingsIn::SaveName));
+        replied(
+            &mut state,
+            Request::SetName {
+                name: "Михаил".into(),
+            },
+            OkReply::Done,
+        );
+        assert_eq!(state.profile_name.as_deref(), Some("Михаил"));
+        {
+            let mut ui = render(&state);
+            assert!(
+                ui.find("Имя сохранено — будет в ваших визитках.").is_ok(),
+                "итог сохранения"
+            );
+        }
+
+        // Переоткрытие: ядро имя обратно не отдаёт — показываем свою запись.
+        let _ = update(&mut state, Message::Meet(MeetIn::CloseOverlay));
+        let _ = update(&mut state, Message::Settings(SettingsIn::Open));
+        let mut ui = render(&state);
+        assert!(ui.find("Сейчас задано: Михаил").is_ok(), "сессионная запись");
+    }
+
+    /// Ошибка SET_NAME — честная строка в панели, имя не запоминается.
+    #[test]
+    fn profile_name_error_is_honest() {
+        let mut state = state();
+        let _ = update(&mut state, Message::Settings(SettingsIn::Open));
+        let _ = update(
+            &mut state,
+            Message::Settings(SettingsIn::NameInput("Михаил".into())),
+        );
+        let _ = update(&mut state, Message::Settings(SettingsIn::SaveName));
+        let _ = update(
+            &mut state,
+            Message::Link(LinkIn::Replied {
+                request: Request::SetName {
+                    name: "Михаил".into(),
+                },
+                reply: Err(crate::core_link::LinkError::Disconnected),
+                tag: None,
+            }),
+        );
+        assert_eq!(state.profile_name, None);
+        let mut ui = render(&state);
+        assert!(
+            ui.find("Имя не сохранено: Нет соединения. Перезапустите приложение.")
+                .is_ok(),
+            "причина в панели"
         );
     }
 }
