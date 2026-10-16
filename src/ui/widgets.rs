@@ -22,7 +22,7 @@ use iced::widget::text::Span;
 use iced::Font;
 
 use crate::core_link::{Entity, EntityKind};
-use crate::model::msg::MsgId;
+use crate::model::msg::{MsgId, Reaction};
 use crate::ui::{
     time_hm, CallIn, CallPhase, CallView, ChatIn, InviteView, MeetIn, MenuView, Message,
     SearchView, SettingsIn, SettingsView,
@@ -221,7 +221,7 @@ pub fn message_group(
     let mut pending: Option<iced::widget::Column<'static, Message>> = None;
     let count = bodies.len();
 
-    for (index, (msg_id, body, entities, _reactions)) in bodies.iter().enumerate() {
+    for (index, (msg_id, body, entities, reactions)) in bodies.iter().enumerate() {
         let last = index + 1 == count;
         // ПКМ по строке тела — меню сообщения (закрепить/открепить, S12);
         // в слитом пузыре каждая строка адресует своё сообщение. Клик по
@@ -238,7 +238,7 @@ pub fn message_group(
             if let Some(col) = pending.take() {
                 elements.push(wrap_row(bubble(col).into(), align_x));
             }
-            let block = iced::widget::Column::new().push(
+            let mut block = iced::widget::Column::new().push(
                 container(body_text)
                     .max_width(560)
                     .padding(Padding {
@@ -249,6 +249,9 @@ pub fn message_group(
                     })
                     .style(palette::no_bubble),
             );
+            if let Some(pills) = reaction_pills(*msg_id, reactions, scale) {
+                block = block.push(pills);
+            }
             if last {
                 elements.push(wrap_row(
                     group_with_footer(block, group_footer(*ts_ms, &status, scale)),
@@ -258,10 +261,15 @@ pub fn message_group(
                 elements.push(wrap_row(block.into(), align_x));
             }
         } else {
-            let col = pending
+            let mut col = pending
                 .take()
                 .unwrap_or_else(|| iced::widget::Column::new().spacing(2));
-            pending = Some(col.push(body_text));
+            col = col.push(body_text);
+            // Пилюли реакций — в пузыре, под своим телом (S15).
+            if let Some(pills) = reaction_pills(*msg_id, reactions, scale) {
+                col = col.push(pills);
+            }
+            pending = Some(col);
         }
     }
     if let Some(col) = pending.take() {
@@ -305,7 +313,7 @@ pub fn compact_group(
         );
     }
     let indent = if *mine { 16.0 } else { 0.0 };
-    for (msg_id, body, entities, _reactions) in bodies {
+    for (msg_id, body, entities, reactions) in bodies {
         // ПКМ по строке — меню сообщения (закрепить/открепить, S12);
         // клик по спойлеру раскрывает (S14).
         let mut area = mouse_area(rich_body(body, entities, revealed.contains(msg_id), scale))
@@ -317,6 +325,13 @@ pub fn compact_group(
             left: indent,
             ..Padding::default()
         }));
+        // Пилюли реакций — под строкой тела (S15).
+        if let Some(pills) = reaction_pills(*msg_id, reactions, scale) {
+            col = col.push(container(pills).padding(Padding {
+                left: indent,
+                ..Padding::default()
+            }));
+        }
     }
     col = col.push(group_footer(*ts_ms, &status, scale));
 
@@ -950,16 +965,24 @@ pub fn pins_panel(entries: &[PinEntry], scale: f32) -> Element<'static, Message>
 /// `pin = None` — своё сообщение в полёте: кнопка-глагол выключена,
 /// под ней строка-пояснение (TEXT_STYLE §3: кнопка — глагол, объяснение
 /// живёт отдельно).
+/// Быстрые реакции меню (S15): кодпоинт = char, контракт §4.4.
+/// «❤» без VS16 — ядро хранит один кодпоинт.
+pub const QUICK_REACTIONS: [char; 6] = ['👍', '❤', '😂', '😮', '😢', '🔥'];
+
+/// `pin`: None — пункта нет вовсе (ядро < 2.2); Some(None) — пункт
+/// виден, но выключен (сообщение в полёте); Some(Some) — активен.
 pub fn msg_menu(
     body: &str,
-    pin: Option<(&'static str, Message)>,
+    pin: Option<Option<(&'static str, Message)>>,
+    react: Option<MsgId>,
     scale: f32,
 ) -> Element<'static, Message> {
     let preview: String = body.chars().take(80).collect();
-    let can_pin = pin.is_some();
+    let has_pin_row = pin.is_some();
+    let can_pin = matches!(pin, Some(Some(_)));
     let (pin_label, pin_action) = match pin {
-        Some((label, message)) => (label, Some(message)),
-        None => ("Закрепить сообщение", None),
+        Some(Some((label, message))) => (label, Some(message)),
+        _ => ("Закрепить сообщение", None),
     };
     let mut pin_button = button(text(pin_label).size(13.0 * scale).color(
         if pin_action.is_some() {
@@ -979,14 +1002,46 @@ pub fn msg_menu(
     if let Some(message) = pin_action {
         pin_button = pin_button.on_press(message);
     }
-    let mut items = column![
-        text(preview).size(11.0 * scale).color(palette::DIM),
-        pin_button,
-    ]
-    .spacing(2);
-    if !can_pin {
+    let mut items = column![text(preview).size(11.0 * scale).color(palette::DIM)].spacing(2);
+    if has_pin_row {
+        items = items.push(pin_button);
+    }
+    if has_pin_row && !can_pin {
         items = items.push(
             text("Закрепить можно после отправки")
+                .size(10.0 * scale)
+                .color(palette::DIM),
+        );
+    }
+    // Ряд быстрых реакций (S15). Своё сообщение в полёте (нет msg_id
+    // ядра) — ряд блёклый, без нажатий.
+    let mut emojis = iced::widget::Row::new().spacing(2);
+    for emoji in QUICK_REACTIONS {
+        let mut b = button(
+            text(emoji.to_string())
+                .size(16.0 * scale)
+                .color(if react.is_some() {
+                    palette::TEXT
+                } else {
+                    palette::DIM
+                }),
+        )
+        .padding(Padding {
+            top: 4.0,
+            right: 6.0,
+            bottom: 4.0,
+            left: 6.0,
+        })
+        .style(palette::button_menu);
+        if let Some(id) = react {
+            b = b.on_press(Message::Chat(ChatIn::React(id, emoji)));
+        }
+        emojis = emojis.push(b);
+    }
+    items = items.push(emojis);
+    if react.is_none() {
+        items = items.push(
+            text("Реагировать можно после отправки")
                 .size(10.0 * scale)
                 .color(palette::DIM),
         );
@@ -1253,6 +1308,44 @@ pub fn search_panel<'a>(
         .padding(16)
         .style(palette::dialog)
         .into()
+}
+
+// ---------- реакции (S15) ----------
+
+/// Пилюли реакций под телом: эмодзи + счётчик (>1); своя — акцентная.
+/// Клик — переключить свою (React: SET, повторный — REMOVE).
+fn reaction_pills(
+    msg_id: MsgId,
+    reactions: &[Reaction],
+    scale: f32,
+) -> Option<Element<'static, Message>> {
+    if reactions.is_empty() {
+        return None;
+    }
+    let mut row = iced::widget::Row::new().spacing(4);
+    for r in reactions {
+        let label = if r.count > 1 {
+            format!("{} {}", r.emoji, r.count)
+        } else {
+            r.emoji.to_string()
+        };
+        row = row.push(
+            button(text(label).size(11.0 * scale).color(if r.mine {
+                palette::ACCENT
+            } else {
+                palette::TEXT
+            }))
+            .padding(Padding {
+                top: 1.0,
+                right: 6.0,
+                bottom: 1.0,
+                left: 6.0,
+            })
+            .style(palette::button_dim)
+            .on_press(Message::Chat(ChatIn::React(msg_id, r.emoji))),
+        );
+    }
+    Some(row.into())
 }
 
 // ---------- разметка сообщений (S14, API 2.0+) ----------

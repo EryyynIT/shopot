@@ -133,6 +133,9 @@ pub enum ChatIn {
     ScrollTop(bool),
     /// Клик по спойлеру — показать/спрятать содержимое (S14).
     ToggleSpoiler(MsgId),
+    /// Реакция на сообщение (S15): из меню (ПКМ) или по пилюле под
+    /// пузырём. Моя реакция с тем же эмодзи снимается (переключатель).
+    React(MsgId, char),
     /// Клик по ссылке в пузыре — открыть в браузере (S14).
     OpenLink(String),
 }
@@ -664,8 +667,18 @@ fn on_link<L: CoreLink>(state: &mut State<L>, link: LinkIn) -> Task<Message> {
                 state.store.mark_delivered(cid, msg_id);
                 Task::none()
             }
-            // Склейка: реакции применятся к ленте в ui-коммите спринта.
-            LinkEvent::Reaction { .. } => Task::none(),
+            // Реакция собеседника (S15): применить к ленте. Своих
+            // ядро событием не шлёт — своя применена по ответу (S15).
+            LinkEvent::Reaction {
+                cid,
+                msg_id,
+                add,
+                emoji,
+                ..
+            } => {
+                state.store.apply_reaction(cid, msg_id, add, false, emoji);
+                Task::none()
+            }
             LinkEvent::Presence { cid, online, .. } => {
                 state.store.set_presence(cid, online);
                 Task::none()
@@ -1010,6 +1023,24 @@ fn on_link<L: CoreLink>(state: &mut State<L>, link: LinkIn) -> Task<Message> {
                 }
                 Task::none()
             }
+            // Реакции (S15): своя применяется по OK; ошибка — честная
+            // sys-строка в чате (Нет соединения, Контакт не найден…).
+            (Request::SetReaction { cid, msg_id, emoji }, Ok(OkReply::Done)) => {
+                state.store.apply_reaction(cid, msg_id, true, true, emoji);
+                Task::none()
+            }
+            (Request::RemoveReaction { cid, msg_id, emoji }, Ok(OkReply::Done)) => {
+                state.store.apply_reaction(cid, msg_id, false, true, emoji);
+                Task::none()
+            }
+            (Request::SetReaction { cid, .. } | Request::RemoveReaction { cid, .. }, Err(err)) => {
+                state.store.push_sys(
+                    cid,
+                    now_ms(),
+                    format!("реакция не ушла: {}", err.user_text()),
+                );
+                Task::none()
+            }
             // Остальные ответы ядерного канала появляются со своими спринтами.
             _ => Task::none(),
         },
@@ -1131,11 +1162,45 @@ fn on_chat<L: CoreLink>(state: &mut State<L>, chat: ChatIn) -> Task<Message> {
             Task::none()
         }
         ChatIn::OpenMsgMenu(id) => {
-            // Меню модально; на ядрах < 2.2 закреплять нечем — не открываем.
-            if state.kernel_v22() && matches!(state.overlay, Overlay::None) {
+            // Меню модально; реакции — на любом ядре (1.0+), закрепы
+            // скрыты ниже 2.2 (в оверлее).
+            if matches!(state.overlay, Overlay::None) {
                 state.overlay = Overlay::MsgMenu(id);
             }
             Task::none()
+        }
+        ChatIn::React(id, emoji) => {
+            state.overlay = Overlay::None;
+            let Some(cid) = state.store.selected() else {
+                return Task::none();
+            };
+            let Some(core_id) = state.store.core_id_of(cid, id) else {
+                // Своё сообщение в полёте: msg_id ядра ещё нет — честно.
+                state
+                    .store
+                    .push_sys(cid, now_ms(), "реагировать можно после отправки".into());
+                return Task::none();
+            };
+            // Переключатель: моя реакция с этим эмодзи уже стоит — снять.
+            let mine = state
+                .store
+                .msg(cid, id)
+                .map(|m| m.reactions.iter().any(|r| r.emoji == emoji && r.mine))
+                .unwrap_or(false);
+            let request = if mine {
+                Request::RemoveReaction {
+                    cid,
+                    msg_id: core_id,
+                    emoji,
+                }
+            } else {
+                Request::SetReaction {
+                    cid,
+                    msg_id: core_id,
+                    emoji,
+                }
+            };
+            request_task(state, request)
         }
         ChatIn::PinMessage(id) => {
             state.overlay = Overlay::None;
@@ -1632,25 +1697,34 @@ fn overlay_layer<'a, L: CoreLink>(
             .into()
         }
         Overlay::MsgMenu(id) => {
-            // Меню привязано к выбранному чату: пункт «закрепить» виден,
-            // только когда у сообщения известен msg_id ядра.
+            // Меню привязано к выбранному чату. Закреп — ядро 2.2+ и
+            // известный msg_id; реакции — на любом ядре, но тоже по
+            // msg_id (своё в полёте — подсказка «после отправки»).
             let cid = state.store.selected();
             let msg = cid.and_then(|cid| state.store.msg(cid, *id));
-            let pin = match (cid, msg.and_then(|m| m.core_id)) {
-                (Some(cid), Some(core_id)) => {
-                    if state.store.is_pinned(cid, core_id) {
-                        Some((
-                            "Открепить сообщение",
-                            Message::Chat(ChatIn::UnpinMessage(core_id)),
-                        ))
-                    } else {
-                        Some((
-                            "Закрепить сообщение",
-                            Message::Chat(ChatIn::PinMessage(*id)),
-                        ))
-                    }
-                }
+            let react = match (cid, msg.and_then(|m| m.core_id)) {
+                (Some(_), Some(_)) => Some(*id),
                 _ => None,
+            };
+            let pin = if !state.kernel_v22() {
+                None
+            } else {
+                Some(match (cid, msg.and_then(|m| m.core_id)) {
+                    (Some(cid), Some(core_id)) => {
+                        if state.store.is_pinned(cid, core_id) {
+                            Some((
+                                "Открепить сообщение",
+                                Message::Chat(ChatIn::UnpinMessage(core_id)),
+                            ))
+                        } else {
+                            Some((
+                                "Закрепить сообщение",
+                                Message::Chat(ChatIn::PinMessage(*id)),
+                            ))
+                        }
+                    }
+                    _ => None,
+                })
             };
             let body = msg.map(|m| m.body.as_str()).unwrap_or("");
             stack![
@@ -1658,6 +1732,7 @@ fn overlay_layer<'a, L: CoreLink>(
                 centered(widgets::msg_menu(
                     body,
                     pin,
+                    react,
                     state.store.settings.font_scale
                 ))
             ]
@@ -2979,23 +3054,137 @@ mod tests {
         assert!(ui.find("Открепить").is_ok(), "действие в списке");
     }
 
-    /// На ядре < 2.2 ПКМ-меню сообщения не открывается, запросов
-    /// закрепов при выборе чата не шлём.
+    /// На ядре < 2.2 меню сообщения открывается (реакции — 1.0+, S15),
+    /// но пункта закрепа в нём нет.
     #[test]
     fn pins_hidden_below_api_2_2() {
         let mut state = state();
         state.kernel_api = (2, 1);
         state.store.replace_contacts(vec![contact(1, "Аня")]);
-        let _ = state
-            .store
-            .push_outgoing(Cid(1), 1_000, "привет".into(), Vec::new());
+        state.store.push_incoming_core(
+            Cid(1),
+            "Аня",
+            crate::model::msg::CoreMsgId([0x07; 16]),
+            1_000,
+            "привет".into(),
+            Vec::new(),
+        );
         state.store.select(Some(Cid(1)));
         let msg = state.store.thread(Cid(1)).unwrap().msgs[0].id;
 
         let _ = update(&mut state, Message::Chat(ChatIn::OpenMsgMenu(msg)));
         assert!(
-            matches!(state.overlay, Overlay::None),
-            "меню не открылось на 1.x"
+            matches!(state.overlay, Overlay::MsgMenu(_)),
+            "меню открылось — реакции есть на любом ядре"
+        );
+        let mut ui = render(&state);
+        assert!(
+            ui.find("Закрепить сообщение").is_err(),
+            "закрепа нет ниже 2.2"
+        );
+        assert!(ui.find("Отмена").is_ok(), "меню живое");
+    }
+
+    // ---------- S15: реакции ----------
+
+    /// Своя реакция: React → SET, по OK пилюля mine; повторный React —
+    /// REMOVE, по OK пилюля гаснет. Событие пира тоже рисует пилюлю.
+    #[test]
+    fn reaction_toggle_flow() {
+        let mut state = state();
+        state.kernel_api = (2, 2);
+        state.store.replace_contacts(vec![contact(1, "Аня")]);
+        let core = crate::model::msg::CoreMsgId([0x07; 16]);
+        state
+            .store
+            .push_incoming_core(Cid(1), "Аня", core, 1_000, "привет".into(), Vec::new());
+        state.store.select(Some(Cid(1)));
+        let msg = state.store.thread(Cid(1)).unwrap().msgs[0].id;
+
+        // Событие пира: 👍 появился, не мой.
+        let _ = update(
+            &mut state,
+            Message::Link(LinkIn::Event(LinkEvent::Reaction {
+                cid: Cid(1),
+                msg_id: core,
+                add: true,
+                emoji: '👍',
+                ts_ms: 1_100,
+            })),
+        );
+        let reactions = &state.store.thread(Cid(1)).unwrap().msgs[0].reactions;
+        assert_eq!(reactions.len(), 1);
+        assert_eq!((reactions[0].count, reactions[0].mine), (1, false));
+
+        // Моя реакция: по OK-ответу применяется как mine.
+        let _ = update(&mut state, Message::Chat(ChatIn::React(msg, '👍')));
+        replied(
+            &mut state,
+            Request::SetReaction {
+                cid: Cid(1),
+                msg_id: core,
+                emoji: '👍',
+            },
+            OkReply::Done,
+        );
+        let reactions = &state.store.thread(Cid(1)).unwrap().msgs[0].reactions;
+        assert_eq!((reactions[0].count, reactions[0].mine), (2, true));
+
+        // Повторный клик — снятие; по OK пилюля гаснет? Нет: пир держит
+        // свою — счётчик 1, mine=false.
+        let _ = update(&mut state, Message::Chat(ChatIn::React(msg, '👍')));
+        replied(
+            &mut state,
+            Request::RemoveReaction {
+                cid: Cid(1),
+                msg_id: core,
+                emoji: '👍',
+            },
+            OkReply::Done,
+        );
+        let reactions = &state.store.thread(Cid(1)).unwrap().msgs[0].reactions;
+        assert_eq!((reactions[0].count, reactions[0].mine), (1, false));
+    }
+
+    /// Реакция на своё летящее сообщение (нет msg_id ядра) — честная
+    /// sys-строка, запроса нет; ошибка ядра — sys-строка.
+    #[test]
+    fn reaction_needs_core_id_and_reports_errors() {
+        let mut state = state();
+        state.store.replace_contacts(vec![contact(1, "Аня")]);
+        let _ = state
+            .store
+            .push_outgoing(Cid(1), 1_000, "моё летит".into(), Vec::new());
+        state.store.select(Some(Cid(1)));
+        let msg = state.store.thread(Cid(1)).unwrap().msgs[0].id;
+
+        let _ = update(&mut state, Message::Chat(ChatIn::React(msg, '👍')));
+        let msgs = &state.store.thread(Cid(1)).unwrap().msgs;
+        assert!(
+            msgs.iter()
+                .any(|m| m.body == "реагировать можно после отправки"),
+            "честная подсказка: {msgs:?}"
+        );
+
+        // Ошибка ядра по SET — sys-строка в чате.
+        let _ = update(
+            &mut state,
+            Message::Link(LinkIn::Replied {
+                request: Request::SetReaction {
+                    cid: Cid(1),
+                    msg_id: crate::model::msg::CoreMsgId([0x07; 16]),
+                    emoji: '👍',
+                },
+                reply: Err(crate::core_link::LinkError::Kernel(
+                    crate::core_link::api::Status::NoSession,
+                )),
+                tag: None,
+            }),
+        );
+        let msgs = &state.store.thread(Cid(1)).unwrap().msgs;
+        assert!(
+            msgs.iter().any(|m| m.body.contains("реакция не ушла")),
+            "ошибка видна: {msgs:?}"
         );
     }
 
@@ -3481,7 +3670,7 @@ mod tests {
         let FeedItem::Group { bodies, .. } = &msgs[1] else {
             panic!("ожидали группу после разделителя дня: {msgs:?}");
         };
-        let (_, body, entities) = &bodies[0];
+        let (_, body, entities, _) = &bodies[0];
         assert_eq!(body, "жирно и тайна");
         assert_eq!(
             entities,
