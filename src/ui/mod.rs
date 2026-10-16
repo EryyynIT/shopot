@@ -664,6 +664,8 @@ fn on_link<L: CoreLink>(state: &mut State<L>, link: LinkIn) -> Task<Message> {
                 state.store.mark_delivered(cid, msg_id);
                 Task::none()
             }
+            // Склейка: реакции применятся к ленте в ui-коммите спринта.
+            LinkEvent::Reaction { .. } => Task::none(),
             LinkEvent::Presence { cid, online, .. } => {
                 state.store.set_presence(cid, online);
                 Task::none()

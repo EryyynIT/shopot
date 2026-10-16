@@ -45,6 +45,20 @@ pub enum Request {
         text: String,
         entities: Vec<Entity>,
     },
+    /// Поставить реакцию на сообщение (SET_REACTION, §4.4). Эмодзи —
+    /// кодпоинт Unicode; чужие правила (живая сессия, контакт известен)
+    /// проверяет ядро. Снятие удалением с той же парой (cid, msg_id).
+    SetReaction {
+        cid: Cid,
+        msg_id: crate::model::msg::CoreMsgId,
+        emoji: char,
+    },
+    /// Снять свою реакцию (REMOVE_REACTION).
+    RemoveReaction {
+        cid: Cid,
+        msg_id: crate::model::msg::CoreMsgId,
+        emoji: char,
+    },
     /// Добавить контакт по инвайт-коду (ACCEPT_INVITE).
     Add { code: String },
     /// Выдать свой инвайт-код (CREATE_INVITE). Пустой addr — код для одной
@@ -298,6 +312,9 @@ impl LinkError {
             Self::Kernel(api::Status::NoSession) => {
                 "Контакт не в сети. Напишите, когда он появится.".into()
             }
+            Self::Kernel(api::Status::UnsupportedReaction) => {
+                "Такой реакции нет.".into()
+            }
             Self::Kernel(api::Status::Busy) => "Уже идёт другой звонок.".into(),
             Self::Kernel(api::Status::NoCall) => "Звонок уже завершён.".into(),
             Self::Kernel(api::Status::Internal) => {
@@ -425,6 +442,16 @@ pub enum LinkEvent {
         name: String,
         bundle: [u8; 64],
         addr: String,
+    },
+    /// Реакция собеседника на сообщение (REACTION, §5). add=false —
+    /// снятие. Своя реакция событием не приходит — применяется по
+    /// ответу SET_REACTION.
+    Reaction {
+        cid: Cid,
+        msg_id: crate::model::msg::CoreMsgId,
+        add: bool,
+        emoji: char,
+        ts_ms: i64,
     },
     /// Смена стадии звонка (CALL_STATE, §4.6/§5): `cid` — собеседник,
     /// `call_id` — какой звонок (их может смениться несколько за сессию,

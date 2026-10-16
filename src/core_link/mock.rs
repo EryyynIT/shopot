@@ -131,6 +131,18 @@ impl Scene {
                         ],
                     },
                 ),
+                // Реакция собеседника (S15): 👍 на размеченное сообщение —
+                // скриншот демо показывает пилюлю под пузырём.
+                (
+                    Duration::from_millis(600),
+                    LinkEvent::Reaction {
+                        cid: Cid(1),
+                        msg_id: core_id(1004),
+                        add: true,
+                        emoji: '👍',
+                        ts_ms: crate::core_link::now_ms(),
+                    },
+                ),
             ],
             flip_presence: Some(Duration::from_secs(8)),
             reply_delay_ms: 700,
@@ -463,6 +475,18 @@ impl MockLink {
                 };
                 let head = if relay { "shopot1r." } else { "shopot1." };
                 Ok(OkReply::Code(format!("{head}{code}@{host}")))
+            }
+            // Семантика ядра: реакция требует известного контакта; msg_id
+            // ядро не проверяет в контракте — заглушка тоже (Done).
+            Request::SetReaction { cid, .. } | Request::RemoveReaction { cid, .. } => {
+                let known = {
+                    let state = inner.state.lock().expect("стейт не отравлен");
+                    state.contacts.iter().any(|c| c.cid == cid)
+                };
+                if !known {
+                    return Err(LinkError::Kernel(Status::NoContact));
+                }
+                Ok(OkReply::Done)
             }
             Request::Add { code } => {
                 if !code.starts_with("shopot1.") && !code.starts_with("shopot://i/") {

@@ -382,6 +382,18 @@ fn encode_request(request: &Request, api2: bool) -> (Method, Vec<u8>) {
             api::put::str16(&mut payload, addr).expect("адрес короче 65535");
             Method::CreateInvite
         }
+        // SET/REMOVE_REACTION (§4.4): [cid u32][msg_id 16][codepoint u32].
+        Request::SetReaction { cid, msg_id, emoji }
+        | Request::RemoveReaction { cid, msg_id, emoji } => {
+            api::put::u32(&mut payload, cid.0 as u32);
+            payload.extend_from_slice(&msg_id.0);
+            api::put::u32(&mut payload, *emoji as u32);
+            if matches!(request, Request::SetReaction { .. }) {
+                Method::SetReaction
+            } else {
+                Method::RemoveReaction
+            }
+        }
         Request::Block { cid } => {
             api::put::u32(&mut payload, cid.0 as u32);
             Method::BlockContact
@@ -832,7 +844,30 @@ fn decode_event(header: &Header, payload: &[u8]) -> Option<LinkEvent> {
                 state,
             })
         }
-        api::Event::Reaction | api::Event::AvatarReceived | api::Event::FileReceived => None,
+        // REACTION (4, §5): [cid u32][msg_id 16][op u8 (1 add, 2 remove)]
+        // [codepoint u32][ts_ms u64]. Незнакомый op или кодпоинт вне
+        // Unicode — событие выбрасываем, поток не рвём.
+        api::Event::Reaction => {
+            let cid = r.read_u32().ok()?;
+            let mut msg_id = [0u8; 16];
+            msg_id.copy_from_slice(r.read_bytes(16).ok()?);
+            let add = match r.read_u8().ok()? {
+                1 => true,
+                2 => false,
+                _ => return None,
+            };
+            let code = r.read_u32().ok()?;
+            let emoji = char::from_u32(code)?;
+            let ts_ms = r.read_u64().ok()? as i64;
+            Some(LinkEvent::Reaction {
+                cid: Cid(i64::from(cid)),
+                msg_id: CoreMsgId(msg_id),
+                add,
+                emoji,
+                ts_ms,
+            })
+        }
+        api::Event::AvatarReceived | api::Event::FileReceived => None,
     }
 }
 
@@ -2105,5 +2140,69 @@ mod tests {
             payload_len: payload.len() as u32,
         };
         assert_eq!(decode_event(&header, &payload), None);
+    }
+
+    /// Реакции (S15): SET/REMOVE кодируются по §4.4; событие REACTION
+    /// разбирается; незнакомый op и кодпоинт вне Unicode — выброс события.
+    #[test]
+    fn reaction_roundtrip_and_garbage() {
+        let (method, payload) = encode_request(
+            &Request::SetReaction {
+                cid: Cid(7),
+                msg_id: CoreMsgId([0x42; 16]),
+                emoji: '👍',
+            },
+            true,
+        );
+        assert_eq!(method, Method::SetReaction);
+        let mut r = api::Reader::new(&payload);
+        assert_eq!(r.read_u32(), Ok(7));
+        assert_eq!(r.read_bytes(16).unwrap(), &[0x42; 16]);
+        assert_eq!(r.read_u32(), Ok('👍' as u32));
+        assert!(!r.has_more());
+
+        let (method, payload) = encode_request(
+            &Request::RemoveReaction {
+                cid: Cid(7),
+                msg_id: CoreMsgId([0x42; 16]),
+                emoji: '👍',
+            },
+            true,
+        );
+        assert_eq!((method, payload.len()), (Method::RemoveReaction, 24));
+
+        // Событие add.
+        let mut payload = Vec::new();
+        api::put::u32(&mut payload, 7);
+        payload.extend_from_slice(&[0x42; 16]);
+        api::put::u8(&mut payload, 1);
+        api::put::u32(&mut payload, '🔥' as u32);
+        api::put::u64(&mut payload, 1_700_000_000_000);
+        let header = Header {
+            kind: Kind::Event,
+            id: api::Event::Reaction as u16,
+            request_id: 0,
+            status: Status::Ok,
+            payload_len: payload.len() as u32,
+        };
+        assert_eq!(
+            decode_event(&header, &payload),
+            Some(LinkEvent::Reaction {
+                cid: Cid(7),
+                msg_id: CoreMsgId([0x42; 16]),
+                add: true,
+                emoji: '🔥',
+                ts_ms: 1_700_000_000_000,
+            })
+        );
+
+        // op 9 из будущего ядра — событие выбрасываем.
+        let mut bad = payload.clone();
+        bad[20] = 9;
+        assert_eq!(decode_event(&header, &bad), None);
+        // Кодпоинт вне Unicode (surrogate) — выброс.
+        let mut bad = payload;
+        bad[21..25].copy_from_slice(&0xD800u32.to_le_bytes());
+        assert_eq!(decode_event(&header, &bad), None);
     }
 }
