@@ -26,8 +26,8 @@ pub enum FeedItem {
         author: Option<Cid>,
         name: String,
         ts_ms: i64,
-        /// Тела сообщений группы.
-        bodies: Vec<(MsgId, String)>,
+        /// Тела сообщений группы с разметкой (S14).
+        bodies: Vec<(MsgId, String, Vec<crate::core_link::Entity>)>,
         /// Статус отправки — у моей группы, по последнему сообщению.
         send: SendState,
     },
@@ -81,7 +81,8 @@ pub fn group(msgs: &[Msg], day_of: impl Fn(i64) -> i64) -> Vec<FeedItem> {
                 if continue_group {
                     let acc = group.as_mut().expect("группа существует");
                     acc.last_ts = msg.ts_ms;
-                    acc.bodies.push((msg.id, msg.body.clone()));
+                    acc.bodies
+                        .push((msg.id, msg.body.clone(), msg.entities.clone()));
                     if mine {
                         acc.last_send = msg.send.clone();
                     }
@@ -98,7 +99,7 @@ pub fn group(msgs: &[Msg], day_of: impl Fn(i64) -> i64) -> Vec<FeedItem> {
                         name: String::new(),
                         first: msg,
                         last_ts: msg.ts_ms,
-                        bodies: vec![(msg.id, msg.body.clone())],
+                        bodies: vec![(msg.id, msg.body.clone(), msg.entities.clone())],
                         last_send: msg.send.clone(),
                     });
                 }
@@ -118,7 +119,7 @@ struct GroupAcc<'a> {
     name: String,
     first: &'a Msg,
     last_ts: i64,
-    bodies: Vec<(MsgId, String)>,
+    bodies: Vec<(MsgId, String, Vec<crate::core_link::Entity>)>,
     last_send: SendState,
 }
 
@@ -146,11 +147,11 @@ mod tests {
     use crate::model::msg::{Msg, MsgId, SendState};
 
     fn incoming(id: u64, ts: i64, body: &str) -> Msg {
-        Msg::incoming(MsgId(id), Cid(1), ts, body.to_owned(), None)
+        Msg::incoming(MsgId(id), Cid(1), ts, body.to_owned(), None, Vec::new())
     }
 
     fn outgoing(id: u64, ts: i64, body: &str) -> Msg {
-        Msg::outgoing(MsgId(id), ts, body.to_owned())
+        Msg::outgoing(MsgId(id), ts, body.to_owned(), Vec::new())
     }
 
     #[test]
@@ -211,7 +212,7 @@ mod tests {
                     author: Some(Cid(1)),
                     name: String::new(),
                     ts_ms: 0,
-                    bodies: vec![(MsgId(1), "раз".into())],
+                    bodies: vec![(MsgId(1), "раз".into(), Vec::new())],
                     send: SendState::Sent,
                 },
                 FeedItem::Sys {
@@ -222,7 +223,7 @@ mod tests {
                     author: Some(Cid(1)),
                     name: String::new(),
                     ts_ms: 2,
-                    bodies: vec![(MsgId(2), "два".into())],
+                    bodies: vec![(MsgId(2), "два".into(), Vec::new())],
                     send: SendState::Sent,
                 },
             ]

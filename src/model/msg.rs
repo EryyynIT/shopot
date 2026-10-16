@@ -2,6 +2,7 @@
 
 use std::fmt;
 
+use crate::core_link::Entity;
 use crate::model::cid::Cid;
 
 /// Локальный номер строки ленты — ключ UI (привязка ответа к пузырю).
@@ -66,6 +67,8 @@ pub struct Msg {
     pub dir: Dir,
     pub ts_ms: i64,
     pub body: String,
+    /// Разметка тела (S14, API 2.0+): байтовые offset/len в body.
+    pub entities: Vec<Entity>,
     pub send: SendState,
     /// msg_id ядра, если известен; по нему приходит MESSAGE_DELIVERED.
     pub core_id: Option<CoreMsgId>,
@@ -78,23 +81,26 @@ impl Msg {
         ts_ms: i64,
         body: String,
         core_id: Option<CoreMsgId>,
+        entities: Vec<Entity>,
     ) -> Self {
         Self {
             id,
             dir: Dir::In(cid),
             ts_ms,
             body,
+            entities,
             send: SendState::Sent,
             core_id,
         }
     }
 
-    pub fn outgoing(id: MsgId, ts_ms: i64, body: String) -> Self {
+    pub fn outgoing(id: MsgId, ts_ms: i64, body: String, entities: Vec<Entity>) -> Self {
         Self {
             id,
             dir: Dir::Out,
             ts_ms,
             body,
+            entities,
             send: SendState::Sending,
             core_id: None,
         }
@@ -106,6 +112,7 @@ impl Msg {
             dir: Dir::Sys,
             ts_ms,
             body,
+            entities: Vec::new(),
             send: SendState::Sent,
             core_id: None,
         }
@@ -118,6 +125,7 @@ impl Msg {
             dir: Dir::Card,
             ts_ms,
             body: name,
+            entities: Vec::new(),
             send: SendState::Sent,
             core_id: None,
         }

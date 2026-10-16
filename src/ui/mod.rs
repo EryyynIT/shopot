@@ -620,14 +620,12 @@ fn on_link<L: CoreLink>(state: &mut State<L>, link: LinkIn) -> Task<Message> {
                 msg_id,
                 ts_ms,
                 text,
-                // Склейка (S14): entities появятся в модели со следующим
-                // коммитом спринта; здесь поле пока игнорируется.
-                entities: _,
+                entities,
             } => {
                 let opened = state.store.selected() == Some(cid);
                 state
                     .store
-                    .push_incoming_core(cid, &name, msg_id, ts_ms, text.clone());
+                    .push_incoming_core(cid, &name, msg_id, ts_ms, text.clone(), entities);
                 let mut task = if opened {
                     scroll_feed(state)
                 } else {
@@ -1394,7 +1392,9 @@ fn send_current<L: CoreLink>(state: &mut State<L>) -> Task<Message> {
         return Task::none();
     }
 
-    let msg_id = state.store.push_outgoing(cid, now_ms(), text.clone());
+    let msg_id = state
+        .store
+        .push_outgoing(cid, now_ms(), text.clone(), Vec::new());
     state.composer = text_editor::Content::new();
     state.store.set_draft(cid, String::new());
 
@@ -1410,10 +1410,11 @@ fn send_current<L: CoreLink>(state: &mut State<L>) -> Task<Message> {
 
     // Склейка (S14): разметка введётся в ui-коммите спринта; пока
     // отправка всегда без entities.
+    let entities = Vec::new();
     let request = Request::SendMsg {
         cid,
         text,
-        entities: Vec::new(),
+        entities,
     };
     let reply_request = request.clone();
     let link = Arc::clone(&state.link);
@@ -2704,16 +2705,18 @@ mod tests {
         state.store.replace_contacts(vec![contact(1, "Аня")]);
         let _ = state
             .store
-            .push_outgoing(Cid(1), 1_000, "уходит сейчас".into());
-        let queued = state
-            .store
-            .push_outgoing(Cid(1), 6_000_000, "ждёт очереди".into());
+            .push_outgoing(Cid(1), 1_000, "уходит сейчас".into(), Vec::new());
+        let queued =
+            state
+                .store
+                .push_outgoing(Cid(1), 6_000_000, "ждёт очереди".into(), Vec::new());
         let delivered = state
             .store
-            .push_outgoing(Cid(1), 12_000_000, "уехало".into());
-        let failed = state
-            .store
-            .push_outgoing(Cid(1), 18_000_000, "не проехало".into());
+            .push_outgoing(Cid(1), 12_000_000, "уехало".into(), Vec::new());
+        let failed =
+            state
+                .store
+                .push_outgoing(Cid(1), 18_000_000, "не проехало".into(), Vec::new());
         state.store.mark_queued(Cid(1), queued);
         state
             .store
@@ -2742,7 +2745,9 @@ mod tests {
         state
             .store
             .push_sys(Cid(1), now, "сессия установлена".to_owned());
-        let _ = state.store.push_outgoing(Cid(1), now, "привет".into());
+        let _ = state
+            .store
+            .push_outgoing(Cid(1), now, "привет".into(), Vec::new());
         state.store.select(Some(Cid(1)));
 
         let mut ui = render(&state);
@@ -2930,7 +2935,9 @@ mod tests {
         let mut state = state();
         state.kernel_api = (2, 1);
         state.store.replace_contacts(vec![contact(1, "Аня")]);
-        let _ = state.store.push_outgoing(Cid(1), 1_000, "привет".into());
+        let _ = state
+            .store
+            .push_outgoing(Cid(1), 1_000, "привет".into(), Vec::new());
         state.store.select(Some(Cid(1)));
         let msg = state.store.thread(Cid(1)).unwrap().msgs[0].id;
 

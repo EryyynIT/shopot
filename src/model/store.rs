@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 
-use crate::core_link::HistoryMsg;
+use crate::core_link::{Entity, HistoryMsg};
 use crate::model::cid::Cid;
 use crate::model::feed::{self, FeedItem};
 use crate::model::msg::{CoreMsgId, Dir, Msg, MsgId, SendState};
@@ -127,7 +127,8 @@ impl Store {
     /// Входящее сообщение от известного/нового контакта; имя — из события.
     /// Новые сообщения ядра идут через [`Self::push_incoming_core`].
     pub fn push_incoming(&mut self, cid: Cid, name: &str, msg_id: MsgId, ts_ms: i64, text: String) {
-        self.push_incoming_impl(cid, name, None, msg_id, ts_ms, text);
+        let msg = Msg::incoming(msg_id, cid, ts_ms, text, None, Vec::new());
+        self.push_incoming_impl(cid, name, msg);
     }
 
     /// Входящее сообщение с настоящим msg_id ядра (событие MESSAGE_RECEIVED).
@@ -138,9 +139,11 @@ impl Store {
         core_id: CoreMsgId,
         ts_ms: i64,
         text: String,
+        entities: Vec<Entity>,
     ) {
         let local = self.next_local_id();
-        self.push_incoming_impl(cid, name, Some(core_id), local, ts_ms, text);
+        let msg = Msg::incoming(local, cid, ts_ms, text, Some(core_id), entities);
+        self.push_incoming_impl(cid, name, msg);
     }
 
     fn next_local_id(&mut self) -> MsgId {
@@ -148,15 +151,7 @@ impl Store {
         MsgId(self.next_msg_id)
     }
 
-    fn push_incoming_impl(
-        &mut self,
-        cid: Cid,
-        name: &str,
-        core_id: Option<CoreMsgId>,
-        msg_id: MsgId,
-        ts_ms: i64,
-        text: String,
-    ) {
+    fn push_incoming_impl(&mut self, cid: Cid, name: &str, msg: Msg) {
         let fresh = !self.contacts.contains_key(&cid);
         if fresh {
             self.order.push(cid);
@@ -174,19 +169,23 @@ impl Store {
         let unread = if self.selected == Some(cid) { 0 } else { 1 };
         let thread = self.threads.entry(cid).or_default();
         thread.unread += unread;
-        thread
-            .msgs
-            .push(Msg::incoming(msg_id, cid, ts_ms, text, core_id));
+        thread.msgs.push(msg);
     }
 
     /// Моё сообщение: сразу `Sending`, идентификатор выдаёт Store.
-    pub fn push_outgoing(&mut self, cid: Cid, ts_ms: i64, text: String) -> MsgId {
+    pub fn push_outgoing(
+        &mut self,
+        cid: Cid,
+        ts_ms: i64,
+        text: String,
+        entities: Vec<Entity>,
+    ) -> MsgId {
         let id = self.next_local_id();
         self.threads
             .entry(cid)
             .or_default()
             .msgs
-            .push(Msg::outgoing(id, ts_ms, text));
+            .push(Msg::outgoing(id, ts_ms, text, entities));
         id
     }
 
@@ -414,8 +413,12 @@ impl Store {
                 continue;
             }
             let msg = if record.mine {
-                let mut msg =
-                    Msg::outgoing(self.next_local_id(), record.ts_ms, record.text.clone());
+                let mut msg = Msg::outgoing(
+                    self.next_local_id(),
+                    record.ts_ms,
+                    record.text.clone(),
+                    record.entities.clone(),
+                );
                 msg.core_id = Some(core_id);
                 msg.send = if record.delivered {
                     SendState::Delivered
@@ -430,6 +433,7 @@ impl Store {
                     record.ts_ms,
                     record.text.clone(),
                     Some(core_id),
+                    record.entities.clone(),
                 )
             };
             fresh.push(msg);
@@ -629,7 +633,7 @@ mod tests {
     fn outgoing_send_states() {
         let mut store = Store::new();
         store.replace_contacts(vec![contact(1, "Аня", true)]);
-        let id = store.push_outgoing(Cid(1), 1000, "привет".into());
+        let id = store.push_outgoing(Cid(1), 1000, "привет".into(), Vec::new());
         let msgs = &store.thread(Cid(1)).unwrap().msgs;
         assert_eq!(msgs[0].send, SendState::Sending);
 
@@ -649,7 +653,7 @@ mod tests {
         let mut store = Store::new();
         store.replace_contacts(vec![contact(1, "Аня", false)]);
 
-        let id = store.push_outgoing(Cid(1), 1000, "привет".into());
+        let id = store.push_outgoing(Cid(1), 1000, "привет".into(), Vec::new());
         store.mark_queued(Cid(1), id);
         assert_eq!(
             store.thread(Cid(1)).unwrap().msgs[0].send,
@@ -676,9 +680,9 @@ mod tests {
         let mine = CoreMsgId([1; 16]);
         let theirs = CoreMsgId([2; 16]);
 
-        let id = store.push_outgoing(Cid(1), 1000, "моё".into());
+        let id = store.push_outgoing(Cid(1), 1000, "моё".into(), Vec::new());
         store.mark_sent_core(Cid(1), id, mine);
-        store.push_incoming_core(Cid(1), "Аня", theirs, 1100, "чужое".into());
+        store.push_incoming_core(Cid(1), "Аня", theirs, 1100, "чужое".into(), Vec::new());
 
         store.mark_delivered(Cid(1), theirs);
         assert_eq!(
@@ -794,7 +798,7 @@ mod tests {
         let mut store = Store::new();
         store.replace_contacts(vec![contact(1, "Аня", true)]);
         let core = CoreMsgId([7; 16]);
-        let live = store.push_outgoing(Cid(1), 3000, "живое моё".into());
+        let live = store.push_outgoing(Cid(1), 3000, "живое моё".into(), Vec::new());
         store.mark_sent_core(Cid(1), live, core);
 
         store.load_history(Cid(1), 1, &[history(7, true, false, 3000, "живое моё")]);
@@ -841,7 +845,7 @@ mod tests {
         let mut store = Store::new();
         store.replace_contacts(vec![contact(1, "Аня", true)]);
         store.push_incoming(Cid(1), "Аня", MsgId(1), 1000, "Привет, мир".into());
-        store.push_outgoing(Cid(1), 2000, "привет из дома".into());
+        store.push_outgoing(Cid(1), 2000, "привет из дома".into(), Vec::new());
         store.push_sys(Cid(1), 2500, "Аня подключилась".into());
         store.push_incoming(Cid(1), "Аня", MsgId(2), 3000, "как дела?".into());
 
@@ -867,7 +871,7 @@ mod tests {
         let yesterday = DAY;
         store.push_incoming(Cid(1), "Аня", MsgId(1), yesterday, "привет".into());
         store.push_incoming(Cid(1), "Аня", MsgId(2), yesterday + 1000, "как дела".into());
-        store.push_outgoing(Cid(1), yesterday + 6 * 60 * 1000, "норм".into());
+        store.push_outgoing(Cid(1), yesterday + 6 * 60 * 1000, "норм".into(), Vec::new());
         store.push_incoming(Cid(1), "Аня", MsgId(3), yesterday + DAY, "ок".into());
 
         let items = store.feed(Cid(1), |ts| ts / DAY);

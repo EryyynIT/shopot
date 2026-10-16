@@ -208,7 +208,8 @@ pub fn message_group(group: &FeedItem, scale: f32) -> Vec<Element<'static, Messa
     let mut pending: Option<iced::widget::Column<'static, Message>> = None;
     let count = bodies.len();
 
-    for (index, (msg_id, body)) in bodies.iter().enumerate() {
+    // Склейка (S14): разметка рендерится в ui-коммите спринта.
+    for (index, (msg_id, body, _entities)) in bodies.iter().enumerate() {
         let last = index + 1 == count;
         // ПКМ по строке тела — меню сообщения (закрепить/открепить, S12);
         // в слитом пузыре каждая строка адресует своё сообщение.
@@ -287,7 +288,8 @@ pub fn compact_group(group: &FeedItem, scale: f32) -> Vec<Element<'static, Messa
         );
     }
     let indent = if *mine { 16.0 } else { 0.0 };
-    for (msg_id, body) in bodies {
+    // Склейка (S14): разметка рендерится в ui-коммите спринта.
+    for (msg_id, body, _entities) in bodies {
         // ПКМ по строке — меню сообщения (закрепить/открепить, S12).
         col = col.push(
             container(
