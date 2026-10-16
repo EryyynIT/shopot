@@ -71,7 +71,12 @@ impl<L: CoreLink> iced::application::BootFn<App<L>, Message> for Boot<L> {
 
 fn boot<L: CoreLink>(link: Arc<L>) -> (App<L>, Task<Message>) {
     let state = ui::State::new(Arc::clone(&link));
-    let task = link_task(link, Request::Contacts, None);
+    // Бутстрап из CORE-API.md §8: контакты + зонд версии (от неё гейтятся
+    // ядерные фичи UI: поиск 2.1+, закрепы 2.2+).
+    let task = Task::batch([
+        link_task(Arc::clone(&link), Request::Contacts, None),
+        link_task(link, Request::Version, None),
+    ]);
     (state, task)
 }
 

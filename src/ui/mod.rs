@@ -16,7 +16,7 @@ use iced::widget::{
 };
 use iced::{Element, Length, Padding, Point, Task};
 
-use crate::core_link::{now_ms, CoreLink, LinkEvent, OkReply, Reply, Request};
+use crate::core_link::{now_ms, CoreLink, LinkEvent, OkReply, Reply, Request, SearchHit};
 use crate::model::cid::Cid;
 use crate::model::feed::FeedItem;
 use crate::model::msg::MsgId;
@@ -60,10 +60,16 @@ pub enum ChatIn {
     SelectIndex(usize),
     Send,
     Edit(text_editor::Action),
-    /// Ctrl+F — панель поиска по загруженному чату (S6).
+    /// Ctrl+F — панель поиска по чату (S6; на ядре 2.1+ — по всей
+    /// истории через SEARCH_MESSAGE, S11).
     SearchOpen,
     /// Ввод в поисковой строке панели.
     SearchInput(String),
+    /// Галка «искать по всем чатам» (GLOBAL_SEARCH_MESSAGE; только в
+    /// ядерном режиме, S11).
+    SearchScope(bool),
+    /// «Показать ещё»: следующая страница совпадений (offset растёт).
+    SearchMore,
     /// Лента прокручена; `true` — докатились до верха: догрузить более
     /// старые сообщения (S6; окно GET_HISTORY растёт от загруженного
     /// до потолка ядра).
@@ -137,11 +143,24 @@ pub enum Overlay {
     Search(SearchView),
 }
 
-/// Панель поиска: запрос живёт здесь, совпадения считает Store.
+/// Панель поиска: запрос живёт здесь; совпадения — либо из Store
+/// (ядро 1.x, локальный поиск по загруженному, S6), либо приходят
+/// от ядра (2.1+, S11) и копятся постранично в `results`.
 pub struct SearchView {
     pub query: String,
     /// Фокус в строку при открытии.
     pub input_id: iced::widget::Id,
+    /// Искать по всем чатам (GLOBAL_SEARCH_MESSAGE) — только ядерный режим.
+    pub global: bool,
+    /// Ядерные совпадения текущего запроса (накапливаются по страницам).
+    pub results: Vec<SearchHit>,
+    /// Всего совпадений у ядра по текущему запросу (для «ещё N из M»).
+    pub total: u32,
+    /// Запрос, на который ядро уже ответило; `!= query` — поиск в полёте.
+    /// Устаревшие ответы (смена запроса/скопа/чата) отбрасываются.
+    pub answered: Option<(String, bool, Option<Cid>)>,
+    /// Ошибка поиска — текст для пользователя (TEXT_STYLE §3).
+    pub error: Option<String>,
 }
 
 /// Инвайт-диалог: мой код и чужой код (GUI_UI.md §1).
@@ -194,6 +213,9 @@ pub struct State<L: CoreLink> {
     /// GET_HISTORY в полёте — скролл к верху не плодит повторных
     /// запросов, пока окно не доехало.
     pub history_in_flight: bool,
+    /// Версия API демона из бутстрап-зонда GET_VERSION; (0, 0) — ещё не
+    /// выяснена. Гейт ядерных фич: поиск — с (2, 1), закрепы — с (2, 2).
+    pub kernel_api: (u16, u16),
 }
 
 impl<L: CoreLink> State<L> {
@@ -210,7 +232,14 @@ impl<L: CoreLink> State<L> {
             invite_code: None,
             window_focused: true,
             history_in_flight: false,
+            kernel_api: (0, 0),
         }
+    }
+
+    /// Ядерный поиск доступен (API 2.1+, SEARCH_MESSAGE §4.3): панель
+    /// Ctrl+F спрашивает демон по всей истории, а не Store по окну.
+    pub fn kernel_search(&self) -> bool {
+        self.kernel_api >= (2, 1)
     }
 
     /// Оверлей закрыт — инвариант для тестов и сценариев.
@@ -335,17 +364,12 @@ fn on_link<L: CoreLink>(state: &mut State<L>, link: LinkIn) -> Task<Message> {
             }
             LinkEvent::Resync => {
                 state.link_up = true;
-                let link = Arc::clone(&state.link);
-                Task::perform(
-                    async move { CoreLink::execute(&*link, Request::Contacts).await },
-                    |reply| {
-                        Message::Link(LinkIn::Replied {
-                            request: Request::Contacts,
-                            reply,
-                            tag: None,
-                        })
-                    },
-                )
+                // Демон между соединениями могли заменить — зонд версии
+                // повторяется, гейт ядерных фич пересчитается.
+                Task::batch([
+                    request_task(state, Request::Contacts),
+                    request_task(state, Request::Version),
+                ])
             }
         },
         LinkIn::Replied {
@@ -439,6 +463,48 @@ fn on_link<L: CoreLink>(state: &mut State<L>, link: LinkIn) -> Task<Message> {
                 state.history_in_flight = false;
                 Task::none()
             }
+            // Бутстрап-зонд: версия API демона гейтит ядерные фичи
+            // (поиск 2.1+, закрепы 2.2+).
+            (Request::Version, Ok(OkReply::Version { major, minor, .. })) => {
+                state.kernel_api = (major, minor);
+                Task::none()
+            }
+            (
+                Request::Search {
+                    cid, query, offset, ..
+                },
+                Ok(OkReply::Search { total, hits }),
+            ) => {
+                // Двухфазно: проверка актуальности неизменяема, затем запись.
+                let current = matches!(&state.overlay, Overlay::Search(view)
+                    if search_reply_current(state, view, &query, cid));
+                if current {
+                    if let Overlay::Search(view) = &mut state.overlay {
+                        // Страницы строго по порядку: первая заменяет,
+                        // следующие дописываются в хвост.
+                        if offset == 0 {
+                            view.results = hits;
+                        } else if offset as usize == view.results.len() {
+                            view.results.extend(hits);
+                        }
+                        view.total = total;
+                        view.error = None;
+                        view.answered = Some((query, view.global, cid));
+                    }
+                }
+                Task::none()
+            }
+            (Request::Search { cid, query, .. }, Err(err)) => {
+                let current = matches!(&state.overlay, Overlay::Search(view)
+                    if search_reply_current(state, view, &query, cid));
+                if current {
+                    if let Overlay::Search(view) = &mut state.overlay {
+                        view.error = Some(err.user_text());
+                        view.answered = Some((query, view.global, cid));
+                    }
+                }
+                Task::none()
+            }
             // Остальные ответы ядерного канала появляются со своими спринтами.
             _ => Task::none(),
         },
@@ -471,6 +537,11 @@ fn on_chat<L: CoreLink>(state: &mut State<L>, chat: ChatIn) -> Task<Message> {
                 state.overlay = Overlay::Search(SearchView {
                     query: String::new(),
                     input_id: input_id.clone(),
+                    global: false,
+                    results: Vec::new(),
+                    total: 0,
+                    answered: None,
+                    error: None,
                 });
                 return operation::focus::<Message>(input_id);
             }
@@ -479,8 +550,40 @@ fn on_chat<L: CoreLink>(state: &mut State<L>, chat: ChatIn) -> Task<Message> {
         ChatIn::SearchInput(text) => {
             if let Overlay::Search(view) = &mut state.overlay {
                 view.query = text;
+                view.error = None;
             }
-            Task::none()
+            search_restart(state)
+        }
+        ChatIn::SearchScope(global) => {
+            if let Overlay::Search(view) = &mut state.overlay {
+                view.global = global;
+                view.error = None;
+            }
+            search_restart(state)
+        }
+        ChatIn::SearchMore => {
+            if !state.kernel_search() {
+                return Task::none();
+            }
+            let Overlay::Search(view) = &state.overlay else {
+                return Task::none();
+            };
+            if view.query.trim().is_empty() {
+                return Task::none();
+            }
+            request_task(
+                state,
+                Request::Search {
+                    cid: if view.global {
+                        None
+                    } else {
+                        state.store.selected()
+                    },
+                    query: view.query.clone(),
+                    limit: SEARCH_PAGE,
+                    offset: view.results.len() as u32,
+                },
+            )
         }
         ChatIn::ScrollTop(at_top) => {
             if at_top {
@@ -490,6 +593,53 @@ fn on_chat<L: CoreLink>(state: &mut State<L>, chat: ChatIn) -> Task<Message> {
             }
         }
     }
+}
+
+/// Страница ядерного поиска (S11): «Показать ещё» догружает по столько же.
+const SEARCH_PAGE: u32 = 50;
+
+/// Ядерный поиск (API 2.1+): сбросить страницы и спросить демон заново.
+/// На ядрах 1.x панель ищет локально по загруженному (S6) — задач нет.
+fn search_restart<L: CoreLink>(state: &mut State<L>) -> Task<Message> {
+    if !state.kernel_search() {
+        return Task::none();
+    }
+    let Overlay::Search(view) = &mut state.overlay else {
+        return Task::none();
+    };
+    view.results.clear();
+    view.total = 0;
+    view.answered = None;
+    if view.query.trim().is_empty() {
+        return Task::none();
+    }
+    let request = Request::Search {
+        cid: if view.global {
+            None
+        } else {
+            state.store.selected()
+        },
+        query: view.query.clone(),
+        limit: SEARCH_PAGE,
+        offset: 0,
+    };
+    request_task(state, request)
+}
+
+/// Ответ ядерного поиска принимается, только если запрос, скоп и чат
+/// с момента отправки не сменились; устаревший — выбрасывается.
+fn search_reply_current<L: CoreLink>(
+    state: &State<L>,
+    view: &SearchView,
+    query: &str,
+    cid: Option<Cid>,
+) -> bool {
+    let scope_now = if view.global {
+        None
+    } else {
+        state.store.selected()
+    };
+    view.query == query && scope_now == cid
 }
 
 /// Открыть чат: непрочитанные обнулены, композер заряжен черновиком,
@@ -819,15 +969,58 @@ fn overlay_layer<'a, L: CoreLink>(
         ]
         .into(),
         Overlay::Search(view) => {
-            let hits = state
-                .store
-                .selected()
-                .map_or_else(Vec::new, |cid| state.store.search_loaded(cid, &view.query));
+            let kernel = state.kernel_search();
+            // Ядерный режим (2.1+): совпадения из ответов демона по всей
+            // истории; 1.x — локальный поиск Store по загруженному окну.
+            let rows = if kernel {
+                view.results
+                    .iter()
+                    .map(|hit| widgets::SearchRow {
+                        ts_ms: hit.ts_ms,
+                        mine: hit.mine,
+                        body: hit.body.clone(),
+                        chat: if view.global {
+                            state
+                                .store
+                                .contacts()
+                                .find(|c| c.cid == hit.cid)
+                                .map(|c| c.name.clone())
+                        } else {
+                            None
+                        },
+                    })
+                    .collect()
+            } else {
+                state.store.selected().map_or_else(Vec::new, |cid| {
+                    state
+                        .store
+                        .search_loaded(cid, &view.query)
+                        .into_iter()
+                        .map(|hit| widgets::SearchRow {
+                            ts_ms: hit.ts_ms,
+                            mine: hit.mine,
+                            body: hit.body,
+                            chat: None,
+                        })
+                        .collect()
+                })
+            };
+            let scope = if view.global {
+                None
+            } else {
+                state.store.selected()
+            };
+            let searching = kernel
+                && !view.query.trim().is_empty()
+                && view.error.is_none()
+                && view.answered.as_ref() != Some(&(view.query.clone(), view.global, scope));
             stack![
                 widgets::backdrop(close()),
                 centered(widgets::search_panel(
                     view,
-                    hits,
+                    kernel,
+                    searching,
+                    rows,
                     state.store.settings.font_scale
                 ))
             ]
@@ -1535,6 +1728,234 @@ mod tests {
         assert!(
             ui.find("заметка 7 про хвост").is_ok(),
             "строка совпадения видна"
+        );
+    }
+
+    /// Совпадение от ядра (S11) для подстановки в Replied.
+    fn kernel_hit(cid: i64, n: u8) -> SearchHit {
+        SearchHit {
+            cid: Cid(cid),
+            mine: false,
+            delivered: false,
+            fuzzy: false,
+            msg_id: crate::model::msg::CoreMsgId([n; 16]),
+            ts_ms: 1_000 + i64::from(n) * 1_000,
+            body: format!("найдено {n} про хвост"),
+        }
+    }
+
+    /// Ядерный поиск (S11, API 2.1+): подсказка и галка скопа, «Ищу…»
+    /// до ответа, устаревший ответ выброшен, страницы дописываются,
+    /// «ещё» исчезает, когда выбрано всё.
+    #[test]
+    fn kernel_search_renders_reply_and_paginates() {
+        let mut state = state();
+        state.kernel_api = (2, 1);
+        state.store.replace_contacts(vec![contact(1, "Аня")]);
+        state.store.select(Some(Cid(1)));
+        let _ = update(&mut state, Message::Chat(ChatIn::SearchOpen));
+
+        {
+            let mut ui = render(&state);
+            assert!(
+                ui.find("Ядро ищет по всей истории, не только по загруженной.")
+                    .is_ok(),
+                "подсказка ядерного режима"
+            );
+            assert!(
+                ui.find("Искать по всем чатам").is_ok(),
+                "галка скопа (checkbox отдаёт label селектору)"
+            );
+        }
+
+        let _ = update(
+            &mut state,
+            Message::Chat(ChatIn::SearchInput("хвост".into())),
+        );
+        {
+            let mut ui = render(&state);
+            assert!(ui.find("Ищу…").is_ok(), "до ответа — честное «ищу»");
+        }
+
+        // Устаревший ответ (прошлый запрос) выбрасывается.
+        let _ = update(
+            &mut state,
+            Message::Link(LinkIn::Replied {
+                request: Request::Search {
+                    cid: Some(Cid(1)),
+                    query: "старое".into(),
+                    limit: 50,
+                    offset: 0,
+                },
+                reply: Ok(OkReply::Search {
+                    total: 1,
+                    hits: vec![kernel_hit(1, 250)],
+                }),
+                tag: None,
+            }),
+        );
+        {
+            let mut ui = render(&state);
+            assert!(
+                ui.find("найдено 250 про хвост").is_err(),
+                "устаревший ответ не рендерится"
+            );
+            assert!(ui.find("Ищу…").is_ok(), "актуальный запрос ещё в полёте");
+        }
+
+        // Первая страница: 2 из 3.
+        let _ = update(
+            &mut state,
+            Message::Link(LinkIn::Replied {
+                request: Request::Search {
+                    cid: Some(Cid(1)),
+                    query: "хвост".into(),
+                    limit: 50,
+                    offset: 0,
+                },
+                reply: Ok(OkReply::Search {
+                    total: 3,
+                    hits: vec![kernel_hit(1, 1), kernel_hit(1, 2)],
+                }),
+                tag: None,
+            }),
+        );
+        {
+            let mut ui = render(&state);
+            assert!(ui.find("найдено 1 про хвост").is_ok());
+            assert!(ui.find("Показать ещё (2 из 3)").is_ok());
+        }
+
+        // Догрузка хвоста; кнопка исчезает, когда выбрано всё.
+        let _ = update(&mut state, Message::Chat(ChatIn::SearchMore));
+        let _ = update(
+            &mut state,
+            Message::Link(LinkIn::Replied {
+                request: Request::Search {
+                    cid: Some(Cid(1)),
+                    query: "хвост".into(),
+                    limit: 50,
+                    offset: 2,
+                },
+                reply: Ok(OkReply::Search {
+                    total: 3,
+                    hits: vec![kernel_hit(1, 3)],
+                }),
+                tag: None,
+            }),
+        );
+        let mut ui = render(&state);
+        assert!(
+            ui.find("найдено 3 про хвост").is_ok(),
+            "страница дописана в хвост"
+        );
+        assert!(
+            ui.find("Показать ещё (3 из 3)").is_err(),
+            "выбрано всё — кнопки нет"
+        );
+    }
+
+    /// Глобальный скоп (GLOBAL_SEARCH_MESSAGE): запрос без cid, строки
+    /// показывают имя чата; смена скопа переспрашивает ядро.
+    #[test]
+    fn kernel_search_global_scope_shows_chat_names() {
+        let mut state = state();
+        state.kernel_api = (2, 2);
+        state
+            .store
+            .replace_contacts(vec![contact(1, "Аня"), contact(2, "Борис")]);
+        state.store.select(Some(Cid(1)));
+        let _ = update(&mut state, Message::Chat(ChatIn::SearchOpen));
+        let _ = update(&mut state, Message::Chat(ChatIn::SearchScope(true)));
+        let _ = update(
+            &mut state,
+            Message::Chat(ChatIn::SearchInput("привет".into())),
+        );
+
+        // Ответ с чужим скопом (чатовый) на глобальный запрос — устарел.
+        let _ = update(
+            &mut state,
+            Message::Link(LinkIn::Replied {
+                request: Request::Search {
+                    cid: Some(Cid(1)),
+                    query: "привет".into(),
+                    limit: 50,
+                    offset: 0,
+                },
+                reply: Ok(OkReply::Search {
+                    total: 1,
+                    hits: vec![kernel_hit(1, 7)],
+                }),
+                tag: None,
+            }),
+        );
+
+        let _ = update(
+            &mut state,
+            Message::Link(LinkIn::Replied {
+                request: Request::Search {
+                    cid: None,
+                    query: "привет".into(),
+                    limit: 50,
+                    offset: 0,
+                },
+                reply: Ok(OkReply::Search {
+                    total: 1,
+                    hits: vec![SearchHit {
+                        body: "привет от Бориса".into(),
+                        ..kernel_hit(2, 9)
+                    }],
+                }),
+                tag: None,
+            }),
+        );
+        let mut ui = render(&state);
+        assert!(
+            ui.find("найдено 7 про хвост").is_err(),
+            "чатовый ответ на глобальный запрос выброшен"
+        );
+        assert!(ui.find("привет от Бориса").is_ok());
+        assert!(
+            ui.find("Борис").is_ok(),
+            "имя чата у глобального совпадения"
+        );
+    }
+
+    /// Ошибка поиска — честный текст пользователю, а не «ничего не
+    /// найдено» (TEXT_STYLE §3).
+    #[test]
+    fn kernel_search_error_is_shown() {
+        let mut state = state();
+        state.kernel_api = (2, 1);
+        state.store.replace_contacts(vec![contact(1, "Аня")]);
+        state.store.select(Some(Cid(1)));
+        let _ = update(&mut state, Message::Chat(ChatIn::SearchOpen));
+        let _ = update(
+            &mut state,
+            Message::Chat(ChatIn::SearchInput("хвост".into())),
+        );
+        let _ = update(
+            &mut state,
+            Message::Link(LinkIn::Replied {
+                request: Request::Search {
+                    cid: Some(Cid(1)),
+                    query: "хвост".into(),
+                    limit: 50,
+                    offset: 0,
+                },
+                reply: Err(crate::core_link::LinkError::Disconnected),
+                tag: None,
+            }),
+        );
+        let mut ui = render(&state);
+        assert!(
+            ui.find("Нет связи с ядром. Запустите shopot serve и подождите.")
+                .is_ok(),
+            "текст ошибки виден"
+        );
+        assert!(
+            ui.find("Ничего не найдено.").is_err(),
+            "ошибка не маскируется под промах"
         );
     }
 

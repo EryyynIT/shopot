@@ -2,14 +2,15 @@
 //! и переданные данные (GUI_UI.md §2).
 
 use iced::alignment::Horizontal;
-use iced::widget::{button, column, container, qr_code, row, scrollable, space, text, text_input};
+use iced::widget::{
+    button, checkbox, column, container, qr_code, row, scrollable, space, text, text_input,
+};
 use iced::{Element, Length, Padding};
 
 use crate::model::cid::Cid;
 use crate::model::feed::FeedItem;
 use crate::model::msg::SendState;
 use crate::model::settings::Settings;
-use crate::model::store::SearchHit;
 use crate::ui::palette;
 use crate::ui::{time_hm, ChatIn, InviteView, MeetIn, MenuView, Message, SearchView, SettingsIn};
 
@@ -643,15 +644,27 @@ pub fn settings_panel(settings: &Settings, scale: f32) -> Element<'_, Message> {
     .into()
 }
 
-/// Сколько совпадений показывать в панели; остаток — строкой-хвостом.
+/// Сколько совпадений показывать в локальном режиме; остаток — строкой-хвостом.
 const SEARCH_SHOW: usize = 50;
 
-/// Панель Ctrl+F (S6): запрос + совпадения по загруженной ленте.
-/// Клик по совпадению закрывает панель; переход к сообщению в ленте —
-/// со scroll-анкорами, осознанно отложено.
+/// Строка совпадения панели поиска: ядерного (S11) или локального (S6).
+pub struct SearchRow {
+    pub ts_ms: i64,
+    pub mine: bool,
+    pub body: String,
+    /// Имя чата — только глобальный поиск (S11).
+    pub chat: Option<String>,
+}
+
+/// Панель Ctrl+F (S6/S11): запрос + совпадения. Ядерный режим (API 2.1+)
+/// ищет по всей истории через демон: постраничная догрузка и скоп «все
+/// чаты»; локальный (ядро 1.x) — по загруженной ленте. Клик по совпадению
+/// закрывает панель; переход к сообщению — со scroll-анкорами, отложено.
 pub fn search_panel<'a>(
     view: &'a SearchView,
-    hits: Vec<SearchHit>,
+    kernel: bool,
+    searching: bool,
+    rows: Vec<SearchRow>,
     scale: f32,
 ) -> Element<'a, Message> {
     let input = text_input("Что найти…", &view.query)
@@ -668,68 +681,107 @@ pub fn search_panel<'a>(
 
     let mut results = column![].spacing(2);
     if view.query.trim().is_empty() {
-        results = results.push(
-            text("Поиск ищет по загруженным сообщениям этого чата.")
-                .size(12.0 * scale)
-                .color(palette::DIM),
-        );
-    } else if hits.is_empty() {
+        let hint = if kernel {
+            "Ядро ищет по всей истории, не только по загруженной."
+        } else {
+            "Поиск ищет по загруженным сообщениям этого чата."
+        };
+        results = results.push(text(hint).size(12.0 * scale).color(palette::DIM));
+    } else if let Some(error) = &view.error {
+        results = results.push(text(error.clone()).size(12.0 * scale).color(palette::ERR));
+    } else if searching {
+        results = results.push(text("Ищу…").size(12.0 * scale).color(palette::DIM));
+    } else if rows.is_empty() {
         results = results.push(
             text("Ничего не найдено.")
                 .size(12.0 * scale)
                 .color(palette::DIM),
         );
     } else {
-        for hit in hits.iter().take(SEARCH_SHOW) {
+        let shown = if kernel {
+            rows.len()
+        } else {
+            rows.len().min(SEARCH_SHOW)
+        };
+        for hit in rows.iter().take(shown) {
             let author = if hit.mine { "я" } else { "не я" };
-            results = results.push(
-                button(
-                    row![
-                        text(time_hm(hit.ts_ms))
-                            .size(11.0 * scale)
-                            .color(palette::DIM),
-                        text(hit.body.clone())
-                            .size(12.0 * scale)
-                            .color(palette::TEXT),
-                        space::Space::new().width(Length::Fill),
-                        text(author).size(11.0 * scale).color(palette::DIM),
-                    ]
-                    .spacing(8)
-                    .align_y(iced::alignment::Vertical::Center),
+            let mut line = row![text(time_hm(hit.ts_ms))
+                .size(11.0 * scale)
+                .color(palette::DIM),]
+            .spacing(8)
+            .align_y(iced::alignment::Vertical::Center);
+            if let Some(chat) = &hit.chat {
+                line = line.push(text(chat.clone()).size(11.0 * scale).color(palette::DIM));
+            }
+            line = line
+                .push(
+                    text(hit.body.clone())
+                        .size(12.0 * scale)
+                        .color(palette::TEXT),
                 )
-                .width(Length::Fill)
-                .padding(Padding {
-                    top: 4.0,
-                    right: 8.0,
-                    bottom: 4.0,
-                    left: 8.0,
-                })
-                .style(palette::button_plain)
-                .on_press(Message::Meet(MeetIn::CloseOverlay)),
+                .push(space::Space::new().width(Length::Fill))
+                .push(text(author).size(11.0 * scale).color(palette::DIM));
+            results = results.push(
+                button(line)
+                    .width(Length::Fill)
+                    .padding(Padding {
+                        top: 4.0,
+                        right: 8.0,
+                        bottom: 4.0,
+                        left: 8.0,
+                    })
+                    .style(palette::button_plain)
+                    .on_press(Message::Meet(MeetIn::CloseOverlay)),
             );
         }
-        if hits.len() > SEARCH_SHOW {
+        if kernel {
+            if (rows.len() as u32) < view.total {
+                results = results.push(
+                    button(
+                        text(format!("Показать ещё ({} из {})", rows.len(), view.total))
+                            .size(12.0 * scale)
+                            .color(palette::ACCENT),
+                    )
+                    .padding(Padding {
+                        top: 4.0,
+                        right: 8.0,
+                        bottom: 4.0,
+                        left: 8.0,
+                    })
+                    .style(palette::button_plain)
+                    .on_press(Message::Chat(ChatIn::SearchMore)),
+                );
+            }
+        } else if rows.len() > SEARCH_SHOW {
             results = results.push(
-                text(format!("и ещё {}", hits.len() - SEARCH_SHOW))
+                text(format!("и ещё {}", rows.len() - SEARCH_SHOW))
                     .size(11.0 * scale)
                     .color(palette::DIM),
             );
         }
     }
 
-    container(
-        column![
-            text("Поиск по чату")
-                .size(14.0 * scale)
-                .font(palette::bold())
-                .color(palette::TEXT),
-            input,
-            scrollable(results).height(Length::Fixed(320.0)),
-        ]
-        .spacing(10),
-    )
-    .width(Length::Fixed(520.0))
-    .padding(16)
-    .style(palette::dialog)
-    .into()
+    let mut content = column![
+        text("Поиск по чату")
+            .size(14.0 * scale)
+            .font(palette::bold())
+            .color(palette::TEXT),
+        input,
+    ]
+    .spacing(10);
+    if kernel {
+        content = content.push(
+            checkbox(view.global)
+                .label("Искать по всем чатам")
+                .size(16.0 * scale)
+                .text_size(12.0 * scale)
+                .on_toggle(|on| Message::Chat(ChatIn::SearchScope(on))),
+        );
+    }
+
+    container(content.push(scrollable(results).height(Length::Fixed(320.0))))
+        .width(Length::Fixed(520.0))
+        .padding(16)
+        .style(palette::dialog)
+        .into()
 }
