@@ -636,6 +636,14 @@ impl MockLink {
                 }
                 Ok(OkReply::Done)
             }
+            Request::SetName { name } => {
+                // Контракт §4.4: 1..=32 символа; ядро отвечает BAD_ARGS.
+                let len = name.chars().count();
+                if !(1..=32).contains(&len) {
+                    return Err(LinkError::Kernel(Status::BadArgs));
+                }
+                Ok(OkReply::Done)
+            }
         }
     }
 }
@@ -1171,5 +1179,21 @@ mod tests {
             contacts.iter().all(|c| c.cid != Cid(1)),
             "удалённый не возвращается в списке"
         );
+    }
+
+    /// SET_NAME (имя профиля): 1..=32 символа, иначе BAD_ARGS (§4.4).
+    #[tokio::test(start_paused = true)]
+    async fn set_name_validates_length() {
+        let link = MockLink::new(scene());
+        let reply = link.execute(Request::SetName { name: "Михаил".into() }).await;
+        assert_eq!(reply, Ok(OkReply::Done));
+        let reply = link.execute(Request::SetName { name: String::new() }).await;
+        assert_eq!(reply, Err(LinkError::Kernel(Status::BadArgs)));
+        let reply = link
+            .execute(Request::SetName {
+                name: "а".repeat(33),
+            })
+            .await;
+        assert_eq!(reply, Err(LinkError::Kernel(Status::BadArgs)));
     }
 }

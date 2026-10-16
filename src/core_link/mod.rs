@@ -95,6 +95,10 @@ pub enum Request {
     /// только его собственным приглашением. Ошибки: NO_CONTACT,
     /// CONTACT_BLOCKED, NO_SESSION.
     SendContact { to: Cid, contact: Option<Cid> },
+    /// Задать имя профиля (SET_NAME, §4.4): 1–32 символа. Ядро рассылает
+    /// его пирам в PROFILE и кладёт в свою визитку (SEND_CONTACT со своей
+    /// карточкой); обратно прочитать имя нельзя — запроса GET_NAME нет.
+    SetName { name: String },
 }
 
 /// Совпадение поиска ядра (SEARCH_MESSAGE/GLOBAL_SEARCH_MESSAGE, §4.3).

@@ -444,6 +444,11 @@ fn encode_request(request: &Request, api2: bool) -> (Method, Vec<u8>) {
             api::put::u32(&mut payload, contact.map_or(0, |c| c.0 as u32));
             Method::SendContact
         }
+        // Имя профиля (§4.4): [name str16 1..32].
+        Request::SetName { name } => {
+            api::put::str16(&mut payload, name).expect("имя короче 65535");
+            Method::SetName
+        }
     };
     (method, payload)
 }
@@ -1772,5 +1777,16 @@ mod tests {
         api::put::str16(&mut short, "Вера").expect("str16");
         short.extend_from_slice(&[0x42; 10]);
         assert_eq!(decode_event(&header, &short), None);
+    }
+
+    /// SET_NAME (§4.4): [name str16].
+    #[test]
+    fn set_name_codec_matches_contract() {
+        let (method, payload) =
+            encode_request(&Request::SetName { name: "Михаил".into() }, true);
+        assert_eq!(method, Method::SetName);
+        let mut expect = Vec::new();
+        api::put::str16(&mut expect, "Михаил").expect("str16");
+        assert_eq!(payload, expect);
     }
 }
