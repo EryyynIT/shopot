@@ -779,11 +779,13 @@ fn decode_contacts(payload: &[u8]) -> Result<Vec<Contact>, LinkError> {
         let flags = r.read_u8().map_err(|_| LinkError::BadFrame("flags"))?;
         let _last_seen = r.read_i64().map_err(|_| LinkError::BadFrame("last_seen"))?;
         let name = r.read_str16().map_err(|_| LinkError::BadFrame("name"))?;
+        // avatar_id в LIST_CONTACTS нет — узнаём из PROFILE/GET_AVATAR_ID.
         contacts.push(Contact {
             cid: Cid(i64::from(cid)),
             name: String::from_utf8_lossy(name).into_owned(),
             online: flags & 0b01 != 0,
             blocked: flags & 0b10 != 0,
+            avatar_id: None,
         });
     }
     Ok(contacts)
@@ -1101,6 +1103,7 @@ mod tests {
                 name: "Аня Б".into(),
                 online: true,
                 blocked: false,
+                avatar_id: None,
             }]))
         );
         let events = events.await;
@@ -1348,6 +1351,7 @@ mod tests {
                 name: "Борис".into(),
                 online: false,
                 blocked: false,
+                avatar_id: None,
             }]))
         );
 

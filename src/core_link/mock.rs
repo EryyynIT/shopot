@@ -412,6 +412,7 @@ impl MockLink {
                         name: c.name.clone(),
                         online: c.online,
                         blocked: c.blocked,
+                        avatar_id: None,
                     })
                     .collect();
                 Ok(OkReply::Contacts(contacts))

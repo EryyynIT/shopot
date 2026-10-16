@@ -2541,6 +2541,7 @@ mod tests {
             name: name.to_owned(),
             online: true,
             blocked: false,
+            avatar_id: None,
         }
     }
 

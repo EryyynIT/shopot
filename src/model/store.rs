@@ -15,6 +15,9 @@ pub struct Contact {
     pub name: String,
     pub online: bool,
     pub blocked: bool,
+    /// avatar_id из профиля (S8б): None — аватарки нет или ещё не
+    /// знаем; байты — в avatar_cache стора (ядро дотаскивает само).
+    pub avatar_id: Option<[u8; 16]>,
 }
 
 /// Совпадение поиска по загруженной ленте (Ctrl+F, S6).
@@ -80,6 +83,13 @@ pub struct Store {
     /// Закреплённый чат демона (GET_PINNED_CHAT, API 2.2+): один на демон,
     /// переживает рестарт ядра.
     pinned_chat: Option<Cid>,
+    /// Кэш байтов аватарок по avatar_id (S8б, §4.4: клиент кэширует,
+    /// ядро доставляет само). В памяти: на диск не пишем (инвариант
+    /// §0); после перезапуска ядро пришлёт снова при сессии с пиром.
+    avatar_cache: HashMap<[u8; 16], Vec<u8>>,
+    /// Своя аватарка (id + байты) — показываем в своей карточке сразу
+    /// после SET_AVATAR, не дожидаясь эха.
+    own_avatar: Option<([u8; 16], Vec<u8>)>,
 }
 
 impl Store {
@@ -163,6 +173,7 @@ impl Store {
                     name: name.to_owned(),
                     online: true,
                     blocked: false,
+                    avatar_id: None,
                 },
             );
         }
@@ -230,6 +241,53 @@ impl Store {
         let id = self.next_local_id();
         let msg = Msg::incoming_file(id, cid, ts_ms, file);
         self.push_incoming_impl(cid, name, msg);
+    }
+
+    /// AVATAR_RECEIVED (S8б): байты в кэш по id, контакту — avatar_id.
+    /// cid 0 — эхо собственной аватарки. Незнакомый cid — кэшируем,
+    /// контакт появится по своему событию.
+    pub fn apply_avatar(&mut self, cid: Cid, avatar_id: [u8; 16], data: Vec<u8>) {
+        // Нулевой id = «аватарки нет»: снимаем с контакта, не кэшируем.
+        if avatar_id == [0; 16] {
+            if let Some(contact) = self.contacts.get_mut(&cid) {
+                contact.avatar_id = None;
+            }
+            return;
+        }
+        self.avatar_cache.insert(avatar_id, data.clone());
+        if cid.0 == 0 {
+            self.own_avatar = Some((avatar_id, data));
+        } else if let Some(contact) = self.contacts.get_mut(&cid) {
+            contact.avatar_id = Some(avatar_id);
+        }
+    }
+
+    /// CONTACT_PROFILE: имя и/или avatar_id сменились; байты придут
+    /// событием AVATAR_RECEIVED (ядро запрашивает при рассинхроне).
+    pub fn apply_profile(&mut self, cid: Cid, name: String, avatar_id: [u8; 16]) {
+        if let Some(contact) = self.contacts.get_mut(&cid) {
+            if !name.is_empty() {
+                contact.name = name;
+            }
+            contact.avatar_id = (avatar_id != [0; 16]).then_some(avatar_id);
+        }
+    }
+
+    /// Своя аватарка после SET_AVATAR: показываем сразу.
+    pub fn set_own_avatar(&mut self, avatar_id: [u8; 16], data: Vec<u8>) {
+        self.avatar_cache.insert(avatar_id, data.clone());
+        self.own_avatar = Some((avatar_id, data));
+    }
+
+    /// Байты аватарки контакта, если ядро их уже прислало.
+    pub fn avatar(&self, cid: Cid) -> Option<&[u8]> {
+        let id = self.contacts.get(&cid)?.avatar_id?;
+        self.avatar_cache.get(&id).map(Vec::as_slice)
+    }
+
+    /// Своя аватарка (для карточки профиля).
+    pub fn own_avatar(&self) -> Option<&[u8]> {
+        self.own_avatar.as_ref().map(|(_, data)| data.as_slice())
     }
 
     /// Служебная строка ядра в ленте (контакт подключился, заблокировал…).
@@ -399,6 +457,7 @@ impl Store {
                 name: name.to_owned(),
                 online: false,
                 blocked: false,
+                avatar_id: None,
             },
         );
         true
@@ -681,6 +740,7 @@ mod tests {
             name: name.to_owned(),
             online,
             blocked: false,
+            avatar_id: None,
         }
     }
 
@@ -1175,5 +1235,35 @@ mod tests {
             Some("Гриша")
         );
         assert_eq!(store.thread(Cid(9)).unwrap().unread, 1);
+    }
+
+    /// Аватарки (S8б): байты в кэш по id, контакту — avatar_id; cid 0 —
+    /// своя; профиль без байтов только помечает id; чужой cid без
+    /// контакта кэширует байты на будущее.
+    #[test]
+    fn avatar_cache_by_id() {
+        let mut store = Store::new();
+        store.replace_contacts(vec![contact(1, "Аня", false)]);
+        assert!(store.avatar(Cid(1)).is_none());
+        assert!(store.own_avatar().is_none());
+
+        store.apply_avatar(Cid(1), [0xA1; 16], vec![1, 2, 3]);
+        assert_eq!(store.avatar(Cid(1)), Some(&[1, 2, 3][..]));
+
+        // Профиль со сменой id: байты ещё не пришли — аватарки нет, но
+        // id обновлён (кэш по новому id пуст до события).
+        store.apply_profile(Cid(1), "Анна".into(), [0xB2; 16]);
+        assert_eq!(store.contact(Cid(1)).unwrap().name, "Анна");
+        assert!(store.avatar(Cid(1)).is_none());
+        store.apply_avatar(Cid(1), [0xB2; 16], vec![9]);
+        assert_eq!(store.avatar(Cid(1)), Some(&[9][..]));
+
+        // Своя: cid 0 и set_own_avatar.
+        store.apply_avatar(Cid(0), [0xC3; 16], vec![7, 7]);
+        assert_eq!(store.own_avatar(), Some(&[7, 7][..]));
+
+        // Нулевой id = аватарки нет: снимается, не кэшируется.
+        store.apply_avatar(Cid(1), [0; 16], vec![1]);
+        assert!(store.avatar(Cid(1)).is_none());
     }
 }
