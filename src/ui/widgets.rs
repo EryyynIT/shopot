@@ -13,10 +13,10 @@ use crate::model::store::SearchHit;
 use crate::ui::palette;
 use crate::ui::{time_hm, ChatIn, InviteView, MeetIn, MenuView, Message, SearchView, SettingsIn};
 
-/// Строка сайдбара: акцентная полоса у самого края карточки, точка
-/// presence, имя, бейдж непрочитанных. Высота карточки фиксированная —
-/// полоса с Fill тянется ровно на неё, а не распирает весь список
-/// (правка осмотра окна: строки растягивались на всю высоту сайдбара).
+/// Строка сайдбара: точка presence, имя, бейдж непрочитанных. Выбор —
+/// капсульная заливка всей строки (стиль chat_row), без полос с краю.
+/// Высота карточки фиксированная (правка осмотра окна: строки
+/// растягивались на всю высоту сайдбара).
 pub fn contact_row(
     cid: Cid,
     name: &str,
@@ -25,13 +25,8 @@ pub fn contact_row(
     selected: bool,
     scale: f32,
 ) -> Element<'static, Message> {
-    let bar = container(text(""))
-        .width(Length::Fixed(3.0))
-        .height(Length::Fill)
-        .style(palette::chat_bar(selected));
-
     let dot = text(if online { "●" } else { "○" })
-        .size(12.0 * scale)
+        .size(10.0 * scale)
         .color(if online { palette::OK } else { palette::DIM });
 
     let has_unread = unread > 0;
@@ -52,7 +47,7 @@ pub fn contact_row(
         })
         .width(Length::Fill);
 
-    let mut cells = row![bar, dot, name]
+    let mut cells = row![dot, name]
         .spacing(8)
         .height(Length::Fill)
         .align_y(iced::alignment::Vertical::Center);
@@ -60,10 +55,10 @@ pub fn contact_row(
         cells = cells.push(
             container(text(unread.to_string()).size(11.0 * scale))
                 .padding(Padding {
-                    top: 1.0,
-                    right: 6.0,
-                    bottom: 1.0,
-                    left: 6.0,
+                    top: 2.0,
+                    right: 7.0,
+                    bottom: 2.0,
+                    left: 7.0,
                 })
                 .style(palette::badge),
         );
@@ -71,14 +66,14 @@ pub fn contact_row(
 
     button(cells.padding(Padding {
         top: 0.0,
-        right: 10.0,
+        right: 12.0,
         bottom: 0.0,
-        left: 0.0,
+        left: 12.0,
     }))
     .on_press(Message::Chat(ChatIn::Select(cid)))
     .style(palette::chat_row(selected))
     .width(Length::Fill)
-    .height(Length::Fixed(56.0))
+    .height(Length::Fixed(52.0))
     .into()
 }
 
@@ -92,9 +87,9 @@ pub fn date_sep(ts_ms: i64, scale: f32) -> Element<'static, Message> {
     .width(Length::Fill)
     .align_x(Horizontal::Center)
     .padding(Padding {
-        top: 4.0,
+        top: 10.0,
         right: 0.0,
-        bottom: 4.0,
+        bottom: 6.0,
         left: 0.0,
     })
     .into()
@@ -152,9 +147,9 @@ fn wrap_row(
         .width(Length::Fill)
         .align_x(align_x)
         .padding(Padding {
-            top: 1.0,
+            top: 3.0,
             right: 2.0,
-            bottom: 1.0,
+            bottom: 3.0,
             left: 2.0,
         })
         .into()
@@ -195,10 +190,10 @@ pub fn message_group(group: &FeedItem, scale: f32) -> Vec<Element<'static, Messa
         container(col)
             .max_width(560)
             .padding(Padding {
-                top: 5.0,
-                right: 10.0,
-                bottom: 5.0,
-                left: 10.0,
+                top: 7.0,
+                right: 12.0,
+                bottom: 7.0,
+                left: 12.0,
             })
             .style(bubble_style)
     };
@@ -374,7 +369,6 @@ pub fn invite_panel(view: &InviteView, scale: f32) -> Element<'_, Message> {
             text("Выдать код")
                 .size(12.0 * scale)
                 .font(palette::bold())
-                .color(palette::BG),
         )
         .padding(Padding {
             top: 8.0,
@@ -402,7 +396,6 @@ pub fn invite_panel(view: &InviteView, scale: f32) -> Element<'_, Message> {
             text("Скопировать код")
                 .size(12.0 * scale)
                 .font(palette::bold())
-                .color(palette::BG),
         )
         .padding(Padding {
             top: 8.0,
@@ -453,8 +446,7 @@ pub fn invite_panel(view: &InviteView, scale: f32) -> Element<'_, Message> {
                     text("Добавить")
                         .size(12.0 * scale)
                         .font(palette::bold())
-                        .color(palette::BG),
-                )
+                        )
                 .padding(Padding {
                     top: 8.0,
                     right: 14.0,
@@ -477,7 +469,7 @@ pub fn invite_panel(view: &InviteView, scale: f32) -> Element<'_, Message> {
 
     container(body)
         .width(Length::Fixed(520.0))
-        .padding(16)
+        .padding(20)
         .style(palette::dialog)
         .into()
 }

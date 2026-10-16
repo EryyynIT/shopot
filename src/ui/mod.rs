@@ -859,13 +859,13 @@ fn title_bar<L: CoreLink>(state: &State<L>) -> Element<'static, Message> {
         .align_y(Vertical::Center),
     )
     .width(Length::Fill)
-    .height(Length::Fixed(32.0))
+    .height(Length::Fixed(40.0))
     .align_y(Vertical::Center)
     .padding(Padding {
         top: 0.0,
-        right: 12.0,
+        right: 16.0,
         bottom: 0.0,
-        left: 12.0,
+        left: 16.0,
     })
     .style(palette::panel)
     .into()
@@ -975,10 +975,10 @@ fn sidebar<L: CoreLink>(state: &State<L>) -> Element<'_, Message> {
         .width(Length::Fixed(260.0))
         .height(Length::Fill)
         .padding(Padding {
-            top: 4.0,
-            right: 4.0,
-            bottom: 4.0,
-            left: 4.0,
+            top: 8.0,
+            right: 8.0,
+            bottom: 8.0,
+            left: 8.0,
         })
         .style(palette::panel)
         .into()
@@ -1044,29 +1044,23 @@ fn main_pane<L: CoreLink>(state: &State<L>) -> Element<'_, Message> {
         .align_y(Vertical::Center),
     )
     .width(Length::Fill)
-    .height(Length::Fixed(48.0))
+    .height(Length::Fixed(52.0))
     .align_y(Vertical::Center)
     .padding(Padding {
         top: 0.0,
-        right: 12.0,
+        right: 16.0,
         bottom: 0.0,
-        left: 12.0,
+        left: 16.0,
     })
     .style(palette::panel);
 
     let feed = feed_view(state, cid);
 
-    // Зазор слева: рамка шапки не должна прилегать к рамке сайдбара —
-    // иначе читается как двойная линия (правка осмотра окна).
+    // Рамок у панелей больше нет: зазор между сайдбаром и лентой
+    // не нужен, их разделяет контраст заливок (palette::panel/root).
     container(column![header, feed, composer(state)])
         .width(Length::Fill)
         .height(Length::Fill)
-        .padding(Padding {
-            top: 0.0,
-            right: 0.0,
-            bottom: 0.0,
-            left: 4.0,
-        })
         .style(palette::root)
         .into()
 }
@@ -1136,34 +1130,29 @@ fn composer<L: CoreLink>(state: &State<L>) -> Element<'_, Message> {
         .key_binding(key_binding)
         .style(palette::editor);
 
-    let send = button(
-        text("Отправить")
-            .size(12.0 * scale)
-            .font(palette::bold())
-            .color(palette::BG),
-    )
-    .padding(Padding {
-        top: 10.0,
-        right: 14.0,
-        bottom: 10.0,
-        left: 14.0,
-    })
-    .style(palette::button_accent)
-    .on_press_maybe((!empty).then_some(Message::Chat(ChatIn::Send)));
+    let send = button(text("↑").size(16.0 * scale).font(palette::bold()))
+        .padding(Padding {
+            top: 8.0,
+            right: 13.0,
+            bottom: 8.0,
+            left: 13.0,
+        })
+        .style(palette::button_accent)
+        .on_press_maybe((!empty).then_some(Message::Chat(ChatIn::Send)));
 
     container(
         iced::widget::Row::new()
             .push(container(editor).width(Length::Fill))
             .push(send)
-            .spacing(8)
+            .spacing(10)
             .align_y(Vertical::Bottom),
     )
     .width(Length::Fill)
     .padding(Padding {
-        top: 8.0,
-        right: 12.0,
-        bottom: 8.0,
-        left: 12.0,
+        top: 10.0,
+        right: 16.0,
+        bottom: 10.0,
+        left: 16.0,
     })
     .style(palette::root)
     .into()

@@ -1,35 +1,36 @@
-//! Палитра и стили темы: продолжение TUI, а не новый язык
-//! (GUI_STYLE.md §0). Один акцент (cyan), семантика — только для
-//! состояний. Никаких цветов мимо этого модуля.
+//! Палитра и стили темы: iOS-подобный тёмный язык (GUI_STYLE.md §0).
+//! Чёрный фон, синий акцент моих пузырей, капсульные радиусы, разделение
+//! панелей заливкой без рамок. Цвета живут только здесь.
 
 use iced::border::Radius;
 use iced::widget::{button, checkbox, container, qr_code, text, text_editor, text_input};
-use iced::{Background, Border, Color, Theme};
+use iced::{Background, Border, Color, Shadow, Theme};
 
-/// Основной фон окна.
-pub const BG: Color = Color::from_rgb8(0x14, 0x17, 0x1B);
-/// Панели: сайдбар, шапки, статус-строка.
-pub const PANEL: Color = Color::from_rgb8(0x1B, 0x1F, 0x24);
-/// Поднятые поверхности: пузыри, выбранный чат, ховер.
-pub const RAISE: Color = Color::from_rgb8(0x25, 0x2A, 0x31);
-/// Границы и линии.
-pub const LINE: Color = Color::from_rgb8(0x2A, 0x2F, 0x36);
+/// Основной фон окна: почти чёрный, как тёмная тема iOS.
+pub const BG: Color = Color::from_rgb8(0x0B, 0x0B, 0x0E);
+/// Панели: сайдбар, шапки.
+pub const PANEL: Color = Color::from_rgb8(0x16, 0x16, 0x1A);
+/// Поднятые поверхности: выбранный чат, ховер, поля ввода.
+pub const RAISE: Color = Color::from_rgb8(0x23, 0x23, 0x29);
+/// Оверлей-панели (диалоги, карточки): на полтона светлее сайдбара.
+pub const SHEET: Color = Color::from_rgb8(0x1C, 0x1C, 0x21);
+/// Приглушённая линия: редко, где заливки не хватает.
+pub const LINE: Color = Color::from_rgb8(0x2C, 0x2C, 0x33);
 /// Основной текст.
-pub const TEXT: Color = Color::from_rgb8(0xCD, 0xD3, 0xDA);
-/// Второстепенный текст: время, подсказки, служебное.
+pub const TEXT: Color = Color::from_rgb8(0xF2, 0xF2, 0xF7);
 /// Приглушённый текст: подписи и метки времени внутри пузырей.
-pub const MUTED: Color = Color::from_rgb8(0x9A, 0xA4, 0xB0);
+pub const MUTED: Color = Color::from_rgb8(0x98, 0x98, 0x9F);
 
-/// Приглушённый текст: хинты, выключенные опции.
-pub const DIM: Color = Color::from_rgb8(0x7D, 0x85, 0x8F);
-/// Единственный акцент (тот же hue, что cyan в TUI).
-pub const ACCENT: Color = Color::from_rgb8(0x4C, 0xC2, 0xFF);
+/// Второстепенный текст: время, подсказки, служебное.
+pub const DIM: Color = Color::from_rgb8(0x63, 0x63, 0x6B);
+/// Единственный акцент: синий iOS, он же пузырь моих сообщений.
+pub const ACCENT: Color = Color::from_rgb8(0x0A, 0x84, 0xFF);
 /// Семантика: онлайн / успех.
-pub const OK: Color = Color::from_rgb8(0x57, 0xC7, 0x85);
+pub const OK: Color = Color::from_rgb8(0x30, 0xD1, 0x58);
 /// Семантика: предупреждение, звонок (позже).
-pub const WARN: Color = Color::from_rgb8(0xD9, 0xB8, 0x5C);
+pub const WARN: Color = Color::from_rgb8(0xD9, 0xB4, 0x5C);
 /// Семантика: ошибка, блокировка.
-pub const ERR: Color = Color::from_rgb8(0xE0, 0x6C, 0x75);
+pub const ERR: Color = Color::from_rgb8(0xFF, 0x45, 0x3A);
 
 /// Полужирный шрифт (только имена и активные элементы).
 pub fn bold() -> iced::Font {
@@ -47,54 +48,46 @@ pub fn root(_: &Theme) -> container::Style {
     }
 }
 
-/// Панель (сайдбар, шапки, статус-строка) с тонкой нижней линией.
+/// Панель (сайдбар, шапки): отделяется заливкой, рамок нет.
 pub fn panel(_: &Theme) -> container::Style {
     container::Style {
         background: Some(Background::Color(PANEL)),
-        border: Border {
-            color: LINE,
-            width: 1.0,
-            radius: Radius::default(),
-        },
         ..Default::default()
     }
 }
 
-/// Пузырь чужого сообщения.
+/// Пузырь чужого сообщения: тёмно-серый, крупный радиус.
 pub fn bubble_theirs(_: &Theme) -> container::Style {
     container::Style {
-        background: Some(Background::Color(Color::from_rgb8(0x2A, 0x30, 0x38))),
+        background: Some(Background::Color(Color::from_rgb8(0x26, 0x26, 0x2B))),
         border: Border {
-            color: LINE,
-            width: 1.0,
-            radius: Radius::from(10.0),
+            radius: Radius::from(18.0),
+            ..Default::default()
         },
         ..Default::default()
     }
 }
 
-/// Пузырь моего сообщения: фон в полтона к акценту, без заливки акцентом.
+/// Пузырь моего сообщения: акцентный синий, как в iMessage.
 pub fn bubble_mine(_: &Theme) -> container::Style {
     container::Style {
-        background: Some(Background::Color(Color::from_rgb8(0x1D, 0x3A, 0x4C))),
+        background: Some(Background::Color(ACCENT)),
         border: Border {
-            color: LINE,
-            width: 0.0,
-            radius: Radius::from(10.0),
+            radius: Radius::from(18.0),
+            ..Default::default()
         },
         ..Default::default()
     }
 }
 
-/// Бейдж непрочитанных: акцентная плашка, тёмная цифра.
+/// Бейдж непрочитанных: акцентная капсула с белой цифрой.
 pub fn badge(_: &Theme) -> container::Style {
     container::Style {
         background: Some(Background::Color(ACCENT)),
-        text_color: Some(BG),
+        text_color: Some(Color::WHITE),
         border: Border {
-            color: LINE,
-            width: 0.0,
-            radius: Radius::from(9.0),
+            radius: Radius::from(10.0),
+            ..Default::default()
         },
         ..Default::default()
     }
@@ -105,7 +98,7 @@ pub fn text_colored(color: Color) -> impl Fn(&Theme) -> text::Style {
     move |_| text::Style { color: Some(color) }
 }
 
-/// Кнопка-строка чата: прозрачная, ховер на полтона, выбранный — поднят.
+/// Кнопка-строка чата: прозрачная; ховер и выбор — капсула заливкой.
 pub fn chat_row(selected: bool) -> impl Fn(&Theme, button::Status) -> button::Style {
     move |_, status| {
         let hovered = matches!(status, button::Status::Hovered);
@@ -118,24 +111,11 @@ pub fn chat_row(selected: bool) -> impl Fn(&Theme, button::Status) -> button::St
             background,
             text_color: TEXT,
             border: Border {
-                color: LINE,
-                width: 0.0,
-                radius: Radius::from(6.0),
+                radius: Radius::from(12.0),
+                ..Default::default()
             },
             ..Default::default()
         }
-    }
-}
-
-/// Акцентная полоса слева у выбранного чата (GUI_UI.md §1).
-pub fn chat_bar(selected: bool) -> impl Fn(&Theme) -> container::Style {
-    move |_| container::Style {
-        background: if selected {
-            Some(Background::Color(ACCENT))
-        } else {
-            None
-        },
-        ..Default::default()
     }
 }
 
@@ -147,50 +127,48 @@ pub fn no_bubble(_: &Theme) -> container::Style {
     }
 }
 
-/// Поле ввода: фон в тон пузырей, скругление; фокус — акцентная рамка.
+/// Поле композера: капсула, фокус — тонкая акцентная обводка.
 pub fn editor(_: &Theme, status: text_editor::Status) -> text_editor::Style {
     let focused = matches!(status, text_editor::Status::Focused { .. });
     text_editor::Style {
-        background: Background::Color(Color::from_rgb8(0x2A, 0x30, 0x38)),
+        background: Background::Color(RAISE),
         border: Border {
             color: if focused { ACCENT } else { LINE },
             width: 1.0,
-            radius: Radius::from(10.0),
+            radius: Radius::from(20.0),
         },
         placeholder: DIM,
         value: TEXT,
-        selection: Color::from_rgba8(0x4C, 0xC2, 0xFF, 0.30),
+        selection: Color::from_rgba8(0x0A, 0x84, 0xFF, 0.35),
     }
 }
 
-/// Главная кнопка действия: акцентная заливка, тёмный текст.
+/// Главная кнопка действия: акцентная капсула, белый текст.
 pub fn button_accent(_: &Theme, status: button::Status) -> button::Style {
     let (bg, fg) = match status {
         button::Status::Disabled => (RAISE, MUTED),
-        _ => (ACCENT, BG),
+        _ => (ACCENT, Color::WHITE),
     };
     button::Style {
         background: Some(Background::Color(bg)),
         text_color: fg,
         border: Border {
-            color: LINE,
-            width: 0.0,
-            radius: Radius::from(8.0),
+            radius: Radius::from(18.0),
+            ..Default::default()
         },
         ..Default::default()
     }
 }
 
-/// Кнопка второстепенного действия: прозрачная с рамкой.
+/// Кнопка второстепенного действия: серая капсула без рамки.
 pub fn button_dim(_: &Theme, status: button::Status) -> button::Style {
     let hovered = matches!(status, button::Status::Hovered);
     button::Style {
-        background: hovered.then_some(Background::Color(RAISE)),
+        background: Some(Background::Color(if hovered { LINE } else { RAISE })),
         text_color: TEXT,
         border: Border {
-            color: LINE,
-            width: 1.0,
-            radius: Radius::from(8.0),
+            radius: Radius::from(18.0),
+            ..Default::default()
         },
         ..Default::default()
     }
@@ -203,9 +181,8 @@ pub fn button_plain(_: &Theme, status: button::Status) -> button::Style {
         background: hovered.then_some(Background::Color(RAISE)),
         text_color: TEXT,
         border: Border {
-            color: LINE,
-            width: 0.0,
-            radius: Radius::from(6.0),
+            radius: Radius::from(10.0),
+            ..Default::default()
         },
         ..Default::default()
     }
@@ -218,9 +195,8 @@ pub fn button_menu(_: &Theme, status: button::Status) -> button::Style {
         background: hovered.then_some(Background::Color(RAISE)),
         text_color: TEXT,
         border: Border {
-            color: LINE,
-            width: 0.0,
-            radius: Radius::from(6.0),
+            radius: Radius::from(10.0),
+            ..Default::default()
         },
         ..Default::default()
     }
@@ -229,19 +205,24 @@ pub fn button_menu(_: &Theme, status: button::Status) -> button::Style {
 /// Тёмная подложка оверлея (GUI_UI.md §1).
 pub fn backdrop(_: &Theme) -> container::Style {
     container::Style {
-        background: Some(Background::Color(Color::from_rgba8(0x0A, 0x0C, 0x0E, 0.65))),
+        background: Some(Background::Color(Color::from_rgba8(0x00, 0x00, 0x00, 0.55))),
         ..Default::default()
     }
 }
 
-/// Панель оверлея (диалог, карточка, меню).
+/// Панель оверлея (диалог, карточка, меню): лист с круглыми углами
+/// и мягкой тенью, как шторка в iOS.
 pub fn dialog(_: &Theme) -> container::Style {
     container::Style {
-        background: Some(Background::Color(PANEL)),
+        background: Some(Background::Color(SHEET)),
         border: Border {
-            color: LINE,
-            width: 1.0,
-            radius: Radius::from(8.0),
+            radius: Radius::from(16.0),
+            ..Default::default()
+        },
+        shadow: Shadow {
+            color: Color::from_rgba8(0x00, 0x00, 0x00, 0.45),
+            offset: iced::Vector::new(0.0, 8.0),
+            blur_radius: 24.0,
         },
         ..Default::default()
     }
@@ -251,20 +232,20 @@ pub fn dialog(_: &Theme) -> container::Style {
 pub fn input(_: &Theme, status: text_input::Status) -> text_input::Style {
     let focused = matches!(status, text_input::Status::Focused { .. });
     text_input::Style {
-        background: Background::Color(Color::from_rgb8(0x2A, 0x30, 0x38)),
+        background: Background::Color(RAISE),
         border: Border {
             color: if focused { ACCENT } else { LINE },
             width: 1.0,
-            radius: Radius::from(10.0),
+            radius: Radius::from(12.0),
         },
         icon: MUTED,
         placeholder: DIM,
         value: TEXT,
-        selection: Color::from_rgba8(0x4C, 0xC2, 0xFF, 0.30),
+        selection: Color::from_rgba8(0x0A, 0x84, 0xFF, 0.35),
     }
 }
 
-/// Чекбокс диалога: рамка LINE, отметка акцентом (без цветных заливок).
+/// Чекбокс диалога: круглые углы, отметка акцентом.
 pub fn checkbox_style(_: &Theme, status: checkbox::Status) -> checkbox::Style {
     let text_color = match status {
         checkbox::Status::Disabled { .. } => MUTED,
@@ -276,7 +257,7 @@ pub fn checkbox_style(_: &Theme, status: checkbox::Status) -> checkbox::Style {
         border: Border {
             color: LINE,
             width: 1.0,
-            radius: Radius::from(4.0),
+            radius: Radius::from(6.0),
         },
         text_color: Some(text_color),
     }
