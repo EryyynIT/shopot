@@ -1036,6 +1036,7 @@ pub fn msg_menu(
         let mut b = button(
             text(emoji.to_string())
                 .size(16.0 * scale)
+                .font(palette::emoji())
                 .color(if react.is_some() {
                     palette::TEXT
                 } else {
@@ -1340,7 +1341,7 @@ fn file_row(
         .push(
             text(format!("📎 {}", file.name))
                 .size(14.0 * scale)
-                .font(palette::bold())
+                .font(palette::emoji())
                 .color(palette::TEXT),
         )
         .push(
@@ -1375,19 +1376,26 @@ fn reaction_pills(
         } else {
             r.emoji.to_string()
         };
+        // Пилюля на фоне пузыря: button_dim (RAISE) сливается с
+        // пузырём — свой стиль на LINE; моя реакция — акцентный контур.
         row = row.push(
-            button(text(label).size(11.0 * scale).color(if r.mine {
-                palette::ACCENT
-            } else {
-                palette::TEXT
-            }))
+            button(
+                text(label)
+                    .size(11.0 * scale)
+                    .font(palette::emoji())
+                    .color(if r.mine {
+                        palette::ACCENT
+                    } else {
+                        palette::TEXT
+                    }),
+            )
             .padding(Padding {
                 top: 1.0,
                 right: 6.0,
                 bottom: 1.0,
                 left: 6.0,
             })
-            .style(palette::button_dim)
+            .style(palette::reaction_pill(r.mine))
             .on_press(Message::Chat(ChatIn::React(msg_id, r.emoji))),
         );
     }

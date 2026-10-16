@@ -2321,15 +2321,22 @@ fn composer<L: CoreLink>(state: &State<L>) -> Element<'_, Message> {
         .style(palette::editor);
 
     // Вложение (S10): выбор файла — нативный диалог, ядро читает путь.
-    let attach = button(text("📎").size(16.0 * scale))
-        .padding(Padding {
-            top: 8.0,
-            right: 11.0,
-            bottom: 8.0,
-            left: 11.0,
-        })
-        .style(palette::button_dim)
-        .on_press(Message::Chat(ChatIn::PickFile));
+    // Иконка — SVG: глиф эмодзи в рендере не красится (COLRv1), а
+    // пустая кнопка выглядит сломанной.
+    const PAPERCLIP: &[u8] = br##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="#98989F" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.5l-8.5 8.5a5.5 5.5 0 0 1-7.8-7.8l9-9a3.7 3.7 0 0 1 5.2 5.2l-8.8 8.8a1.85 1.85 0 0 1-2.6-2.6l8.1-8.1"/></svg>"##;
+    let attach = button(
+        iced::widget::svg(iced::widget::svg::Handle::from_memory(PAPERCLIP))
+            .width(18.0 * scale)
+            .height(18.0 * scale),
+    )
+    .padding(Padding {
+        top: 8.0,
+        right: 11.0,
+        bottom: 8.0,
+        left: 11.0,
+    })
+    .style(palette::button_dim)
+    .on_press(Message::Chat(ChatIn::PickFile));
 
     let send = button(text("↑").size(16.0 * scale).font(palette::bold()))
         .padding(Padding {

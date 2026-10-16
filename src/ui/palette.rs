@@ -33,6 +33,31 @@ pub const WARN: Color = Color::from_rgb8(0xD9, 0xB4, 0x5C);
 pub const ERR: Color = Color::from_rgb8(0xFF, 0x45, 0x3A);
 
 /// Полужирный шрифт (только имена и активные элементы).
+/// Эмодзи (S15/S10): моношрифтный fallback не красит COLRv1 — просим
+/// монохромный «Noto Emoji» явно; без него в системе глиф пустой
+/// (честный предел рендера).
+pub fn emoji() -> iced::Font {
+    iced::Font::with_name("Noto Emoji")
+}
+
+/// Пилюля реакции (S15): фон LINE (button_dim/RAISE сливается с
+/// пузырём); своя — акцентный контур.
+pub fn reaction_pill(mine: bool) -> impl Fn(&Theme, button::Status) -> button::Style {
+    move |_: &Theme, status: button::Status| {
+        let hovered = matches!(status, button::Status::Hovered);
+        button::Style {
+            background: Some(Background::Color(if hovered { RAISE } else { LINE })),
+            text_color: TEXT,
+            border: Border {
+                radius: Radius::from(10.0),
+                width: if mine { 1.0 } else { 0.0 },
+                color: if mine { ACCENT } else { LINE },
+            },
+            ..Default::default()
+        }
+    }
+}
+
 pub fn bold() -> iced::Font {
     iced::Font {
         weight: iced::font::Weight::Bold,
