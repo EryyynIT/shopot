@@ -504,8 +504,8 @@ fn history_restores_on_chat_open() {
     );
     assert_eq!(
         anna.msgs.len(),
-        6,
-        "3 из истории + 3 живых входящих демо-сцены"
+        7,
+        "3 из истории + 3 живых входящих + файл демо-сцены (S10)"
     );
     assert!(anna
         .msgs
@@ -901,12 +901,25 @@ fn formatted_message_renders() {
     // Сценарные события демо приходят до 600 мс (разметка + реакция
     // «👍») — качаем с запасом.
     pump(&mut emu, &program, &mut receiver, 1200);
-    // Реакция собеседника видна пилюлей под пузырём (S15).
+    // Реакция собеседника видна пилюлей под пузырём (S15), входящий
+    // файл — пузырем с именем и размером (S10).
     run_instruction(
         &mut emu,
         &program,
         &mut receiver,
         Instruction::Expect(Expectation::Text("👍".into())),
+    );
+    run_instruction(
+        &mut emu,
+        &program,
+        &mut receiver,
+        Instruction::Expect(Expectation::Text("📎 макет.pdf".into())),
+    );
+    run_instruction(
+        &mut emu,
+        &program,
+        &mut receiver,
+        Instruction::Expect(Expectation::Text("249 КБ".into())),
     );
     finish(emu, &program, "formatted_feed");
 }
