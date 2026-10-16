@@ -213,6 +213,7 @@ const SCENARIOS: &[(&str, fn())] = &[
         settings_overlay_toggles_and_closes,
     ),
     ("звонок: оверлей и mute", call_overlay_and_mute),
+    ("разметка в ленте", formatted_message_renders),
 ];
 
 #[test]
@@ -875,4 +876,29 @@ fn call_overlay_and_mute() {
 
     let state = finish(emu, &program, "call_active");
     assert!(state.call_active(), "звонок жив после Esc");
+}
+
+/// Разметка в ленте (S14): демо-сообщение с жирным/кодом/спойлером
+/// приходит по сценарию и рендерится spans; снимок — визуальная приёмка.
+fn formatted_message_renders() {
+    let program = app::program(Link::new(Scene::demo()));
+    let (sender, mut receiver) = mpsc::channel(512);
+    let mut emu = Emulator::new(
+        sender,
+        &program,
+        Mode::Immediate,
+        iced::Size::new(1000.0, 700.0),
+    );
+    run_instruction(
+        &mut emu,
+        &program,
+        &mut receiver,
+        Instruction::Expect(Expectation::Text("Аня".into())),
+    );
+    let [press, release] = click("Аня");
+    run_instruction(&mut emu, &program, &mut receiver, press);
+    run_instruction(&mut emu, &program, &mut receiver, release);
+    // Сценарные сообщения демо приходят до 450 мс — качаем с запасом.
+    pump(&mut emu, &program, &mut receiver, 1200);
+    finish(emu, &program, "formatted_feed");
 }
