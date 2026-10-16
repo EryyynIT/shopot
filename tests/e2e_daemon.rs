@@ -1700,3 +1700,138 @@ async fn formatted_message_entities_two_daemons() {
         "сущность за границей тела — BAD_ARGS: {reply:?}"
     );
 }
+
+/// Два демона: реакции (S15). B ставит 👍 на сообщение A — A получает
+/// REACTION add; B снимает — A получает remove. Своя реакция ставится
+/// с любого ядра (1.0+), гейта по версии нет.
+#[tokio::test]
+async fn reactions_two_daemons() {
+    if std::env::var("SHOPOT_BIN").is_err() {
+        eprintln!("SHOPOT_BIN не задан — e2e против демона пропущен");
+        return;
+    }
+
+    let a = spawn_daemon("ra");
+    let b = spawn_daemon("rb");
+    let sock_a = wait_socket(&a.1).await;
+    let sock_b = wait_socket(&b.1).await;
+    let link_a = std::sync::Arc::new(UdsLink::with_config(
+        sock_a,
+        Duration::from_millis(100),
+        false,
+    ));
+    let link_b = std::sync::Arc::new(UdsLink::with_config(
+        sock_b,
+        Duration::from_millis(100),
+        false,
+    ));
+    let mut events_a = Box::pin(CoreLink::events(std::sync::Arc::clone(&link_a)));
+    let mut events_b = Box::pin(CoreLink::events(std::sync::Arc::clone(&link_b)));
+    for events in [&mut events_a, &mut events_b] {
+        wait_event(events, Duration::from_secs(10), |e| {
+            matches!(e, LinkEvent::Resync)
+        })
+        .await;
+    }
+
+    // Знакомство A↔B.
+    let code = match execute_retry(
+        &link_a,
+        Request::Invite {
+            relay: false,
+            addr: String::new(),
+        },
+    )
+    .await
+    {
+        Ok(OkReply::Code(code)) => code,
+        other => panic!("CREATE_INVITE не удался: {other:?}"),
+    };
+    let cid_a_at_b = match execute_retry(&link_b, Request::Add { code }).await {
+        Ok(OkReply::Added { cid }) => cid,
+        other => panic!("ACCEPT_INVITE не удался: {other:?}"),
+    };
+    let joined = wait_event(&mut events_a, Duration::from_secs(20), |e| {
+        matches!(e, LinkEvent::ContactJoined { .. })
+    })
+    .await;
+    let LinkEvent::ContactJoined { cid: cid_b, .. } = joined else {
+        unreachable!()
+    };
+    // Присутствие обеих сторон: реакция требует живой сессии.
+    for (events, cid) in [(&mut events_a, cid_b), (&mut events_b, cid_a_at_b)] {
+        wait_event(
+            events,
+            Duration::from_secs(20),
+            |e| matches!(e, LinkEvent::Presence { cid: c, online: true, .. } if *c == cid),
+        )
+        .await;
+    }
+
+    // A шлёт сообщение; у B оно получает msg_id.
+    let reply = execute_retry(
+        &link_a,
+        Request::SendMsg {
+            cid: cid_b,
+            text: "оцени".into(),
+            entities: Vec::new(),
+        },
+    )
+    .await;
+    let Ok(OkReply::Sent { msg_id, .. }) = reply else {
+        panic!("SEND_MESSAGE не удался: {reply:?}")
+    };
+    wait_event(&mut events_b, Duration::from_secs(20), |e| {
+        matches!(e, LinkEvent::MessageReceived { .. })
+    })
+    .await;
+
+    // B ставит 👍 → A видит событие add с тем же msg_id и кодпоинтом.
+    let reply = CoreLink::execute(
+        &*link_b,
+        Request::SetReaction {
+            cid: cid_a_at_b,
+            msg_id,
+            emoji: '👍',
+        },
+    )
+    .await;
+    assert_eq!(reply, Ok(OkReply::Done), "SET_REACTION: {reply:?}");
+    let event = wait_event(&mut events_a, Duration::from_secs(20), |e| {
+        matches!(e, LinkEvent::Reaction { add: true, .. })
+    })
+    .await;
+    let LinkEvent::Reaction {
+        cid,
+        msg_id: got,
+        emoji,
+        ..
+    } = event
+    else {
+        unreachable!()
+    };
+    assert_eq!(cid, cid_b);
+    assert_eq!(got, msg_id, "реакция адресует то сообщение");
+    assert_eq!(emoji, '👍');
+
+    // B снимает → A видит remove.
+    let reply = CoreLink::execute(
+        &*link_b,
+        Request::RemoveReaction {
+            cid: cid_a_at_b,
+            msg_id,
+            emoji: '👍',
+        },
+    )
+    .await;
+    assert_eq!(reply, Ok(OkReply::Done), "REMOVE_REACTION: {reply:?}");
+    let event = wait_event(&mut events_a, Duration::from_secs(20), |e| {
+        matches!(e, LinkEvent::Reaction { add: false, .. })
+    })
+    .await;
+    let LinkEvent::Reaction { add, emoji, .. } = event else {
+        unreachable!()
+    };
+    assert!(!add);
+    assert_eq!(emoji, '👍');
+}
