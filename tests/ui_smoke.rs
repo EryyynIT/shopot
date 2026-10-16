@@ -212,6 +212,7 @@ const SCENARIOS: &[(&str, fn())] = &[
         "настройки: галки и масштаб",
         settings_overlay_toggles_and_closes,
     ),
+    ("звонок: оверлей и mute", call_overlay_and_mute),
 ];
 
 #[test]
@@ -795,4 +796,83 @@ fn screenshot_demo_scene() {
     // Путь читает README (docs/screenshot.png): тест перегенерирует ассет.
     let path = concat!(env!("CARGO_MANIFEST_DIR"), "/docs/screenshot.png");
     save_png(shot, std::path::Path::new(path));
+}
+
+/// Звонок (S7): «Позвонить» → «звоним…» → авто-accept заглушки →
+/// активный оверлей (таймер, mute, «Завершить»); Esc активный звонок не
+/// закрывает (GUI_UI.md §3). Снимок активного звонка — визуальная приёмка.
+fn call_overlay_and_mute() {
+    let program = app::program(Link::new(Scene::smoke()));
+    let (sender, mut receiver) = mpsc::channel(512);
+    let mut emu = Emulator::new(
+        sender,
+        &program,
+        Mode::Immediate,
+        iced::Size::new(1000.0, 700.0),
+    );
+    run_instruction(
+        &mut emu,
+        &program,
+        &mut receiver,
+        Instruction::Expect(Expectation::Text("Аня".into())),
+    );
+
+    // Открыть чат — в шапке появляется «Позвонить».
+    let [press, release] = click("Аня");
+    run_instruction(&mut emu, &program, &mut receiver, press);
+    run_instruction(&mut emu, &program, &mut receiver, release);
+    run_instruction(
+        &mut emu,
+        &program,
+        &mut receiver,
+        Instruction::Expect(Expectation::Text("Позвонить".into())),
+    );
+
+    // Звоним: ответ через reply_delay сцены, «пир» примет ещё через столько
+    // же — качаем с запасом.
+    let [press, release] = click("Позвонить");
+    run_instruction(&mut emu, &program, &mut receiver, press);
+    run_instruction(&mut emu, &program, &mut receiver, release);
+    pump(&mut emu, &program, &mut receiver, 800);
+    run_instruction(
+        &mut emu,
+        &program,
+        &mut receiver,
+        Instruction::Expect(Expectation::Text("Завершить".into())),
+    );
+    run_instruction(
+        &mut emu,
+        &program,
+        &mut receiver,
+        Instruction::Expect(Expectation::Text("Выключить микрофон".into())),
+    );
+
+    // Esc активный звонок не закрывает.
+    run_instruction(
+        &mut emu,
+        &program,
+        &mut receiver,
+        Instruction::Interact(Interaction::Keyboard(Keyboard::Type(Key::Escape))),
+    );
+    pump(&mut emu, &program, &mut receiver, 300);
+    run_instruction(
+        &mut emu,
+        &program,
+        &mut receiver,
+        Instruction::Expect(Expectation::Text("Завершить".into())),
+    );
+
+    // Mute-тумблер меняет подпись.
+    let [press, release] = click("Выключить микрофон");
+    run_instruction(&mut emu, &program, &mut receiver, press);
+    run_instruction(&mut emu, &program, &mut receiver, release);
+    run_instruction(
+        &mut emu,
+        &program,
+        &mut receiver,
+        Instruction::Expect(Expectation::Text("Включить микрофон".into())),
+    );
+
+    let state = finish(emu, &program, "call_active");
+    assert!(state.call_active(), "звонок жив после Esc");
 }
