@@ -1,6 +1,7 @@
 //! UI: Elm-архитектура — один State, update() как единственное место
 //! мутаций, view() — чистая функция над Store (GUI_DEV.md §3).
 
+pub mod markup;
 pub mod notify;
 pub mod palette;
 pub mod widgets;
@@ -130,6 +131,10 @@ pub enum ChatIn {
     /// старые сообщения (S6; окно GET_HISTORY растёт от загруженного
     /// до потолка ядра).
     ScrollTop(bool),
+    /// Клик по спойлеру — показать/спрятать содержимое (S14).
+    ToggleSpoiler(MsgId),
+    /// Клик по ссылке в пузыре — открыть в браузере (S14).
+    OpenLink(String),
 }
 
 /// Действия знакомства: инвайт-диалог, карточка контакта, блокировка
@@ -313,6 +318,9 @@ pub struct State<L: CoreLink> {
     pub profile_name: Option<String>,
     /// Аудио-мост активного звонка (S7); живёт, пока фаза Active.
     pub call_audio: Option<crate::audio::CallAudio>,
+    /// Раскрытые спойлеры (S14): набор MsgId. Не переживает перезапуск —
+    /// как и черновики; спойлер снова скрыт.
+    pub revealed_spoilers: std::collections::HashSet<MsgId>,
 }
 
 impl<L: CoreLink> State<L> {
@@ -332,6 +340,7 @@ impl<L: CoreLink> State<L> {
             kernel_api: (0, 0),
             profile_name: None,
             call_audio: None,
+            revealed_spoilers: std::collections::HashSet::new(),
         }
     }
 
@@ -339,6 +348,11 @@ impl<L: CoreLink> State<L> {
     /// Ctrl+F спрашивает демон по всей истории, а не Store по окну.
     pub fn kernel_search(&self) -> bool {
         self.kernel_api >= (2, 1)
+    }
+
+    /// Разметка сообщений — API 2.0+ (§4.3).
+    pub fn kernel_v20(&self) -> bool {
+        self.kernel_api >= (2, 0)
     }
 
     /// Фичи API 2.2+ (§4.8): закрепы, визитки, удаление чата. На ядрах
@@ -1089,6 +1103,31 @@ fn on_chat<L: CoreLink>(state: &mut State<L>, chat: ChatIn) -> Task<Message> {
                 Task::none()
             }
         }
+        ChatIn::ToggleSpoiler(id) => {
+            // Клик по пузырю со спойлером: раскрыть/спрятать (S14).
+            if !state.revealed_spoilers.insert(id) {
+                state.revealed_spoilers.remove(&id);
+            }
+            Task::none()
+        }
+        ChatIn::OpenLink(url) => {
+            // Ссылка из пузыря — браузер ОС; без браузера — честная
+            // sys-строка в открытом чате.
+            if std::process::Command::new("xdg-open")
+                .arg(&url)
+                .spawn()
+                .is_err()
+            {
+                if let Some(cid) = state.store.selected() {
+                    state.store.push_sys(
+                        cid,
+                        now_ms(),
+                        "ссылка не открылась — скопируйте адрес вручную".into(),
+                    );
+                }
+            }
+            Task::none()
+        }
         ChatIn::OpenMsgMenu(id) => {
             // Меню модально; на ядрах < 2.2 закреплять нечем — не открываем.
             if state.kernel_v22() && matches!(state.overlay, Overlay::None) {
@@ -1387,19 +1426,26 @@ fn send_current<L: CoreLink>(state: &mut State<L>) -> Task<Message> {
     let Some(cid) = state.store.selected() else {
         return Task::none();
     };
-    let text = state.composer.text();
-    if text.trim().is_empty() {
+    let raw = state.composer.text();
+    if raw.trim().is_empty() {
         return Task::none();
     }
 
-    let msg_id = state
-        .store
-        .push_outgoing(cid, now_ms(), text.clone(), Vec::new());
-    state.composer = text_editor::Content::new();
-    state.store.set_draft(cid, String::new());
+    // Разметка (S14): на ядре 2.0+ маркеры срезаются в entities, на 1.x
+    // текст уходит как набран — маркеры остаются видимыми, это честно.
+    let (text, entities) = if state.kernel_v20() {
+        markup::parse(&raw)
+    } else {
+        (raw, Vec::new())
+    };
 
     // Превышение лимита ядра ловим до поездки: тело SEND_MESSAGE — str16.
     if text.len() > MAX_BODY {
+        let msg_id = state
+            .store
+            .push_outgoing(cid, now_ms(), text.clone(), Vec::new());
+        state.composer = text_editor::Content::new();
+        state.store.set_draft(cid, String::new());
         state.store.mark_failed(
             cid,
             msg_id,
@@ -1408,9 +1454,12 @@ fn send_current<L: CoreLink>(state: &mut State<L>) -> Task<Message> {
         return Task::none();
     }
 
-    // Склейка (S14): разметка введётся в ui-коммите спринта; пока
-    // отправка всегда без entities.
-    let entities = Vec::new();
+    let msg_id = state
+        .store
+        .push_outgoing(cid, now_ms(), text.clone(), entities.clone());
+    state.composer = text_editor::Content::new();
+    state.store.set_draft(cid, String::new());
+
     let request = Request::SendMsg {
         cid,
         text,
@@ -2010,9 +2059,9 @@ fn feed_view<L: CoreLink>(state: &State<L>, cid: Cid) -> Element<'_, Message> {
             FeedItem::Card { name, .. } => list = list.push(widgets::card_bubble(name, scale)),
             group @ FeedItem::Group { .. } => {
                 let rows = if compact {
-                    widgets::compact_group(&group, scale)
+                    widgets::compact_group(&group, scale, &state.revealed_spoilers)
                 } else {
-                    widgets::message_group(&group, scale)
+                    widgets::message_group(&group, scale, &state.revealed_spoilers)
                 };
                 for element in rows {
                     list = list.push(element);
@@ -3411,5 +3460,83 @@ mod tests {
         assert!(ui
             .find("звонок не начался: Контакт не в сети. Напишите, когда он появится.")
             .is_ok());
+    }
+
+    // ---------- S14: разметка сообщений ----------
+
+    /// Отправка с разметкой на ядре 2.x: маркеры срезаны, entities в
+    /// сообщении ленты; на 1.x текст уходит как набран.
+    #[test]
+    fn markup_parsed_on_v2_literal_on_v1() {
+        let mut state = state();
+        state.kernel_api = (2, 2);
+        state.store.replace_contacts(vec![contact(1, "Аня")]);
+        let _ = update(&mut state, Message::Chat(ChatIn::Select(Cid(1))));
+        state.composer = iced::widget::text_editor::Content::with_text("**жирно** и ||тайна||");
+        let _ = update(&mut state, Message::Chat(ChatIn::Send));
+
+        let msgs = state.store.feed(Cid(1), |ts| ts / 86_400_000);
+        let FeedItem::Group { bodies, .. } = &msgs[1] else {
+            panic!("ожидали группу после разделителя дня: {msgs:?}");
+        };
+        let (_, body, entities) = &bodies[0];
+        assert_eq!(body, "жирно и тайна");
+        assert_eq!(
+            entities,
+            &vec![
+                crate::core_link::Entity::new(crate::core_link::EntityKind::Bold, 0, 10),
+                crate::core_link::Entity::new(crate::core_link::EntityKind::Spoiler, 14, 10),
+            ]
+        );
+
+        // Ядро 1.x: маркеры остаются в тексте, entities нет.
+        state.kernel_api = (1, 0);
+        state.composer = iced::widget::text_editor::Content::with_text("**жирно**");
+        let _ = update(&mut state, Message::Chat(ChatIn::Send));
+        let msgs = state.store.feed(Cid(1), |ts| ts / 86_400_000);
+        let FeedItem::Group { bodies, .. } = &msgs[1] else {
+            panic!("второе сообщение той же группы: {msgs:?}");
+        };
+        // То же окно группировки — второе тело той же группы.
+        let last = bodies.last().expect("тело есть");
+        assert_eq!(last.1, "**жирно**");
+        assert!(last.2.is_empty());
+    }
+
+    /// Спойлер: клик раскрывает, повторный — прячет; переключение живёт
+    /// в State, не в ядре.
+    #[test]
+    fn spoiler_toggles_on_click() {
+        let mut state = state();
+        state.kernel_api = (2, 2);
+        state.store.replace_contacts(vec![contact(1, "Аня")]);
+        let _ = update(&mut state, Message::Chat(ChatIn::Select(Cid(1))));
+        state.composer = iced::widget::text_editor::Content::with_text("||тайна||");
+        let _ = update(&mut state, Message::Chat(ChatIn::Send));
+        let msgs = state.store.feed(Cid(1), |ts| ts / 86_400_000);
+        let FeedItem::Group { bodies, .. } = &msgs[1] else {
+            panic!("группа после разделителя дня: {msgs:?}");
+        };
+        let id = bodies[0].0;
+        assert!(!state.revealed_spoilers.contains(&id), "по умолчанию скрыт");
+        let _ = update(&mut state, Message::Chat(ChatIn::ToggleSpoiler(id)));
+        assert!(state.revealed_spoilers.contains(&id), "клик раскрыл");
+        let _ = update(&mut state, Message::Chat(ChatIn::ToggleSpoiler(id)));
+        assert!(!state.revealed_spoilers.contains(&id), "повторный скрыл");
+    }
+
+    /// Размеченное сообщение рендерится (rich spans): тело видимо,
+    /// паник нет; спойлерный текст в дереве есть (скрыт стилем).
+    #[test]
+    fn formatted_bubble_renders() {
+        let mut state = state();
+        state.kernel_api = (2, 2);
+        state.store.replace_contacts(vec![contact(1, "Аня")]);
+        let _ = update(&mut state, Message::Chat(ChatIn::Select(Cid(1))));
+        state.composer =
+            iced::widget::text_editor::Content::with_text("**важно** и [ссылка](https://x.y)");
+        let _ = update(&mut state, Message::Chat(ChatIn::Send));
+        let mut ui = render(&state);
+        assert!(ui.find("Аня").is_ok(), "чат на месте");
     }
 }

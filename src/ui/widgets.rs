@@ -14,6 +14,15 @@ use crate::model::msg::SendState;
 use crate::model::settings::Settings;
 use crate::model::store::PinEntry;
 use crate::ui::palette;
+use std::collections::{BTreeSet, HashSet};
+
+use iced::font::{Style as FontStyle, Weight};
+use iced::widget::rich_text;
+use iced::widget::text::Span;
+use iced::Font;
+
+use crate::core_link::{Entity, EntityKind};
+use crate::model::msg::MsgId;
 use crate::ui::{
     time_hm, CallIn, CallPhase, CallView, ChatIn, InviteView, MeetIn, MenuView, Message,
     SearchView, SettingsIn, SettingsView,
@@ -166,7 +175,11 @@ fn wrap_row(
 /// под пузырём, у его правой кромки. Fill-распорок в цепочке группы
 /// нет ни одной: они протягивают ширину ближайшего ограничителя и
 /// распахивают пузырь (правка по замерам пробы раскладки).
-pub fn message_group(group: &FeedItem, scale: f32) -> Vec<Element<'static, Message>> {
+pub fn message_group(
+    group: &FeedItem,
+    scale: f32,
+    revealed: &HashSet<MsgId>,
+) -> Vec<Element<'static, Message>> {
     let FeedItem::Group {
         mine,
         name: _,
@@ -208,17 +221,17 @@ pub fn message_group(group: &FeedItem, scale: f32) -> Vec<Element<'static, Messa
     let mut pending: Option<iced::widget::Column<'static, Message>> = None;
     let count = bodies.len();
 
-    // Склейка (S14): разметка рендерится в ui-коммите спринта.
-    for (index, (msg_id, body, _entities)) in bodies.iter().enumerate() {
+    for (index, (msg_id, body, entities)) in bodies.iter().enumerate() {
         let last = index + 1 == count;
         // ПКМ по строке тела — меню сообщения (закрепить/открепить, S12);
-        // в слитом пузыре каждая строка адресует своё сообщение.
-        let body_text = mouse_area(
-            text(body.to_owned())
-                .size(14.0 * scale)
-                .color(palette::TEXT),
-        )
-        .on_right_press(Message::Chat(ChatIn::OpenMsgMenu(*msg_id)));
+        // в слитом пузыре каждая строка адресует своё сообщение. Клик по
+        // строке со спойлером раскрывает его (S14).
+        let mut area = mouse_area(rich_body(body, entities, revealed.contains(msg_id), scale))
+            .on_right_press(Message::Chat(ChatIn::OpenMsgMenu(*msg_id)));
+        if entities.iter().any(|e| e.kind == EntityKind::Spoiler) {
+            area = area.on_press(Message::Chat(ChatIn::ToggleSpoiler(*msg_id)));
+        }
+        let body_text = area;
 
         // Длинные тексты — без пузыря, на всю ширину (GUI_STYLE.md §2).
         if body.len() > 300 {
@@ -264,7 +277,11 @@ pub fn message_group(group: &FeedItem, scale: f32) -> Vec<Element<'static, Messa
 /// Компактная группа: без пузырей, всё слева, мои строки — с отступом
 /// (GUI_STYLE.md §2). Имя автора — над чужой группой: выравнивание
 /// больше не отличает авторов.
-pub fn compact_group(group: &FeedItem, scale: f32) -> Vec<Element<'static, Message>> {
+pub fn compact_group(
+    group: &FeedItem,
+    scale: f32,
+    revealed: &HashSet<MsgId>,
+) -> Vec<Element<'static, Message>> {
     let FeedItem::Group {
         mine,
         name,
@@ -288,23 +305,18 @@ pub fn compact_group(group: &FeedItem, scale: f32) -> Vec<Element<'static, Messa
         );
     }
     let indent = if *mine { 16.0 } else { 0.0 };
-    // Склейка (S14): разметка рендерится в ui-коммите спринта.
-    for (msg_id, body, _entities) in bodies {
-        // ПКМ по строке — меню сообщения (закрепить/открепить, S12).
-        col = col.push(
-            container(
-                mouse_area(
-                    text(body.to_owned())
-                        .size(14.0 * scale)
-                        .color(palette::TEXT),
-                )
-                .on_right_press(Message::Chat(ChatIn::OpenMsgMenu(*msg_id))),
-            )
-            .padding(Padding {
-                left: indent,
-                ..Padding::default()
-            }),
-        );
+    for (msg_id, body, entities) in bodies {
+        // ПКМ по строке — меню сообщения (закрепить/открепить, S12);
+        // клик по спойлеру раскрывает (S14).
+        let mut area = mouse_area(rich_body(body, entities, revealed.contains(msg_id), scale))
+            .on_right_press(Message::Chat(ChatIn::OpenMsgMenu(*msg_id)));
+        if entities.iter().any(|e| e.kind == EntityKind::Spoiler) {
+            area = area.on_press(Message::Chat(ChatIn::ToggleSpoiler(*msg_id)));
+        }
+        col = col.push(container(area).padding(Padding {
+            left: indent,
+            ..Padding::default()
+        }));
     }
     col = col.push(group_footer(*ts_ms, &status, scale));
 
@@ -1241,4 +1253,105 @@ pub fn search_panel<'a>(
         .padding(16)
         .style(palette::dialog)
         .into()
+}
+
+// ---------- разметка сообщений (S14, API 2.0+) ----------
+
+/// Тело сообщения с разметкой: entities ядра → spans rich_text. Без
+/// разметки — обычный текст (та же цена рендера). Спойлер до клика —
+/// сплошная полоса (прозрачный текст на плашке). Ссылки кликабельны
+/// (OpenLink → браузер ОС).
+fn rich_body(
+    body: &str,
+    entities: &[Entity],
+    revealed: bool,
+    scale: f32,
+) -> Element<'static, Message> {
+    if entities.is_empty() {
+        return text(body.to_owned())
+            .size(14.0 * scale)
+            .color(palette::TEXT)
+            .into();
+    }
+    rich_text(body_spans(body, entities, revealed))
+        .size(14.0 * scale)
+        .on_link_click(|url| Message::Chat(ChatIn::OpenLink(url)))
+        .into()
+}
+
+/// Разбить тело на сегменты по границам entities (пересечения сливаются
+/// в общий стиль сегмента). Проводу не доверяем: сущности за пределами
+/// тела или не по границам символов выбрасываются (ядро не валидирует
+/// UTF-8 — резка по символам на клиенте, §4.3).
+fn body_spans(body: &str, entities: &[Entity], revealed: bool) -> Vec<Span<'static, String>> {
+    let valid: Vec<&Entity> = entities
+        .iter()
+        .filter(|e| {
+            let start = usize::from(e.offset);
+            let end = start + usize::from(e.len);
+            e.len > 0
+                && end <= body.len()
+                && body.is_char_boundary(start)
+                && body.is_char_boundary(end)
+        })
+        .collect();
+    let mut bounds: BTreeSet<usize> = [0, body.len()].into_iter().collect();
+    for e in &valid {
+        bounds.insert(usize::from(e.offset));
+        bounds.insert(usize::from(e.offset) + usize::from(e.len));
+    }
+    let bounds: Vec<usize> = bounds.into_iter().collect();
+
+    let mut spans = Vec::new();
+    for window in bounds.windows(2) {
+        let (start, end) = (window[0], window[1]);
+        let slice = &body[start..end];
+        let covering: Vec<&&Entity> = valid
+            .iter()
+            .filter(|e| {
+                usize::from(e.offset) <= start && end <= usize::from(e.offset) + usize::from(e.len)
+            })
+            .collect();
+
+        // Скрытый спойлер: текст есть (копируется, ищется), но не читается.
+        if covering.iter().any(|e| e.kind == EntityKind::Spoiler) && !revealed {
+            spans.push(
+                Span::new(slice.to_owned())
+                    .color(iced::Color::from_rgba8(0, 0, 0, 0.0))
+                    .background(palette::LINE),
+            );
+            continue;
+        }
+
+        let mut font = Font::DEFAULT;
+        let mut color = palette::TEXT;
+        let mut underline = false;
+        let mut strike = false;
+        let mut link: Option<String> = None;
+        for e in covering {
+            match e.kind {
+                EntityKind::Bold => font.weight = Weight::Bold,
+                EntityKind::Italic => font.style = FontStyle::Italic,
+                EntityKind::Underline => underline = true,
+                EntityKind::Strike => strike = true,
+                EntityKind::Code | EntityKind::CodeBlock => font = Font::MONOSPACE,
+                EntityKind::Link => {
+                    color = palette::ACCENT;
+                    underline = true;
+                    link = Some(e.value.clone());
+                }
+                EntityKind::Spoiler => {} // раскрыт — обычный текст
+            }
+        }
+        let mut span = Span::new(slice.to_owned())
+            .font(font)
+            .color(color)
+            .underline(underline)
+            .strikethrough(strike);
+        if let Some(url) = link {
+            span = span.link(url);
+        }
+        spans.push(span);
+    }
+    spans
 }
