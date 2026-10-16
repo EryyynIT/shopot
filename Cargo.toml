@@ -23,6 +23,9 @@ iced = { version = "0.14", default-features = false, features = [
 tokio = { version = "1", default-features = false, features = ["sync", "time", "macros", "rt", "net", "io-util", "process"] }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 futures-core = "0.3"
+# Звук звонков (S7): захват/вывод устройств; ядро получает/отдаёт PCM
+# через fifo ~/.shopot/pcm (CORE-API §4.6, PROTOCOL §10).
+cpal = "0.17"
 
 [dev-dependencies]
 futures-util = "0.3"
