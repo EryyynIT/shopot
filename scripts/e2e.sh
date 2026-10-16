@@ -6,6 +6,12 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
+# cpal (S7) линкуется с libasound: dev-файлы либо системные, либо
+# локальная сборка в ~/.local (см. check.sh).
+if [ -f "$HOME/.local/lib/pkgconfig/alsa.pc" ]; then
+    export PKG_CONFIG_PATH="$HOME/.local/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
+fi
+
 find_zig() {
     if [ -n "${ZIG:-}" ]; then echo "$ZIG"; return; fi
     if command -v zig >/dev/null 2>&1; then command -v zig; return; fi

@@ -16,6 +16,8 @@ jobs:
         with:
           submodules: recursive
       - uses: dtolnay/rust-toolchain@stable
+      # cpal (S7) линкуется с libasound — dev-файлы из пакета.
+      - run: sudo apt-get install -y libasound2-dev
       - uses: mlugg/setup-zig@v2
         with:
           version: 0.17.0
