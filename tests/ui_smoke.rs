@@ -898,7 +898,15 @@ fn formatted_message_renders() {
     let [press, release] = click("Аня");
     run_instruction(&mut emu, &program, &mut receiver, press);
     run_instruction(&mut emu, &program, &mut receiver, release);
-    // Сценарные сообщения демо приходят до 450 мс — качаем с запасом.
+    // Сценарные события демо приходят до 600 мс (разметка + реакция
+    // «👍») — качаем с запасом.
     pump(&mut emu, &program, &mut receiver, 1200);
+    // Реакция собеседника видна пилюлей под пузырём (S15).
+    run_instruction(
+        &mut emu,
+        &program,
+        &mut receiver,
+        Instruction::Expect(Expectation::Text("👍".into())),
+    );
     finish(emu, &program, "formatted_feed");
 }
