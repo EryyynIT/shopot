@@ -682,7 +682,7 @@ pub fn search_panel<'a>(
     let mut results = column![].spacing(2);
     if view.query.trim().is_empty() {
         let hint = if kernel {
-            "Ядро ищет по всей истории, не только по загруженной."
+            "Поиск по всей истории чата."
         } else {
             "Поиск ищет по загруженным сообщениям этого чата."
         };

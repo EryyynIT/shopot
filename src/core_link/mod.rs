@@ -112,7 +112,7 @@ impl LinkError {
     /// Ядро шлёт только машинные коды — человеческий текст рождается здесь.
     pub fn user_text(&self) -> String {
         match self {
-            Self::Disconnected => "Нет связи с ядром. Запустите shopot serve и подождите.".into(),
+            Self::Disconnected => "Нет соединения. Перезапустите приложение.".into(),
             Self::Kernel(api::Status::NoContact) => "Контакт не найден.".into(),
             Self::Kernel(api::Status::ContactBlocked) => {
                 "Контакт заблокирован. Разблокируйте, чтобы писать.".into()
@@ -120,20 +120,24 @@ impl LinkError {
             Self::Kernel(api::Status::BadInviteCode) => {
                 "Неверный код. Скопируйте строку целиком — она начинается с shopot://i/.".into()
             }
+            // Реестр живых приглашений — память демона (§4.2): перезапуск
+            // приложения его не очистит, остаётся ждать использования кодов.
             Self::Kernel(api::Status::TooManyInvites) => {
-                "Активных приглашений уже четыре. Перезапустите shopot serve — реестр приглашений хранится в памяти демона.".into()
+                "Живых приглашений уже четыре — больше нельзя. Дождитесь, пока кто-то воспользуется кодом.".into()
             }
             Self::Kernel(api::Status::TooBig) => {
                 "Сообщение слишком длинное — лимит 4096 байт.".into()
             }
             Self::Kernel(api::Status::NoSession) => {
-                "Нет защищённой сессии. Напишите, когда контакт будет онлайн.".into()
+                "Контакт не в сети. Напишите, когда он появится.".into()
             }
-            Self::Kernel(api::Status::Internal) => "Сбой ядра. Попробуйте позже.".into(),
+            Self::Kernel(api::Status::Internal) => {
+                "Внутренний сбой. Перезапустите приложение.".into()
+            }
             Self::Kernel(status) => {
-                format!("Ошибка ядра ({}). Попробуйте позже.", status.name())
+                format!("Ошибка ({}). Попробуйте позже.", status.name())
             }
-            Self::BadFrame(_) => "Ядро ответило не по протоколу. Обновите shopot-core.".into(),
+            Self::BadFrame(_) => "Несовместимая версия. Обновите приложение.".into(),
         }
     }
 }
@@ -270,16 +274,47 @@ pub(crate) async fn take_events(
 mod tests {
     use super::*;
 
-    /// Совет в тексте ошибки обязан быть выполнимым в GUI (TEXT_STYLE §3):
-    /// отзыва инвайтов в API 1.0.0 нет, перезапуск демона — есть.
+    /// Совет в тексте ошибки обязан быть выполнимым и честным
+    /// (TEXT_STYLE §3): реестр приглашений живёт в памяти демона,
+    /// перезапуск приложения его не очистит — остаётся ждать.
     #[test]
-    fn too_many_invites_advises_restart_not_revoke() {
+    fn too_many_invites_advises_waiting_honestly() {
         let err = LinkError::Kernel(api::Status::TooManyInvites);
         let text = err.user_text();
         assert!(
-            text.contains("Перезапустите"),
-            "совет должен быть выполнимым: {text}"
+            text.contains("Дождитесь"),
+            "реестр чистится только использованием кодов: {text}"
+        );
+        assert!(
+            !text.contains("Перезапустите"),
+            "перезапуск не поможет: {text}"
         );
         assert!(!text.contains("Отзовите"), "отзыва в API нет: {text}");
+        assert!(
+            !text.contains("демон") && !text.contains("serve"),
+            "без техничности: {text}"
+        );
+    }
+
+    /// Ошибки канала — без технических слов («ядро», «демон», «сессия»);
+    /// сбой соединения просит перезапуск приложения.
+    #[test]
+    fn user_texts_avoid_kernel_jargon() {
+        let texts = [
+            LinkError::Disconnected.user_text(),
+            LinkError::Kernel(api::Status::Internal).user_text(),
+            LinkError::Kernel(api::Status::NoSession).user_text(),
+            LinkError::BadFrame("тест").user_text(),
+        ];
+        for text in &texts {
+            for jargon in ["ядр", "демон", "serve", "сесси"] {
+                assert!(!text.contains(jargon), "«{jargon}» в «{text}»");
+            }
+        }
+        assert!(
+            texts[0].contains("Перезапустите"),
+            "обрыв соединения — совет перезапуска: {}",
+            texts[0]
+        );
     }
 }
