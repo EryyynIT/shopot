@@ -66,6 +66,9 @@ pub enum Method {
     UnblockContact = 20,
     Connect = 21,
     Listen = 22,
+    /// API 2.1+: поиск по истории чата / по всем чатам (§4.3).
+    SearchMessage = 23,
+    GlobalSearchMessage = 24,
 }
 
 impl Method {
@@ -93,6 +96,8 @@ impl Method {
             20 => Self::UnblockContact,
             21 => Self::Connect,
             22 => Self::Listen,
+            23 => Self::SearchMessage,
+            24 => Self::GlobalSearchMessage,
             _ => return None,
         })
     }
@@ -547,7 +552,9 @@ mod tests {
 
         assert_eq!(Method::from_u16(7), Some(Method::SendMessage));
         assert_eq!(Method::from_u16(0), None);
-        assert_eq!(Method::from_u16(23), None);
+        assert_eq!(Method::from_u16(23), Some(Method::SearchMessage));
+        assert_eq!(Method::from_u16(24), Some(Method::GlobalSearchMessage));
+        assert_eq!(Method::from_u16(25), None);
         assert_eq!(Status::from_u16(4), Status::NoContact);
         assert_eq!(Status::from_u16(600), Status::Unknown(600));
         assert_eq!(Event::from_u16(10), Some(Event::BlockedByPeer));

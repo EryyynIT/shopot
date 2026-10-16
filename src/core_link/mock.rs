@@ -16,7 +16,9 @@ use tokio::sync::mpsc;
 use tokio::time;
 
 use crate::core_link::api::Status;
-use crate::core_link::{CoreLink, HistoryMsg, LinkError, LinkEvent, OkReply, Reply, Request};
+use crate::core_link::{
+    CoreLink, HistoryMsg, LinkError, LinkEvent, OkReply, Reply, Request, SearchHit,
+};
 use crate::model::cid::Cid;
 use crate::model::msg::CoreMsgId;
 use crate::model::store::Contact;
@@ -478,6 +480,57 @@ impl MockLink {
                 let records = all.map_or_else(Vec::new, |h| h[skip..].to_vec());
                 Ok(OkReply::History { total, records })
             }
+            Request::Search {
+                cid,
+                query,
+                limit,
+                offset,
+            } => {
+                // Заглушка ищет по сценарной истории подстрокой без учёта
+                // регистра — тот же путь UI, что у ядерного поиска (2.1+),
+                // но без нечётких совпадений (fuzzy всегда false).
+                let needle = query.trim().to_lowercase();
+                if needle.is_empty() {
+                    return Err(LinkError::Kernel(Status::BadArgs));
+                }
+                let limit = if limit == 0 { 50 } else { limit.min(200) };
+                let mut matched: Vec<SearchHit> = Vec::new();
+                let mut collect = |cid: Cid, records: &[HistoryMsg]| {
+                    // Ядро отдаёт точные совпадения новые → старые.
+                    for record in records.iter().rev() {
+                        if record.text.to_lowercase().contains(&needle) {
+                            matched.push(SearchHit {
+                                cid,
+                                mine: record.mine,
+                                delivered: record.delivered,
+                                fuzzy: false,
+                                msg_id: record.msg_id,
+                                ts_ms: record.ts_ms,
+                                body: record.text.clone(),
+                            });
+                        }
+                    }
+                };
+                match cid {
+                    Some(cid) => {
+                        if let Some(records) = scene.history.get(&cid.0) {
+                            collect(cid, records);
+                        }
+                    }
+                    None => {
+                        for (cid, records) in &scene.history {
+                            collect(Cid(*cid), records);
+                        }
+                    }
+                }
+                let total = matched.len() as u32;
+                let page = matched
+                    .into_iter()
+                    .skip(offset as usize)
+                    .take(limit as usize)
+                    .collect();
+                Ok(OkReply::Search { total, hits: page })
+            }
         }
     }
 }
@@ -791,5 +844,81 @@ mod tests {
             ts_ms: n as i64 * 1000,
             text: text.to_owned(),
         }
+    }
+
+    /// Поиск заглушки (S11): подстрока без регистра, новые первыми,
+    /// limit/offset как у ядра, пустой запрос — BAD_ARGS.
+    #[tokio::test(start_paused = true)]
+    async fn search_matches_kernel_semantics() {
+        let mut scene = scene();
+        scene.history.insert(
+            1,
+            vec![
+                record(1, "привет, как дела"),
+                record(2, "второе приветствие"),
+                record(3, "ПРИВЕТ ещё раз"),
+            ],
+        );
+        scene.history.insert(2, vec![record(4, "и тут привет")]);
+        let link = MockLink::new(scene);
+
+        // Чатовый: все три записи Ани, новые первыми.
+        let reply = link
+            .execute(Request::Search {
+                cid: Some(Cid(1)),
+                query: "ПРИВЕТ".into(),
+                limit: 0,
+                offset: 0,
+            })
+            .await;
+        let Ok(OkReply::Search { total, hits }) = reply else {
+            panic!("{reply:?}");
+        };
+        assert_eq!(total, 3);
+        assert_eq!(hits.len(), 3);
+        assert_eq!(hits[0].body, "ПРИВЕТ ещё раз");
+        assert!(hits.iter().all(|h| h.cid == Cid(1) && !h.fuzzy));
+
+        // Постранично: limit/offset режут тот же список.
+        let reply = link
+            .execute(Request::Search {
+                cid: Some(Cid(1)),
+                query: "привет".into(),
+                limit: 2,
+                offset: 2,
+            })
+            .await;
+        let Ok(OkReply::Search { total, hits }) = reply else {
+            panic!("{reply:?}");
+        };
+        assert_eq!(total, 3);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].body, "привет, как дела");
+
+        // Глобальный: оба чата, cid у записей разный.
+        let reply = link
+            .execute(Request::Search {
+                cid: None,
+                query: "привет".into(),
+                limit: 0,
+                offset: 0,
+            })
+            .await;
+        let Ok(OkReply::Search { total, hits }) = reply else {
+            panic!("{reply:?}");
+        };
+        assert_eq!(total, 4);
+        assert!(hits.iter().any(|h| h.cid == Cid(2)));
+
+        // Пустой запрос — BAD_ARGS, как у ядра (§4.3).
+        let reply = link
+            .execute(Request::Search {
+                cid: Some(Cid(1)),
+                query: "   ".into(),
+                limit: 0,
+                offset: 0,
+            })
+            .await;
+        assert_eq!(reply, Err(LinkError::Kernel(Status::BadArgs)));
     }
 }

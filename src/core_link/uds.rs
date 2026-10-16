@@ -23,7 +23,9 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::time::timeout;
 
 use super::api::{self, Header, Kind, Method, Status};
-use super::{CoreLink, HistoryMsg, LinkError, LinkEvent, OkReply, RecvStream, Reply, Request};
+use super::{
+    CoreLink, HistoryMsg, LinkError, LinkEvent, OkReply, RecvStream, Reply, Request, SearchHit,
+};
 use crate::model::cid::Cid;
 use crate::model::msg::CoreMsgId;
 use crate::model::store::Contact;
@@ -64,6 +66,9 @@ struct Inner {
     /// Major-версия API демона; 0 — ещё не выяснена (сбрасывается при
     /// каждом новом соединении — между ними демон могли заменить).
     api_major: AtomicU16,
+    /// Minor-версия API демона; осмысленна вместе с `api_major`: гейт
+    /// фич вроде поиска (2.1+) смотрит пару (major, minor).
+    api_minor: AtomicU16,
     events_tx: mpsc::Sender<LinkEvent>,
     events_rx: Mutex<Option<mpsc::Receiver<LinkEvent>>>,
 }
@@ -89,6 +94,7 @@ impl UdsLink {
                 pending: Arc::new(Mutex::new(HashMap::new())),
                 next_id: AtomicU32::new(1),
                 api_major: AtomicU16::new(0),
+                api_minor: AtomicU16::new(0),
                 events_tx,
                 events_rx: Mutex::new(Some(events_rx)),
             }),
@@ -136,6 +142,7 @@ impl Inner {
                 Ok(stream) => {
                     backoff = self.backoff;
                     self.api_major.store(0, Ordering::Relaxed);
+                    self.api_minor.store(0, Ordering::Relaxed);
                     let _ = self.events_tx.send(LinkEvent::Resync).await;
                     self.serve(stream).await;
                     let _ = self.events_tx.send(LinkEvent::Down).await;
@@ -238,7 +245,17 @@ impl Inner {
         }
         let api2 = self.api_major.load(Ordering::Relaxed) >= 2;
         let (method, payload) = encode_request(&request, api2);
-        self.roundtrip(method, payload, api2).await
+        let mut reply = self.roundtrip(method, payload, api2).await;
+        // Чатовый поиск не несёт cid в записях ответа — восстанавливаем
+        // из запроса, чтобы SearchHit всегда знал свой чат.
+        if let (Request::Search { cid: Some(cid), .. }, Ok(OkReply::Search { hits, .. })) =
+            (&request, &mut reply)
+        {
+            for hit in hits.iter_mut() {
+                hit.cid = *cid;
+            }
+        }
+        reply
     }
 
     /// Один запрос-ответ: request_id, кадр, ожидание с таймаутом.
@@ -287,8 +304,9 @@ impl Inner {
         match timeout(REPLY_TIMEOUT, rx).await {
             Ok(Ok(Ok(raw))) => {
                 let reply = decode_reply(method, raw, api2);
-                if let Ok(OkReply::Version { major, .. }) = &reply {
+                if let Ok(OkReply::Version { major, minor, .. }) = &reply {
                     self.api_major.store(*major, Ordering::Relaxed);
+                    self.api_minor.store(*minor, Ordering::Relaxed);
                 }
                 reply
             }
@@ -368,6 +386,28 @@ fn encode_request(request: &Request, api2: bool) -> (Method, Vec<u8>) {
             api::put::u32(&mut payload, *limit);
             Method::GetHistory
         }
+        // SEARCH_MESSAGE (23) / GLOBAL_SEARCH_MESSAGE (24), API 2.1+.
+        // Запрос: [cid u32 (только чатовый)][query str16][limit u32][offset u32].
+        // Гейт по версии — на стороне UI: сюда запрос доезжает, только когда
+        // демон уже выяснен как 2.1+.
+        Request::Search {
+            cid,
+            query,
+            limit,
+            offset,
+        } => {
+            if let Some(cid) = cid {
+                api::put::u32(&mut payload, cid.0 as u32);
+            }
+            api::put::str16(&mut payload, query).expect("запрос короче 65535");
+            api::put::u32(&mut payload, *limit);
+            api::put::u32(&mut payload, *offset);
+            if cid.is_some() {
+                Method::SearchMessage
+            } else {
+                Method::GlobalSearchMessage
+            }
+        }
     };
     (method, payload)
 }
@@ -445,6 +485,43 @@ fn decode_reply(method: Method, raw: RawReply, api2: bool) -> Reply {
                 });
             }
             OkReply::History { total, records }
+        }
+        // Ответ поиска (API 2.1+): [total u32][count u32] × {[cid u32 —
+        // только глобальный][flags u8][msg_id 16][ts u64][body str16]
+        // [entity tail]}. Метод существует только на 2.1+, поэтому
+        // entity tail обязателен и версия зонда не нужна.
+        Method::SearchMessage | Method::GlobalSearchMessage => {
+            let global = method == Method::GlobalSearchMessage;
+            let mut r = api::Reader::new(&raw.payload);
+            let total = r.read_u32().map_err(|_| LinkError::BadFrame("total"))?;
+            let count = r.read_u32().map_err(|_| LinkError::BadFrame("count"))?;
+            let mut hits = Vec::with_capacity(count as usize);
+            for _ in 0..count {
+                let cid = if global {
+                    r.read_u32().map_err(|_| LinkError::BadFrame("cid"))?
+                } else {
+                    0 // заполняется вызывающим: чатовый поиск знает свой cid
+                };
+                let flags = r.read_u8().map_err(|_| LinkError::BadFrame("flags"))?;
+                let mut msg_id = [0u8; 16];
+                msg_id.copy_from_slice(
+                    r.read_bytes(16)
+                        .map_err(|_| LinkError::BadFrame("msg_id"))?,
+                );
+                let ts_ms = r.read_u64().map_err(|_| LinkError::BadFrame("ts"))? as i64;
+                let body = r.read_str16().map_err(|_| LinkError::BadFrame("body"))?;
+                skip_entity_tail(&mut r)?;
+                hits.push(SearchHit {
+                    cid: Cid(i64::from(cid)),
+                    mine: flags & 0b001 != 0,
+                    delivered: flags & 0b010 != 0,
+                    fuzzy: flags & 0b100 != 0,
+                    msg_id: CoreMsgId(msg_id),
+                    ts_ms,
+                    body: String::from_utf8_lossy(body).into_owned(),
+                });
+            }
+            OkReply::Search { total, hits }
         }
         _ => OkReply::Done,
     };
@@ -1253,5 +1330,147 @@ mod tests {
             Ok(OkReply::Contacts(vec![]))
         );
         cleanup(&path);
+    }
+
+    /// Запрос поиска (S11, API 2.1+): [cid u32][query str16][limit u32]
+    /// [offset u32]; глобальный скоп — без cid-префикса (§4.3).
+    #[test]
+    fn search_request_encodes_chat_and_global_scopes() {
+        let (method, payload) = encode_request(
+            &Request::Search {
+                cid: Some(Cid(7)),
+                query: "привет".into(),
+                limit: 50,
+                offset: 100,
+            },
+            true,
+        );
+        assert_eq!(method, Method::SearchMessage);
+        let mut r = api::Reader::new(&payload);
+        assert_eq!(r.read_u32(), Ok(7));
+        assert_eq!(
+            r.read_str16()
+                .map(|b| String::from_utf8_lossy(b).into_owned()),
+            Ok("привет".to_owned())
+        );
+        assert_eq!(r.read_u32(), Ok(50));
+        assert_eq!(r.read_u32(), Ok(100));
+        assert!(!r.has_more(), "строгий разбор: payload прочитан до конца");
+
+        let (method, payload) = encode_request(
+            &Request::Search {
+                cid: None,
+                query: "хвост".into(),
+                limit: 0,
+                offset: 0,
+            },
+            true,
+        );
+        assert_eq!(method, Method::GlobalSearchMessage);
+        let mut r = api::Reader::new(&payload);
+        assert_eq!(
+            r.read_str16()
+                .map(|b| String::from_utf8_lossy(b).into_owned()),
+            Ok("хвост".to_owned()),
+            "глобальный скоп: cid на проводе нет"
+        );
+        assert_eq!(r.read_u32(), Ok(0));
+        assert_eq!(r.read_u32(), Ok(0));
+        assert!(!r.has_more());
+    }
+
+    /// Запись ответа поиска: [flags][msg_id 16][ts u64][body str16]
+    /// [entity tail]; у глобального — [cid u32] впереди.
+    fn push_search_record(payload: &mut Vec<u8>, cid: Option<u32>, flags: u8, body: &str) {
+        if let Some(cid) = cid {
+            api::put::u32(payload, cid);
+        }
+        api::put::u8(payload, flags);
+        payload.extend_from_slice(&[0xAB; 16]);
+        api::put::u64(payload, 1_700_000_000_123);
+        api::put::str16(payload, body).expect("str16");
+        // Entity tail: одна ссылка (kind 8) — проверка, что tail
+        // разбирается, а не съедает следующую запись.
+        api::put::u8(payload, 1);
+        api::put::u8(payload, 8);
+        api::put::u16(payload, 0);
+        api::put::u16(payload, 4);
+        api::put::u8(payload, 4);
+        payload.extend_from_slice(b"http");
+    }
+
+    /// Ответ чатового поиска: флаги mine/delivered/fuzzy разложены,
+    /// entity tail пропущен, cid остаётся нулевым — заполнит roundtrip.
+    #[test]
+    fn search_reply_decodes_flags_and_entity_tail() {
+        let mut payload = Vec::new();
+        api::put::u32(&mut payload, 2); // total
+        api::put::u32(&mut payload, 2); // count
+        push_search_record(&mut payload, None, 0b101, "точное и моё"); // mine+fuzzy
+        push_search_record(&mut payload, None, 0b010, "доставленное");
+
+        let reply = decode_reply(
+            Method::SearchMessage,
+            RawReply {
+                status: Status::Ok,
+                payload,
+            },
+            true,
+        );
+        let Ok(OkReply::Search { total, hits }) = reply else {
+            panic!("{reply:?}");
+        };
+        assert_eq!(total, 2);
+        assert_eq!(hits.len(), 2);
+        assert!(hits[0].mine && hits[0].fuzzy && !hits[0].delivered);
+        assert!(!hits[1].mine && hits[1].delivered && !hits[1].fuzzy);
+        assert_eq!(hits[1].body, "доставленное");
+        assert_eq!(hits[1].ts_ms, 1_700_000_000_123);
+    }
+
+    /// Ответ глобального поиска: cid перед флагами каждой записи.
+    #[test]
+    fn global_search_reply_decodes_cid_per_record() {
+        let mut payload = Vec::new();
+        api::put::u32(&mut payload, 5); // total
+        api::put::u32(&mut payload, 2); // count
+        push_search_record(&mut payload, Some(3), 0b000, "у Ани");
+        push_search_record(&mut payload, Some(9), 0b001, "у Бориса");
+
+        let reply = decode_reply(
+            Method::GlobalSearchMessage,
+            RawReply {
+                status: Status::Ok,
+                payload,
+            },
+            true,
+        );
+        let Ok(OkReply::Search { total, hits }) = reply else {
+            panic!("{reply:?}");
+        };
+        assert_eq!(total, 5);
+        assert_eq!(hits[0].cid, Cid(3));
+        assert_eq!(hits[1].cid, Cid(9));
+        assert!(hits[1].mine);
+    }
+
+    /// Обрезанный entity tail — BadFrame, а не паника/усечение.
+    #[test]
+    fn search_reply_with_truncated_tail_is_bad_frame() {
+        let mut payload = Vec::new();
+        api::put::u32(&mut payload, 1);
+        api::put::u32(&mut payload, 1);
+        push_search_record(&mut payload, None, 0, "тело");
+        payload.truncate(payload.len() - 2); // tail недоеден
+
+        let reply = decode_reply(
+            Method::SearchMessage,
+            RawReply {
+                status: Status::Ok,
+                payload,
+            },
+            true,
+        );
+        assert!(matches!(reply, Err(LinkError::BadFrame(_))));
     }
 }

@@ -56,6 +56,32 @@ pub enum Request {
     /// История чата (GET_HISTORY): окно новейших записей, старые → новые.
     /// Лимит ядра — 200, 0 означает «дефолтные 50».
     History { cid: Cid, limit: u32 },
+    /// Поиск по истории (API 2.1+, CORE-API §4.3): `cid = Some` — один чат
+    /// (SEARCH_MESSAGE), `cid = None` — все чаты (GLOBAL_SEARCH_MESSAGE).
+    /// Постранично: `limit` ≤ 200 (0 → дефолт 50), `offset` — пропуск
+    /// совпадений. Ядра 1.x метод не знают — клиент обязан отгейтить
+    /// по GET_VERSION и молча уйти в локальный поиск.
+    Search {
+        cid: Option<Cid>,
+        query: String,
+        limit: u32,
+        offset: u32,
+    },
+}
+
+/// Совпадение поиска ядра (SEARCH_MESSAGE/GLOBAL_SEARCH_MESSAGE, §4.3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SearchHit {
+    /// Чат, где найдено (у чатового поиска — тот же cid).
+    pub cid: Cid,
+    pub mine: bool,
+    /// Пир подтвердил ACK (бит1 flags). Осмысленно только для своих.
+    pub delivered: bool,
+    /// Нечёткое совпадение (бит2 flags): идут после точных.
+    pub fuzzy: bool,
+    pub msg_id: CoreMsgId,
+    pub ts_ms: i64,
+    pub body: String,
 }
 
 /// Ошибка канала с ядром (GUI_DEV.md §2: типизированные варианты).
@@ -142,6 +168,9 @@ pub enum OkReply {
         total: u32,
         records: Vec<HistoryMsg>,
     },
+    /// SEARCH_MESSAGE/GLOBAL_SEARCH_MESSAGE: всего совпадений + страница
+    /// (точные новые → старые, затем нечёткие).
+    Search { total: u32, hits: Vec<SearchHit> },
     /// У команды нет содержательного ответа (block/unblock).
     Done,
 }
