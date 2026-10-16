@@ -689,16 +689,19 @@ pub fn pins_panel(entries: &[PinEntry], scale: f32) -> Element<'static, Message>
 
 /// Меню сообщения по ПКМ (S12): закрепить/открепить. Пункт собирает
 /// view (он знает, закреплено ли сообщение и есть ли у него msg_id ядра);
-/// `pin = None` — свое сообщение в полёте, кнопка выключена.
+/// `pin = None` — своё сообщение в полёте: кнопка-глагол выключена,
+/// под ней строка-пояснение (TEXT_STYLE §3: кнопка — глагол, объяснение
+/// живёт отдельно).
 pub fn msg_menu(
     body: &str,
     pin: Option<(&'static str, Message)>,
     scale: f32,
 ) -> Element<'static, Message> {
     let preview: String = body.chars().take(80).collect();
+    let can_pin = pin.is_some();
     let (pin_label, pin_action) = match pin {
         Some((label, message)) => (label, Some(message)),
-        None => ("Закрепить можно после отправки", None),
+        None => ("Закрепить сообщение", None),
     };
     let mut pin_button = button(text(pin_label).size(13.0 * scale).color(
         if pin_action.is_some() {
@@ -718,27 +721,35 @@ pub fn msg_menu(
     if let Some(message) = pin_action {
         pin_button = pin_button.on_press(message);
     }
-    container(
-        column![
-            text(preview).size(11.0 * scale).color(palette::DIM),
-            pin_button,
-            button(text("Отмена").size(13.0 * scale).color(palette::DIM))
-                .width(Length::Fill)
-                .padding(Padding {
-                    top: 6.0,
-                    right: 10.0,
-                    bottom: 6.0,
-                    left: 10.0,
-                })
-                .style(palette::button_menu)
-                .on_press(Message::Meet(MeetIn::CloseOverlay)),
-        ]
-        .spacing(2),
-    )
-    .width(Length::Fixed(220.0))
-    .padding(8)
-    .style(palette::dialog)
-    .into()
+    let mut items = column![
+        text(preview).size(11.0 * scale).color(palette::DIM),
+        pin_button,
+    ]
+    .spacing(2);
+    if !can_pin {
+        items = items.push(
+            text("Закрепить можно после отправки")
+                .size(10.0 * scale)
+                .color(palette::DIM),
+        );
+    }
+    items = items.push(
+        button(text("Отмена").size(13.0 * scale).color(palette::DIM))
+            .width(Length::Fill)
+            .padding(Padding {
+                top: 6.0,
+                right: 10.0,
+                bottom: 6.0,
+                left: 10.0,
+            })
+            .style(palette::button_menu)
+            .on_press(Message::Meet(MeetIn::CloseOverlay)),
+    );
+    container(items)
+        .width(Length::Fixed(220.0))
+        .padding(8)
+        .style(palette::dialog)
+        .into()
 }
 
 /// Панель настроек: приватность уведомлений, компактная лента, масштаб
