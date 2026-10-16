@@ -120,12 +120,14 @@ impl Scene {
                         msg_id: core_id(1004),
                         ts_ms: crate::core_link::now_ms(),
                         text: "Жёсткий дедлайн. Шёпотом: переждём.".into(),
-                        // Демо-разметка (S14): жирный + спойлер + код —
+                        // Демо-разметка (S14): жирный + код + спойлер —
                         // скриншот демо-сцены показывает рендер spans.
+                        // offsets — байты UTF-8: «Жёсткий» 0..14,
+                        // «Шёпотом» 31..45, «переждём.» 47..64.
                         entities: vec![
-                            Entity::new(EntityKind::Bold, 0, 16),
-                            Entity::new(EntityKind::Spoiler, 35, "переждём.".len() as u16),
-                            Entity::new(EntityKind::Code, 18, "Шёпотом".len() as u16),
+                            Entity::new(EntityKind::Bold, 0, 14),
+                            Entity::new(EntityKind::Code, 31, 14),
+                            Entity::new(EntityKind::Spoiler, 47, 17),
                         ],
                     },
                 ),
