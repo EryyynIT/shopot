@@ -26,6 +26,17 @@ pub struct SearchHit {
     pub body: String,
 }
 
+/// Закреплённое сообщение (S12): порядок и состав — от ядра
+/// (GET_PINNED_MESSAGES), тела дозапрашиваются через GET_MESSAGE.
+/// `body = None` — тело в пути; такая запись не рисуется (без заглушек).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PinEntry {
+    pub msg_id: CoreMsgId,
+    pub ts_ms: i64,
+    pub mine: bool,
+    pub body: Option<String>,
+}
+
 /// Состояние защищённой сессии с контактом. Ядро отдельного события сессии
 /// не шлёт: сессия = живое соединение, поэтому её определяет PRESENCE.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -50,6 +61,10 @@ pub struct Thread {
     pub history_loaded: u32,
     /// Сколько записей у ядра всего (total из ответа GET_HISTORY).
     pub history_total: u32,
+    /// Закреплённые сообщения чата в порядке закрепления (S12).
+    pub pins: Vec<PinEntry>,
+    /// GET_PINNED_MESSAGES уже запрашивался для этого чата.
+    pub pins_requested: bool,
 }
 
 /// Проекция ядра для UI. Пересобирается из contacts + событий.
@@ -62,6 +77,9 @@ pub struct Store {
     next_msg_id: u64,
     /// Выбор пользователя (масштаб, компакт, приватность уведомлений).
     pub settings: Settings,
+    /// Закреплённый чат демона (GET_PINNED_CHAT, API 2.2+): один на демон,
+    /// переживает рестарт ядра.
+    pinned_chat: Option<Cid>,
 }
 
 impl Store {
@@ -419,6 +437,101 @@ impl Store {
             })
             .collect()
     }
+
+    /// Закреплённый чат (GET_PINNED_CHAT, S12).
+    pub fn pinned_chat(&self) -> Option<Cid> {
+        self.pinned_chat
+    }
+
+    pub fn set_pinned_chat(&mut self, cid: Option<Cid>) {
+        self.pinned_chat = cid;
+    }
+
+    /// Закрепы чата от ядра (GET_PINNED_MESSAGES): порядок закрепления.
+    /// Уже разрешённые тела сохраняются — повторный ответ не сбрасывает
+    /// их в «незагружено»; тело нового закрепа подхватывается из
+    /// загруженной ленты, иначе дозапрашивается (GET_MESSAGE).
+    pub fn set_pin_ids(&mut self, cid: Cid, ids: &[CoreMsgId]) {
+        let thread = self.threads.entry(cid).or_default();
+        let old = std::mem::take(&mut thread.pins);
+        thread.pins = ids
+            .iter()
+            .map(|id| {
+                let resolved = old
+                    .iter()
+                    .find(|p| p.msg_id == *id)
+                    .and_then(|p| p.body.clone().map(|body| (p.ts_ms, p.mine, body)))
+                    .or_else(|| {
+                        let msg = thread.msgs.iter().find(|m| m.core_id == Some(*id))?;
+                        Some((msg.ts_ms, matches!(msg.dir, Dir::Out), msg.body.clone()))
+                    });
+                match resolved {
+                    Some((ts_ms, mine, body)) => PinEntry {
+                        msg_id: *id,
+                        ts_ms,
+                        mine,
+                        body: Some(body),
+                    },
+                    None => PinEntry {
+                        msg_id: *id,
+                        ts_ms: 0,
+                        mine: false,
+                        body: None,
+                    },
+                }
+            })
+            .collect();
+    }
+
+    /// Тело закрепа от GET_MESSAGE; неизвестный msg_id — не наш ответ.
+    pub fn fill_pin(&mut self, cid: Cid, msg_id: CoreMsgId, ts_ms: i64, mine: bool, body: String) {
+        let Some(thread) = self.threads.get_mut(&cid) else {
+            return;
+        };
+        if let Some(entry) = thread.pins.iter_mut().find(|p| p.msg_id == msg_id) {
+            *entry = PinEntry {
+                msg_id,
+                ts_ms,
+                mine,
+                body: Some(body),
+            };
+        }
+    }
+
+    /// Закрепы чата для UI (порядок закрепления).
+    pub fn pins(&self, cid: Cid) -> &[PinEntry] {
+        self.threads
+            .get(&cid)
+            .map_or(&[], |thread| thread.pins.as_slice())
+    }
+
+    /// Закреплено ли сообщение (для пункта меню пузыря).
+    pub fn is_pinned(&self, cid: Cid, msg_id: CoreMsgId) -> bool {
+        self.pins(cid).iter().any(|p| p.msg_id == msg_id)
+    }
+
+    /// msg_id ядра для строки ленты (ПКМ по пузырю): известен не всем —
+    /// своим до ответа SEND_MESSAGE его ещё нет.
+    pub fn core_id_of(&self, cid: Cid, id: MsgId) -> Option<CoreMsgId> {
+        self.msg(cid, id).and_then(|m| m.core_id)
+    }
+
+    /// Строка ленты по локальному id (меню пузыря, S12).
+    pub fn msg(&self, cid: Cid, id: MsgId) -> Option<&Msg> {
+        self.threads.get(&cid)?.msgs.iter().find(|m| m.id == id)
+    }
+
+    /// GET_PINNED_MESSAGES уже запрашивался для чата.
+    pub fn pins_requested(&self, cid: Cid) -> bool {
+        self.threads
+            .get(&cid)
+            .map(|t| t.pins_requested)
+            .unwrap_or(false)
+    }
+
+    pub fn mark_pins_requested(&mut self, cid: Cid) {
+        self.threads.entry(cid).or_default().pins_requested = true;
+    }
 }
 
 #[cfg(test)]
@@ -745,5 +858,47 @@ mod tests {
         assert_eq!(bodies.len(), 1);
         assert!(matches!(items[3], FeedItem::DateSep { .. }));
         assert_eq!(items.len(), 5);
+    }
+
+    /// Закрепы (S12): повторный состав сохраняет разрешённые тела,
+    /// новый закреп подхватывает тело из загруженной ленты, неизвестный
+    /// ждёт GET_MESSAGE.
+    #[test]
+    fn pins_resolve_and_survive_refresh() {
+        let mut store = Store::default();
+        store.replace_contacts(vec![contact(1, "Аня", true)]);
+        let in_feed = CoreMsgId([1; 16]);
+        let known = CoreMsgId([2; 16]);
+        let fresh = CoreMsgId([3; 16]);
+
+        store.load_history(
+            Cid(1),
+            1,
+            &[HistoryMsg {
+                mine: false,
+                delivered: false,
+                msg_id: in_feed,
+                ts_ms: 1_000,
+                text: "в ленте".into(),
+            }],
+        );
+        store.set_pin_ids(Cid(1), &[known]);
+        assert_eq!(store.pins(Cid(1))[0].body, None, "тела пока нет");
+        store.fill_pin(Cid(1), known, 500, true, "старое".into());
+
+        // Новый состав: known сохраняет тело, in_feed берёт из ленты,
+        // fresh ждёт GET_MESSAGE.
+        store.set_pin_ids(Cid(1), &[known, in_feed, fresh]);
+        let pins = store.pins(Cid(1));
+        assert_eq!(pins.len(), 3, "порядок закрепления сохранён");
+        assert_eq!(pins[0].body.as_deref(), Some("старое"));
+        assert_eq!(pins[1].body.as_deref(), Some("в ленте"));
+        assert_eq!(pins[2].body, None);
+        assert!(store.is_pinned(Cid(1), fresh));
+        assert!(!store.is_pinned(Cid(1), CoreMsgId([9; 16])));
+
+        // Откреп: состав без known.
+        store.set_pin_ids(Cid(1), &[in_feed, fresh]);
+        assert!(!store.is_pinned(Cid(1), known));
     }
 }
