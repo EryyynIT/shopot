@@ -46,6 +46,17 @@ pub enum Dir {
     Card,
 }
 
+/// Файл-вложение (S10): имя/размер с провода, file_id = SHA-256[0..16],
+/// path — где лежит для открытия (входящий: ~/.shopot/files/<hex>;
+/// свой: исходный путь). Статус передачи — поле send сообщения.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileRef {
+    pub name: String,
+    pub size: u32,
+    pub file_id: [u8; 16],
+    pub path: Option<String>,
+}
+
 /// Реакция на сообщение (S15): эмодзи, счётчик, моя ли (моя — кликом
 /// снимается). Ядро историю реакций не отдаёт — состояние живёт, пока
 /// жива лента в памяти.
@@ -82,6 +93,8 @@ pub struct Msg {
     /// Реакции (S15): событийные, в истории ядра их нет — после
     /// перезапуска пусто (честный предел контракта).
     pub reactions: Vec<Reaction>,
+    /// Файл (S10): сообщение-вложение; body дублирует имя для поиска.
+    pub file: Option<FileRef>,
     pub send: SendState,
     /// msg_id ядра, если известен; по нему приходит MESSAGE_DELIVERED.
     pub core_id: Option<CoreMsgId>,
@@ -103,6 +116,7 @@ impl Msg {
             body,
             entities,
             reactions: Vec::new(),
+            file: None,
             send: SendState::Sent,
             core_id,
         }
@@ -116,6 +130,7 @@ impl Msg {
             body,
             entities,
             reactions: Vec::new(),
+            file: None,
             send: SendState::Sending,
             core_id: None,
         }
@@ -129,6 +144,7 @@ impl Msg {
             body,
             entities: Vec::new(),
             reactions: Vec::new(),
+            file: None,
             send: SendState::Sent,
             core_id: None,
         }
@@ -143,6 +159,37 @@ impl Msg {
             body: name,
             entities: Vec::new(),
             reactions: Vec::new(),
+            file: None,
+            send: SendState::Sent,
+            core_id: None,
+        }
+    }
+
+    /// Исходящий файл (S10): Sending до события FILE_SENT.
+    pub fn outgoing_file(id: MsgId, ts_ms: i64, file: FileRef) -> Self {
+        Self {
+            id,
+            dir: Dir::Out,
+            ts_ms,
+            body: file.name.clone(),
+            entities: Vec::new(),
+            reactions: Vec::new(),
+            file: Some(file),
+            send: SendState::Sending,
+            core_id: None,
+        }
+    }
+
+    /// Входящий файл (S10): ядро уже сохранил его на диск.
+    pub fn incoming_file(id: MsgId, cid: Cid, ts_ms: i64, file: FileRef) -> Self {
+        Self {
+            id,
+            dir: Dir::In(cid),
+            ts_ms,
+            body: file.name.clone(),
+            entities: Vec::new(),
+            reactions: Vec::new(),
+            file: Some(file),
             send: SendState::Sent,
             core_id: None,
         }

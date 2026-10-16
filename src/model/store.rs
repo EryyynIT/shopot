@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use crate::core_link::{Entity, HistoryMsg};
 use crate::model::cid::Cid;
 use crate::model::feed::{self, FeedItem};
-use crate::model::msg::{CoreMsgId, Dir, Msg, MsgId, Reaction, SendState};
+use crate::model::msg::{CoreMsgId, Dir, FileRef, Msg, MsgId, Reaction, SendState};
 use crate::model::settings::Settings;
 
 /// Контакт.
@@ -187,6 +187,49 @@ impl Store {
             .msgs
             .push(Msg::outgoing(id, ts_ms, text, entities));
         id
+    }
+
+    /// Мой файл: Sending до события FILE_SENT (честный статус, S10).
+    pub fn push_outgoing_file(&mut self, cid: Cid, ts_ms: i64, file: FileRef) -> MsgId {
+        let id = self.next_local_id();
+        self.threads
+            .entry(cid)
+            .or_default()
+            .msgs
+            .push(Msg::outgoing_file(id, ts_ms, file));
+        id
+    }
+
+    /// Ответ SEND_FILE: ядро посчитало file_id/size — пузырь получает
+    /// настоящие (S10). Локальный стоял с нулевым id.
+    pub fn set_file_meta(&mut self, cid: Cid, id: MsgId, file_id: [u8; 16], size: u32) {
+        if let Some(msg) = self.msg_mut(cid, id) {
+            if let Some(file) = &mut msg.file {
+                file.file_id = file_id;
+                file.size = size;
+            }
+        }
+    }
+
+    /// FILE_SENT: все чанки подтверждены — пузырь «отправлен».
+    pub fn mark_file_sent(&mut self, cid: Cid, file_id: [u8; 16]) {
+        let Some(thread) = self.threads.get_mut(&cid) else {
+            return;
+        };
+        for msg in thread.msgs.iter_mut().rev() {
+            if msg.file.as_ref().map(|f| f.file_id) == Some(file_id) {
+                msg.send = SendState::Sent;
+                return;
+            }
+        }
+    }
+
+    /// Входящий файл (FILE_RECEIVED, S10): как входящее сообщение —
+    /// непрочитанное, новый контакт создаётся.
+    pub fn push_incoming_file(&mut self, cid: Cid, name: &str, ts_ms: i64, file: FileRef) {
+        let id = self.next_local_id();
+        let msg = Msg::incoming_file(id, cid, ts_ms, file);
+        self.push_incoming_impl(cid, name, msg);
     }
 
     /// Служебная строка ядра в ленте (контакт подключился, заблокировал…).
@@ -1089,5 +1132,48 @@ mod tests {
         // Снятие без постановки — не уходит в минус; чужой msg_id — игнор.
         assert!(store.apply_reaction(cid, core, false, false, '🔥'));
         assert!(!store.apply_reaction(cid, CoreMsgId([0xEE; 16]), true, false, '🔥'));
+    }
+
+    /// Файлы (S10): исходящий Sending → FILE_SENT делает Sent; входящий
+    /// создаёт контакт и непрочитанное.
+    #[test]
+    fn file_lifecycle_honest_status() {
+        let mut store = Store::new();
+        store.replace_contacts(vec![contact(1, "Аня", false)]);
+        let file = FileRef {
+            name: "макет.pdf".into(),
+            size: 254_000,
+            file_id: [0xF1; 16],
+            path: Some("/tmp/макет.pdf".into()),
+        };
+        let id = store.push_outgoing_file(Cid(1), 1000, file.clone());
+        let msgs = &store.thread(Cid(1)).expect("чат есть").msgs;
+        assert_eq!(msgs[0].id, id);
+        assert_eq!(msgs[0].send, SendState::Sending);
+        assert_eq!(msgs[0].file.as_ref().map(|f| f.size), Some(254_000));
+
+        store.mark_file_sent(Cid(1), [0xF1; 16]);
+        assert_eq!(store.thread(Cid(1)).unwrap().msgs[0].send, SendState::Sent);
+        // Чужой file_id — ничего не трогает.
+        store.mark_file_sent(Cid(1), [0xEE; 16]);
+        assert_eq!(store.thread(Cid(1)).unwrap().msgs[0].send, SendState::Sent);
+
+        // Входящий от незнакомого cid — контакт появляется, непрочитанное.
+        store.push_incoming_file(
+            Cid(9),
+            "Гриша",
+            2000,
+            FileRef {
+                name: "смета.xlsx".into(),
+                size: 12_000,
+                file_id: [0xA9; 16],
+                path: Some("/home/u/.shopot/files/a9a9".into()),
+            },
+        );
+        assert_eq!(
+            store.contact(Cid(9)).map(|c| c.name.as_str()),
+            Some("Гриша")
+        );
+        assert_eq!(store.thread(Cid(9)).unwrap().unread, 1);
     }
 }

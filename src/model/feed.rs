@@ -10,6 +10,31 @@ use crate::model::msg::{Dir, Msg, MsgId, SendState};
 /// Разрыв группы: 5 минут.
 const GAP_MS: i64 = 5 * 60 * 1000;
 
+/// Тело сообщения внутри группы ленты: текст + разметка (S14) +
+/// реакции (S15) + файл (S10).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FeedBody {
+    pub id: MsgId,
+    pub body: String,
+    pub entities: Vec<crate::core_link::Entity>,
+    pub reactions: Vec<crate::model::msg::Reaction>,
+    pub file: Option<crate::model::msg::FileRef>,
+}
+
+#[cfg(test)]
+impl FeedBody {
+    /// Короткий конструктор для тестов группировки.
+    pub(crate) fn test(id: MsgId, body: &str) -> Self {
+        Self {
+            id,
+            body: body.to_owned(),
+            entities: Vec::new(),
+            reactions: Vec::new(),
+            file: None,
+        }
+    }
+}
+
 /// Элемент ленты после группировки. Подписи («Сегодня», время) — забота UI.
 #[derive(Clone, Debug, PartialEq)]
 pub enum FeedItem {
@@ -26,13 +51,8 @@ pub enum FeedItem {
         author: Option<Cid>,
         name: String,
         ts_ms: i64,
-        /// Тела сообщений группы с разметкой (S14).
-        bodies: Vec<(
-            MsgId,
-            String,
-            Vec<crate::core_link::Entity>,
-            Vec<crate::model::msg::Reaction>,
-        )>,
+        /// Тела сообщений группы.
+        bodies: Vec<FeedBody>,
         /// Статус отправки — у моей группы, по последнему сообщению.
         send: SendState,
     },
@@ -86,12 +106,13 @@ pub fn group(msgs: &[Msg], day_of: impl Fn(i64) -> i64) -> Vec<FeedItem> {
                 if continue_group {
                     let acc = group.as_mut().expect("группа существует");
                     acc.last_ts = msg.ts_ms;
-                    acc.bodies.push((
-                        msg.id,
-                        msg.body.clone(),
-                        msg.entities.clone(),
-                        msg.reactions.clone(),
-                    ));
+                    acc.bodies.push(FeedBody {
+                        id: msg.id,
+                        body: msg.body.clone(),
+                        entities: msg.entities.clone(),
+                        reactions: msg.reactions.clone(),
+                        file: msg.file.clone(),
+                    });
                     if mine {
                         acc.last_send = msg.send.clone();
                     }
@@ -108,12 +129,13 @@ pub fn group(msgs: &[Msg], day_of: impl Fn(i64) -> i64) -> Vec<FeedItem> {
                         name: String::new(),
                         first: msg,
                         last_ts: msg.ts_ms,
-                        bodies: vec![(
-                            msg.id,
-                            msg.body.clone(),
-                            msg.entities.clone(),
-                            msg.reactions.clone(),
-                        )],
+                        bodies: vec![FeedBody {
+                            id: msg.id,
+                            body: msg.body.clone(),
+                            entities: msg.entities.clone(),
+                            reactions: msg.reactions.clone(),
+                            file: msg.file.clone(),
+                        }],
                         last_send: msg.send.clone(),
                     });
                 }
@@ -133,12 +155,7 @@ struct GroupAcc<'a> {
     name: String,
     first: &'a Msg,
     last_ts: i64,
-    bodies: Vec<(
-        MsgId,
-        String,
-        Vec<crate::core_link::Entity>,
-        Vec<crate::model::msg::Reaction>,
-    )>,
+    bodies: Vec<FeedBody>,
     last_send: SendState,
 }
 
@@ -231,7 +248,7 @@ mod tests {
                     author: Some(Cid(1)),
                     name: String::new(),
                     ts_ms: 0,
-                    bodies: vec![(MsgId(1), "раз".into(), Vec::new(), Vec::new())],
+                    bodies: vec![FeedBody::test(MsgId(1), "раз")],
                     send: SendState::Sent,
                 },
                 FeedItem::Sys {
@@ -242,7 +259,7 @@ mod tests {
                     author: Some(Cid(1)),
                     name: String::new(),
                     ts_ms: 2,
-                    bodies: vec![(MsgId(2), "два".into(), Vec::new(), Vec::new())],
+                    bodies: vec![FeedBody::test(MsgId(2), "два")],
                     send: SendState::Sent,
                 },
             ]

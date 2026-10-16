@@ -221,7 +221,9 @@ pub fn message_group(
     let mut pending: Option<iced::widget::Column<'static, Message>> = None;
     let count = bodies.len();
 
-    for (index, (msg_id, body, entities, reactions)) in bodies.iter().enumerate() {
+    for (index, body) in bodies.iter().enumerate() {
+        let (msg_id, body, entities, reactions) =
+            (&body.id, &body.body, &body.entities, &body.reactions);
         let last = index + 1 == count;
         // ПКМ по строке тела — меню сообщения (закрепить/открепить, S12);
         // в слитом пузыре каждая строка адресует своё сообщение. Клик по
@@ -313,7 +315,8 @@ pub fn compact_group(
         );
     }
     let indent = if *mine { 16.0 } else { 0.0 };
-    for (msg_id, body, entities, reactions) in bodies {
+    for b in bodies {
+        let (msg_id, body, entities, reactions) = (&b.id, &b.body, &b.entities, &b.reactions);
         // ПКМ по строке — меню сообщения (закрепить/открепить, S12);
         // клик по спойлеру раскрывает (S14).
         let mut area = mouse_area(rich_body(body, entities, revealed.contains(msg_id), scale))
