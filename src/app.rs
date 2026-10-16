@@ -81,13 +81,21 @@ fn boot<L: CoreLink>(link: Arc<L>) -> (App<L>, Task<Message>) {
 }
 
 /// Постоянный поток событий ядра + клавиатура (Esc закрывает оверлей)
-/// + фокус окна (открытый в фокусе чат не уведомляет, GUI_UI.md §4).
+/// + фокус окна (открытый в фокусе чат не уведомляет, GUI_UI.md §4)
+/// + тик таймера разговора (S7) — только пока звонок активен.
 fn subscription<L: CoreLink>(state: &App<L>) -> Subscription<Message> {
-    Subscription::batch([
+    let mut subs = vec![
         Subscription::run_with(Arc::clone(&state.link), events_subscription),
         esc_subscription(),
         focus_subscription(),
-    ])
+    ];
+    if state.call_active() {
+        subs.push(
+            iced::time::every(std::time::Duration::from_secs(1))
+                .map(|_| Message::Call(ui::CallIn::Tick)),
+        );
+    }
+    Subscription::batch(subs)
 }
 
 fn events_subscription<L: CoreLink>(link: &Arc<L>) -> impl iced::futures::Stream<Item = Message> {
