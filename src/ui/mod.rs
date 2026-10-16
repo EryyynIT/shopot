@@ -1459,4 +1459,131 @@ mod tests {
         assert_eq!(chat_index(&Code::Digit0), None, "Ctrl+0 не назначен");
         assert_eq!(chat_index(&Code::KeyA), None);
     }
+
+    // ---------- render-тесты: view() в headless-дерево ----------
+    //
+    // Покрывают состояния, которые эмулятор ввести не умеет (Ctrl+F,
+    // скролл ленты): состояние собирается через update() и Store
+    // напрямую, затем проверяется точный текст виджетов. Без рантайма.
+
+    /// view() состояния в дерево виджетов; find ищет точный текст.
+    fn render<L: CoreLink>(state: &State<L>) -> iced_test::Simulator<'_, Message> {
+        iced_test::simulator(view(state))
+    }
+
+    fn history_record(id: u8, ts_ms: i64, text: &str) -> crate::core_link::HistoryMsg {
+        crate::core_link::HistoryMsg {
+            mine: false,
+            delivered: false,
+            msg_id: crate::model::msg::CoreMsgId([id; 16]),
+            ts_ms,
+            text: text.to_owned(),
+        }
+    }
+
+    /// Панель Ctrl+F: заголовок и подсказка на пустом запросе, честный
+    /// «пусто» на промахе. Панель рендерится только открытой.
+    #[test]
+    fn search_panel_renders_hint_and_empty_state() {
+        let mut state = state();
+        state.store.replace_contacts(vec![contact(1, "Аня")]);
+        state.store.select(Some(Cid(1)));
+        let _ = update(&mut state, Message::Chat(ChatIn::SearchOpen));
+
+        {
+            let mut ui = render(&state);
+            assert!(ui.find("Поиск по чату").is_ok(), "заголовок панели");
+            assert!(
+                ui.find("Поиск ищет по загруженным сообщениям этого чата.")
+                    .is_ok(),
+                "подсказка на пустом запросе"
+            );
+        }
+
+        let _ = update(
+            &mut state,
+            Message::Chat(ChatIn::SearchInput("неттакого".into())),
+        );
+        let mut ui = render(&state);
+        assert!(ui.find("Ничего не найдено.").is_ok(), "промах честно пуст");
+    }
+
+    /// Хвост панели: показаны первые 50 совпадений, остаток — строкой.
+    #[test]
+    fn search_results_capped_with_tail_line() {
+        let mut state = state();
+        state.store.replace_contacts(vec![contact(1, "Аня")]);
+        let records: Vec<crate::core_link::HistoryMsg> = (1..=60u8)
+            .map(|i| {
+                history_record(
+                    i,
+                    1_000 + i64::from(i) * 1_000,
+                    &format!("заметка {i} про хвост"),
+                )
+            })
+            .collect();
+        state.store.load_history(Cid(1), 60, &records);
+        state.store.select(Some(Cid(1)));
+        let _ = update(&mut state, Message::Chat(ChatIn::SearchOpen));
+        let _ = update(
+            &mut state,
+            Message::Chat(ChatIn::SearchInput("хвост".into())),
+        );
+
+        let mut ui = render(&state);
+        assert!(ui.find("и ещё 10").is_ok(), "60 минус 50 показанных");
+        assert!(
+            ui.find("заметка 7 про хвост").is_ok(),
+            "строка совпадения видна"
+        );
+    }
+
+    /// Статусы отправки рендерятся честно (GUI_STYLE.md §2): разрывы
+    /// длиннее пяти минут дают каждому сообщению свою группу, у каждой
+    /// свой статус в подвале.
+    #[test]
+    fn feed_renders_honest_send_states() {
+        let mut state = state();
+        state.store.replace_contacts(vec![contact(1, "Аня")]);
+        let _ = state.store.push_outgoing(Cid(1), 1_000, "уходит сейчас".into());
+        let queued = state.store.push_outgoing(Cid(1), 6_000_000, "ждёт очереди".into());
+        let delivered = state.store.push_outgoing(Cid(1), 12_000_000, "уехало".into());
+        let failed = state.store.push_outgoing(Cid(1), 18_000_000, "не проехало".into());
+        state.store.mark_queued(Cid(1), queued);
+        state
+            .store
+            .mark_failed(Cid(1), failed, "ядро недоступно".to_owned());
+        let core_id = crate::model::msg::CoreMsgId([7; 16]);
+        state.store.mark_sent_core(Cid(1), delivered, core_id);
+        state.store.mark_delivered(Cid(1), core_id);
+        state.store.select(Some(Cid(1)));
+
+        let mut ui = render(&state);
+        assert!(ui.find("отправляю").is_ok(), "Sending рендерится");
+        assert!(ui.find("отправится позже").is_ok(), "Queued рендерится");
+        assert!(ui.find("доставлено").is_ok(), "Delivered рендерится");
+        assert!(
+            ui.find("не ушло: ядро недоступно").is_ok(),
+            "Failed рендерится с причиной"
+        );
+    }
+
+    /// Разделитель дня и служебные строки ядра видны в ленте.
+    #[test]
+    fn feed_renders_day_separator_and_sys_lines() {
+        let mut state = state();
+        state.store.replace_contacts(vec![contact(1, "Аня")]);
+        let now = now_ms();
+        state.store.push_sys(Cid(1), now, "сессия установлена".to_owned());
+        let _ = state.store.push_outgoing(Cid(1), now, "привет".into());
+        state.store.select(Some(Cid(1)));
+
+        let mut ui = render(&state);
+        assert!(ui.find("Сегодня").is_ok(), "разделитель дня");
+        assert!(
+            ui.find("сессия установлена").is_ok(),
+            "служебная строка ядра"
+        );
+        assert!(ui.find("привет").is_ok(), "пузырь сообщения");
+    }
 }
