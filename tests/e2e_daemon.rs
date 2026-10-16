@@ -1051,3 +1051,252 @@ async fn pins_survive_daemon_restart() {
     let reply = CoreLink::execute(&*link_a, Request::PinnedMessages { cid: cid_a }).await;
     assert_eq!(reply, Ok(OkReply::PinnedMessages { ids: vec![] }));
 }
+
+/// Визитки и удаление чата (S13, API 2.2+): A знакомится с B и C,
+/// шлёт B свою визитку и визитку C (события CONTACT_CARD у B), затем
+/// удаляет чат с B — контакт, история и закреп исчезают и не
+/// воскресают после рестарта демона (§4.8). У B своя копия остаётся.
+#[tokio::test]
+async fn cards_and_chat_delete_two_daemons() {
+    if std::env::var("SHOPOT_BIN").is_err() {
+        eprintln!("SHOPOT_BIN не задан — e2e против демона пропущен");
+        return;
+    }
+
+    let mut a = spawn_daemon("ca");
+    let b = spawn_daemon("cb");
+    let c = spawn_daemon("cc");
+    let sock_a = wait_socket(&a.1).await;
+    let sock_b = wait_socket(&b.1).await;
+    let sock_c = wait_socket(&c.1).await;
+    let link_a = std::sync::Arc::new(UdsLink::with_config(
+        sock_a,
+        Duration::from_millis(100),
+        false,
+    ));
+    let link_b = std::sync::Arc::new(UdsLink::with_config(
+        sock_b,
+        Duration::from_millis(100),
+        false,
+    ));
+    let link_c = std::sync::Arc::new(UdsLink::with_config(
+        sock_c,
+        Duration::from_millis(100),
+        false,
+    ));
+    let mut events_a = Box::pin(CoreLink::events(std::sync::Arc::clone(&link_a)));
+    let mut events_b = Box::pin(CoreLink::events(std::sync::Arc::clone(&link_b)));
+    let mut events_c = Box::pin(CoreLink::events(std::sync::Arc::clone(&link_c)));
+    for events in [&mut events_a, &mut events_b, &mut events_c] {
+        wait_event(events, Duration::from_secs(10), |e| {
+            matches!(e, LinkEvent::Resync)
+        })
+        .await;
+    }
+
+    // Гейт: визитки и удаление — API 2.2; моложе — тест не о чём говорить.
+    let reply = CoreLink::execute(&*link_a, Request::Version).await;
+    let Ok(OkReply::Version { major, minor, .. }) = reply else {
+        panic!("GET_VERSION не удался: {reply:?}")
+    };
+    if (major, minor) < (2, 2) {
+        eprintln!("ядро {major}.{minor} < 2.2 — визитки/удаление не поддержаны, пропуск");
+        return;
+    }
+
+    // Знакомство A↔B и A↔C по LAN-кодам, по очереди.
+    let mut cid_at_a = Vec::new();
+    let mut cid_of_a_at = Vec::new();
+    for (link_peer, events_peer) in [(&link_b, &mut events_b), (&link_c, &mut events_c)] {
+        let code = match execute_retry(
+            &link_a,
+            Request::Invite {
+                relay: false,
+                addr: String::new(),
+            },
+        )
+        .await
+        {
+            Ok(OkReply::Code(code)) => code,
+            other => panic!("CREATE_INVITE не удался: {other:?}"),
+        };
+        let cid_peer = match execute_retry(link_peer, Request::Add { code }).await {
+            Ok(OkReply::Added { cid }) => cid,
+            other => panic!("ACCEPT_INVITE не удался: {other:?}"),
+        };
+        let joined = wait_event(&mut events_a, Duration::from_secs(20), |e| {
+            matches!(e, LinkEvent::ContactJoined { .. })
+        })
+        .await;
+        let LinkEvent::ContactJoined { cid, .. } = joined else {
+            unreachable!()
+        };
+        cid_at_a.push(cid);
+        cid_of_a_at.push(cid_peer);
+        wait_event(events_peer, Duration::from_secs(20), |e| {
+            matches!(e, LinkEvent::Presence { online: true, .. })
+        })
+        .await;
+    }
+    let (cid_b, cid_c) = (cid_at_a[0], cid_at_a[1]);
+    let cid_a_at_b = cid_of_a_at[0];
+
+    // A шлёт B свою визитку (contact = None). Имя в карточке — имя
+    // профиля A; оно не задано (SET_NAME не вызывался), поэтому пусто —
+    // квирк ядра: «shopot» у B — дефолт инвайта, а не профиль.
+    let reply = execute_retry(
+        &link_a,
+        Request::SendContact {
+            to: cid_b,
+            contact: None,
+        },
+    )
+    .await;
+    assert_eq!(reply, Ok(OkReply::Done), "SEND_CONTACT своей: {reply:?}");
+    let card = wait_event(&mut events_b, Duration::from_secs(20), |e| {
+        matches!(e, LinkEvent::ContactCard { .. })
+    })
+    .await;
+    let LinkEvent::ContactCard {
+        cid: card_from,
+        name: card_name,
+        bundle: bundle_a,
+        ..
+    } = card
+    else {
+        unreachable!()
+    };
+    assert_eq!(card_from, cid_a_at_b, "cid события — отправитель визитки");
+    assert!(
+        card_name.is_empty() || card_name == "shopot",
+        "имя профиля не задано: пусто (83ea91e) или дефолт ядра: {card_name:?}"
+    );
+
+    // A пересылает B визитку C: другой человек — другой bundle.
+    let reply = execute_retry(
+        &link_a,
+        Request::SendContact {
+            to: cid_b,
+            contact: Some(cid_c),
+        },
+    )
+    .await;
+    assert_eq!(reply, Ok(OkReply::Done), "SEND_CONTACT чужой: {reply:?}");
+    let card = wait_event(&mut events_b, Duration::from_secs(20), |e| {
+        matches!(e, LinkEvent::ContactCard { .. })
+    })
+    .await;
+    let LinkEvent::ContactCard {
+        cid: card_from,
+        bundle: bundle_c,
+        ..
+    } = card
+    else {
+        unreachable!()
+    };
+    assert_eq!(card_from, cid_a_at_b);
+    assert_ne!(bundle_c, bundle_a, "визитка C — не визитка A");
+
+    // Ошибки честные: неизвестный получатель и неизвестная карточка.
+    let reply = CoreLink::execute(
+        &*link_a,
+        Request::SendContact {
+            to: shopot_gui::model::cid::Cid(99),
+            contact: None,
+        },
+    )
+    .await;
+    assert_eq!(reply, Err(LinkError::Kernel(Status::NoContact)));
+
+    // A закрепляет чат с B, затем удаляет его: у ядра чистятся история,
+    // закреп и сам контакт (§4.8).
+    let reply = CoreLink::execute(&*link_a, Request::PinChat { cid: cid_b }).await;
+    assert_eq!(reply, Ok(OkReply::Done), "PIN_CHAT: {reply:?}");
+    let reply = CoreLink::execute(&*link_a, Request::DeleteChat { cid: cid_b }).await;
+    assert_eq!(reply, Ok(OkReply::Done), "DELETE_CHAT: {reply:?}");
+
+    let reply = execute_retry(&link_a, Request::Contacts).await;
+    let Ok(OkReply::Contacts(contacts_a)) = reply else {
+        panic!("LIST_CONTACTS у A: {reply:?}")
+    };
+    assert!(
+        contacts_a.iter().all(|x| x.cid != cid_b),
+        "удалённый контакт не возвращается: {contacts_a:?}"
+    );
+    assert!(
+        contacts_a.iter().any(|x| x.cid == cid_c),
+        "чат с C не пострадал"
+    );
+    let reply = CoreLink::execute(&*link_a, Request::PinnedChat).await;
+    assert_eq!(
+        reply,
+        Ok(OkReply::PinnedChat { cid: None }),
+        "закреп удалённого чата сброшен"
+    );
+    let reply = CoreLink::execute(
+        &*link_a,
+        Request::History {
+            cid: cid_b,
+            limit: 0,
+        },
+    )
+    .await;
+    assert_eq!(
+        reply,
+        Err(LinkError::Kernel(Status::NoContact)),
+        "история удалённого недоступна: {reply:?}"
+    );
+    let reply = CoreLink::execute(
+        &*link_a,
+        Request::SendMsg {
+            cid: cid_b,
+            text: "уже некому".into(),
+        },
+    )
+    .await;
+    assert_eq!(reply, Err(LinkError::Kernel(Status::NoContact)));
+
+    // У B своя копия осталась: удаление — локальное действие A.
+    let reply = execute_retry(&link_b, Request::Contacts).await;
+    let Ok(OkReply::Contacts(contacts_b)) = reply else {
+        panic!("LIST_CONTACTS у B: {reply:?}")
+    };
+    assert!(
+        contacts_b.iter().any(|x| x.cid == cid_a_at_b),
+        "у B контакт с A на месте"
+    );
+
+    // Рестарт демона A: удаление переживает рестарт (слот-надгробие).
+    drop(events_a);
+    drop(link_a);
+    a.0.kill().expect("демон убит");
+    let _ = a.0.wait();
+    let bin = std::env::var("SHOPOT_BIN").expect("SHOPOT_BIN задан");
+    a.0 = Command::new(&bin)
+        .arg("serve")
+        .env("HOME", &a.1)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("демон перезапущен");
+    let sock_a = wait_socket(&a.1).await;
+    let link_a = std::sync::Arc::new(UdsLink::with_config(
+        sock_a,
+        Duration::from_millis(100),
+        false,
+    ));
+    let mut events_a = Box::pin(CoreLink::events(std::sync::Arc::clone(&link_a)));
+    wait_event(&mut events_a, Duration::from_secs(10), |e| {
+        matches!(e, LinkEvent::Resync)
+    })
+    .await;
+    let reply = execute_retry(&link_a, Request::Contacts).await;
+    let Ok(OkReply::Contacts(contacts_a)) = reply else {
+        panic!("LIST_CONTACTS после рестарта: {reply:?}")
+    };
+    assert!(
+        contacts_a.iter().all(|x| x.cid != cid_b),
+        "удалённый не воскрес после рестарта: {contacts_a:?}"
+    );
+    assert!(contacts_a.iter().any(|x| x.cid == cid_c));
+}
