@@ -429,6 +429,23 @@ pub mod put {
         out.extend_from_slice(bytes);
         Ok(())
     }
+
+    /// bytes16: `[len u16][байты]` — бинарный аналог str16 (аватарки в
+    /// событиях, §4.4).
+    pub fn bytes16(out: &mut Vec<u8>, bytes: &[u8]) -> Result<(), super::Bad> {
+        if bytes.len() > u16::MAX as usize {
+            return Err(super::Bad);
+        }
+        super::put::u16(out, bytes.len() as u16);
+        out.extend_from_slice(bytes);
+        Ok(())
+    }
+
+    /// str32: `[len u32][байты]` — большие бинарные (SET_AVATAR, §4.4).
+    pub fn bytes32(out: &mut Vec<u8>, bytes: &[u8]) {
+        super::put::u32(out, bytes.len() as u32);
+        out.extend_from_slice(bytes);
+    }
 }
 
 #[cfg(test)]

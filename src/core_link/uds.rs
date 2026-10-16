@@ -382,6 +382,16 @@ fn encode_request(request: &Request, api2: bool) -> (Method, Vec<u8>) {
             api::put::str16(&mut payload, addr).expect("адрес короче 65535");
             Method::CreateInvite
         }
+        // SET_AVATAR (§4.4): [data str32] — байты картинки как есть.
+        Request::SetAvatar { data } => {
+            api::put::bytes32(&mut payload, data);
+            Method::SetAvatar
+        }
+        // GET_AVATAR_ID (§4.4): [cid u32].
+        Request::GetAvatarId { cid } => {
+            api::put::u32(&mut payload, cid.0 as u32);
+            Method::GetAvatarId
+        }
         // SEND_FILE (§4.5): [cid u32][path str16] — путь читает демон.
         Request::SendFile { cid, path } => {
             api::put::u32(&mut payload, cid.0 as u32);
@@ -612,6 +622,27 @@ fn decode_reply(method: Method, raw: RawReply, api2: bool) -> Reply {
                     .map_err(|_| LinkError::BadFrame("call_id"))?,
             );
             OkReply::CallStarted { call_id }
+        }
+        // SET_AVATAR (§4.4): [avatar_id 16][size u32].
+        Method::SetAvatar => {
+            let mut r = api::Reader::new(&raw.payload);
+            let mut avatar_id = [0u8; 16];
+            avatar_id.copy_from_slice(
+                r.read_bytes(16)
+                    .map_err(|_| LinkError::BadFrame("avatar_id"))?,
+            );
+            let size = r.read_u32().map_err(|_| LinkError::BadFrame("size"))?;
+            OkReply::AvatarSet { avatar_id, size }
+        }
+        // GET_AVATAR_ID (§4.4): [avatar_id 16], нули — аватарки нет.
+        Method::GetAvatarId => {
+            let mut r = api::Reader::new(&raw.payload);
+            let mut avatar_id = [0u8; 16];
+            avatar_id.copy_from_slice(
+                r.read_bytes(16)
+                    .map_err(|_| LinkError::BadFrame("avatar_id"))?,
+            );
+            OkReply::AvatarId(avatar_id)
         }
         // SEND_FILE (§4.5): [file_id 16][size u32][chunks u32].
         Method::SendFile => {
@@ -918,7 +949,18 @@ fn decode_event(header: &Header, payload: &[u8]) -> Option<LinkEvent> {
                 file_id,
             })
         }
-        api::Event::AvatarReceived => None,
+        // AVATAR_RECEIVED (6, §4.4): [cid u32][avatar_id 16][data str16].
+        api::Event::AvatarReceived => {
+            let cid = r.read_u32().ok()?;
+            let mut avatar_id = [0u8; 16];
+            avatar_id.copy_from_slice(r.read_bytes(16).ok()?);
+            let data = r.read_str16().ok()?.to_vec();
+            Some(LinkEvent::AvatarReceived {
+                cid: Cid(i64::from(cid)),
+                avatar_id,
+                data,
+            })
+        }
     }
 }
 
@@ -2331,6 +2373,77 @@ mod tests {
             Some(LinkEvent::FileSent {
                 cid: Cid(7),
                 file_id: [0xF1; 16],
+            })
+        );
+    }
+
+    /// S8б: SET_AVATAR/GET_AVATAR_ID — кадры и ответы; AVATAR_RECEIVED.
+    #[test]
+    fn avatar_wire_roundtrip() {
+        let (method, payload) = encode_request(
+            &Request::SetAvatar {
+                data: vec![0x89, 0x50, 0x4E, 0x47],
+            },
+            true,
+        );
+        assert_eq!(method, Method::SetAvatar);
+        let mut r = api::Reader::new(&payload);
+        assert_eq!(r.read_u32(), Ok(4)); // bytes32: длина
+        assert_eq!(r.read_bytes(4), Ok(&[0x89, 0x50, 0x4E, 0x47][..]));
+
+        let (method, payload) = encode_request(&Request::GetAvatarId { cid: Cid(7) }, true);
+        assert_eq!(method, Method::GetAvatarId);
+        assert_eq!(payload, 7u32.to_le_bytes());
+
+        // Ответ SET_AVATAR: [avatar_id 16][size u32].
+        let mut raw = Vec::new();
+        raw.extend_from_slice(&[0xA1; 16]);
+        api::put::u32(&mut raw, 105);
+        let reply = decode_reply(
+            Method::SetAvatar,
+            RawReply {
+                status: Status::Ok,
+                payload: raw,
+            },
+            true,
+        );
+        assert_eq!(
+            reply,
+            Ok(OkReply::AvatarSet {
+                avatar_id: [0xA1; 16],
+                size: 105,
+            })
+        );
+
+        // Ответ GET_AVATAR_ID: нули — нет аватарки.
+        let reply = decode_reply(
+            Method::GetAvatarId,
+            RawReply {
+                status: Status::Ok,
+                payload: [0; 16].to_vec(),
+            },
+            true,
+        );
+        assert_eq!(reply, Ok(OkReply::AvatarId([0; 16])));
+
+        // AVATAR_RECEIVED: [cid u32][avatar_id 16][data str16].
+        let mut payload = Vec::new();
+        api::put::u32(&mut payload, 7);
+        payload.extend_from_slice(&[0xA1; 16]);
+        api::put::bytes16(&mut payload, &[1, 2, 3]).expect("bytes16");
+        let header = Header {
+            kind: Kind::Event,
+            id: api::Event::AvatarReceived as u16,
+            request_id: 0,
+            status: Status::Ok,
+            payload_len: payload.len() as u32,
+        };
+        assert_eq!(
+            decode_event(&header, &payload),
+            Some(LinkEvent::AvatarReceived {
+                cid: Cid(7),
+                avatar_id: [0xA1; 16],
+                data: vec![1, 2, 3],
             })
         );
     }

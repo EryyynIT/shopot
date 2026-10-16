@@ -65,6 +65,14 @@ pub enum Request {
     /// локальной сети (ядро ждёт LAN-анонс); с адресом — ядро дозванивается
     /// сразу; relay — адрес трактуется как релей, peer IP не видит.
     Invite { relay: bool, addr: String },
+    /// Своя аватарка (SET_AVATAR, §4.4): байты картинки как есть,
+    /// 1..=16000 Б. Ответ — avatar_id (SHA-256[0..16], content
+    /// addressing) и размер.
+    SetAvatar { data: Vec<u8> },
+    /// avatar_id контакта (GET_AVATAR_ID, §4.4): нули — аватарки нет.
+    /// Байты приходят сами событием AVATAR_RECEIVED (ядро запрашивает
+    /// их у пира при рассинхроне и лечится на переподключении).
+    GetAvatarId { cid: Cid },
     /// Отправить файл (SEND_FILE, §4.5): путь в ФС пользователя демона
     /// (демон тот же хост — читает сам). Имя — basename, ≤ 64 байт;
     /// лимит 64 МБ. Офлайн — не ошибка: outbox, уйдёт с сессией.
@@ -359,6 +367,10 @@ pub enum OkReply {
     Added { cid: Cid },
     /// CREATE_INVITE: односторонний инвайт-код.
     Code(String),
+    /// SET_AVATAR принят: avatar_id (content addressing) + размер.
+    AvatarSet { avatar_id: [u8; 16], size: u32 },
+    /// GET_AVATAR_ID: нули — аватарки у контакта нет.
+    AvatarId([u8; 16]),
     /// SEND_FILE принят: file_id = SHA-256[0..16], size/chunks —
     /// раскладка передачи. Доставка подтверждается событием FILE_SENT.
     FileQueued {
@@ -456,6 +468,13 @@ pub enum LinkEvent {
         name: String,
         bundle: [u8; 64],
         addr: String,
+    },
+    /// Аватарка контакта (AVATAR_RECEIVED, §4.4): ядро само запросило
+    /// байты у пира; кэшируем по avatar_id. cid 0 — наша (эхо PROFILE).
+    AvatarReceived {
+        cid: Cid,
+        avatar_id: [u8; 16],
+        data: Vec<u8>,
     },
     /// Входящий файл (FILE_RECEIVED, §4.5): ядро уже проверило хэш и
     /// сохранило в ~/.shopot/files/<hex file_id> (0600).

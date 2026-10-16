@@ -142,6 +142,16 @@ impl Scene {
                         name: "макет.pdf".into(),
                     },
                 ),
+                // Аватарка Ани (S8б): ядро «дотащило» байты у пира —
+                // кружок в сайдбаре и шапке чата на скриншоте демо.
+                (
+                    Duration::from_millis(900),
+                    LinkEvent::AvatarReceived {
+                        cid: Cid(1),
+                        avatar_id: [0xA1; 16],
+                        data: include_bytes!("demo_avatar.png").to_vec(),
+                    },
+                ),
                 // Реакция собеседника (S15): 👍 на размеченное сообщение —
                 // скриншот демо показывает пилюлю под пузырём.
                 (
@@ -264,6 +274,8 @@ struct State {
     pinned_msgs: HashMap<Cid, Vec<CoreMsgId>>,
     /// Текущий звонок (§4.6: одна линия на демон).
     call: Option<MockCall>,
+    /// avatar_id по cid (0 — своя); байты отдаются событием (S8б).
+    avatar_ids: HashMap<u32, [u8; 16]>,
 }
 
 struct MockCall {
@@ -322,6 +334,7 @@ impl MockLink {
                     pinned_chat: None,
                     pinned_msgs: HashMap::new(),
                     call: None,
+                    avatar_ids: HashMap::new(),
                 }),
                 tx,
                 rx: Mutex::new(Some(rx)),
@@ -486,6 +499,37 @@ impl MockLink {
                 };
                 let head = if relay { "shopot1r." } else { "shopot1." };
                 Ok(OkReply::Code(format!("{head}{code}@{host}")))
+            }
+            // Семантика ядра (§4.4): 1..=16000 Б, id — content
+            // addressing (заглушка — синтетический, как msg_id).
+            Request::SetAvatar { data } => {
+                if data.is_empty() {
+                    return Err(LinkError::Kernel(Status::BadArgs));
+                }
+                if data.len() > 16000 {
+                    return Err(LinkError::Kernel(Status::TooBig));
+                }
+                let avatar_id = core_id(0xA000 + inner.msg_seq.fetch_add(1, Ordering::Relaxed)).0;
+                inner
+                    .state
+                    .lock()
+                    .expect("стейт не отравлен")
+                    .avatar_ids
+                    .insert(0, avatar_id); // своя
+                Ok(OkReply::AvatarSet {
+                    avatar_id,
+                    size: data.len() as u32,
+                })
+            }
+            // GET_AVATAR_ID: известный id или нули (нет аватарки).
+            Request::GetAvatarId { cid } => {
+                let state = inner.state.lock().expect("стейт не отравлен");
+                let id = state
+                    .avatar_ids
+                    .get(&(cid.0 as u32))
+                    .copied()
+                    .unwrap_or([0; 16]);
+                Ok(OkReply::AvatarId(id))
             }
             // Семантика ядра (§4.5): путь читается с диска, лимит 64 МБ,
             // basename ≤ 64 байт; контакт онлайн — через паузу событие
@@ -1573,5 +1617,36 @@ mod tests {
             .await;
         assert_eq!(reply, Err(LinkError::Kernel(Status::NoContact)));
         std::fs::remove_file(&tmp).ok();
+    }
+
+    /// S8б: SET_AVATAR в заглушке — лимит 16000 Б, пустая — BAD_ARGS;
+    /// GET_AVATAR_ID: своя после Set, чужая неизвестная — нули.
+    #[tokio::test(start_paused = true)]
+    async fn avatar_mock_semantics() {
+        let link = MockLink::new(scene());
+        let reply = link
+            .execute(Request::SetAvatar {
+                data: vec![0x89; 100],
+            })
+            .await;
+        let Ok(OkReply::AvatarSet { avatar_id, size }) = reply else {
+            panic!("ожидали AvatarSet: {reply:?}")
+        };
+        assert_eq!(size, 100);
+        assert_ne!(avatar_id, [0; 16]);
+
+        let reply = link.execute(Request::GetAvatarId { cid: Cid(0) }).await;
+        assert_eq!(reply, Ok(OkReply::AvatarId(avatar_id)));
+        let reply = link.execute(Request::GetAvatarId { cid: Cid(1) }).await;
+        assert_eq!(reply, Ok(OkReply::AvatarId([0; 16])));
+
+        let reply = link.execute(Request::SetAvatar { data: vec![] }).await;
+        assert_eq!(reply, Err(LinkError::Kernel(Status::BadArgs)));
+        let reply = link
+            .execute(Request::SetAvatar {
+                data: vec![0x89; 16001],
+            })
+            .await;
+        assert_eq!(reply, Err(LinkError::Kernel(Status::TooBig)));
     }
 }

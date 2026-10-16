@@ -672,6 +672,8 @@ fn on_link<L: CoreLink>(state: &mut State<L>, link: LinkIn) -> Task<Message> {
                 state.store.mark_delivered(cid, msg_id);
                 Task::none()
             }
+            // Склейка: аватарки применит ui-коммит спринта (S8б).
+            LinkEvent::AvatarReceived { .. } => Task::none(),
             // Входящий файл (S10): ядро сохранил в ~/.shopot/files/<hex>;
             // пузырь с кнопкой открытия, уведомление как у сообщения.
             LinkEvent::FileReceived {
