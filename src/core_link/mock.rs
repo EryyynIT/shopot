@@ -504,10 +504,9 @@ impl MockLink {
             // Семантика ядра (§4.4): 1..=16000 Б, id — content
             // addressing (заглушка — синтетический, как msg_id).
             Request::SetAvatar { data } => {
-                if data.is_empty() {
-                    return Err(LinkError::Kernel(Status::BadArgs));
-                }
-                if data.len() > 16000 {
+                // Ядро отвечает одним кодом на обе рамки размера
+                // (проверено e2e): пустая и >16000 — TooBig.
+                if data.is_empty() || data.len() > 16000 {
                     return Err(LinkError::Kernel(Status::TooBig));
                 }
                 let avatar_id = core_id(0xA000 + inner.msg_seq.fetch_add(1, Ordering::Relaxed)).0;
@@ -1642,7 +1641,7 @@ mod tests {
         assert_eq!(reply, Ok(OkReply::AvatarId([0; 16])));
 
         let reply = link.execute(Request::SetAvatar { data: vec![] }).await;
-        assert_eq!(reply, Err(LinkError::Kernel(Status::BadArgs)));
+        assert_eq!(reply, Err(LinkError::Kernel(Status::TooBig)));
         let reply = link
             .execute(Request::SetAvatar {
                 data: vec![0x89; 16001],

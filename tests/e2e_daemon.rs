@@ -1970,3 +1970,119 @@ async fn file_transfer_two_daemons() {
 
     std::fs::remove_file(&src).ok();
 }
+
+/// Два демона: аватарка доезжает (S8б). A ставит фото; B (онлайн)
+/// получает AVATAR_RECEIVED с тем же avatar_id и байтами; GET_AVATAR_ID
+/// у B для A отдаёт тот же id.
+#[tokio::test]
+async fn avatar_two_daemons() {
+    if std::env::var("SHOPOT_BIN").is_err() {
+        eprintln!("SHOPOT_BIN не задан — e2e против демона пропущен");
+        return;
+    }
+
+    let a = spawn_daemon("ava");
+    let b = spawn_daemon("avb");
+    let sock_a = wait_socket(&a.1).await;
+    let sock_b = wait_socket(&b.1).await;
+    let link_a = std::sync::Arc::new(UdsLink::with_config(
+        sock_a,
+        Duration::from_millis(100),
+        false,
+    ));
+    let link_b = std::sync::Arc::new(UdsLink::with_config(
+        sock_b,
+        Duration::from_millis(100),
+        false,
+    ));
+    let mut events_a = Box::pin(CoreLink::events(std::sync::Arc::clone(&link_a)));
+    let mut events_b = Box::pin(CoreLink::events(std::sync::Arc::clone(&link_b)));
+    for events in [&mut events_a, &mut events_b] {
+        wait_event(events, Duration::from_secs(10), |e| {
+            matches!(e, LinkEvent::Resync)
+        })
+        .await;
+    }
+
+    let code = match execute_retry(
+        &link_a,
+        Request::Invite {
+            relay: false,
+            addr: String::new(),
+        },
+    )
+    .await
+    {
+        Ok(OkReply::Code(code)) => code,
+        other => panic!("CREATE_INVITE не удался: {other:?}"),
+    };
+    let cid_a_at_b = match execute_retry(&link_b, Request::Add { code }).await {
+        Ok(OkReply::Added { cid }) => cid,
+        other => panic!("ACCEPT_INVITE не удался: {other:?}"),
+    };
+    let joined = wait_event(&mut events_a, Duration::from_secs(20), |e| {
+        matches!(e, LinkEvent::ContactJoined { .. })
+    })
+    .await;
+    let LinkEvent::ContactJoined { cid: cid_b, .. } = joined else {
+        unreachable!()
+    };
+    for (events, cid) in [(&mut events_a, cid_b), (&mut events_b, cid_a_at_b)] {
+        wait_event(
+            events,
+            Duration::from_secs(20),
+            |e| matches!(e, LinkEvent::Presence { cid: c, online: true, .. } if *c == cid),
+        )
+        .await;
+    }
+
+    // A ставит аватарку (маленький «PNG» — ядро формат не разбирает).
+    let data: Vec<u8> = std::iter::once(vec![0x89, 0x50, 0x4E, 0x47])
+        .chain(std::iter::once(
+            (0..2000u32).map(|i| (i % 251) as u8).collect(),
+        ))
+        .flatten()
+        .collect();
+    let reply = CoreLink::execute(&*link_a, Request::SetAvatar { data: data.clone() }).await;
+    let Ok(OkReply::AvatarSet { avatar_id, size }) = reply else {
+        panic!("SET_AVATAR не удался: {reply:?}")
+    };
+    assert_eq!(size as usize, data.len());
+
+    // B: AVATAR_RECEIVED с теми же id и байтами.
+    let event = wait_event(&mut events_b, Duration::from_secs(30), |e| {
+        matches!(e, LinkEvent::AvatarReceived { .. })
+    })
+    .await;
+    let LinkEvent::AvatarReceived {
+        cid,
+        avatar_id: got_id,
+        data: got_data,
+    } = event
+    else {
+        unreachable!()
+    };
+    assert_eq!(cid, cid_a_at_b);
+    assert_eq!(
+        got_id, avatar_id,
+        "avatar_id — content addressing, совпадает"
+    );
+    assert_eq!(got_data, data, "байты без искажений");
+
+    // GET_AVATAR_ID у B согласован.
+    let reply = CoreLink::execute(&*link_b, Request::GetAvatarId { cid: cid_a_at_b }).await;
+    assert_eq!(reply, Ok(OkReply::AvatarId(avatar_id)));
+
+    // Лимиты: пустая и 16001 Б — обе TOO_BIG (нарушение рамки размера
+    // ядро отвечает одним кодом).
+    let reply = CoreLink::execute(&*link_a, Request::SetAvatar { data: vec![] }).await;
+    assert_eq!(reply, Err(LinkError::Kernel(Status::TooBig)));
+    let reply = CoreLink::execute(
+        &*link_a,
+        Request::SetAvatar {
+            data: vec![0x89; 16001],
+        },
+    )
+    .await;
+    assert_eq!(reply, Err(LinkError::Kernel(Status::TooBig)));
+}
