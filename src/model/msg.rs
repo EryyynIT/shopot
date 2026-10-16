@@ -46,6 +46,16 @@ pub enum Dir {
     Card,
 }
 
+/// Реакция на сообщение (S15): эмодзи, счётчик, моя ли (моя — кликом
+/// снимается). Ядро историю реакций не отдаёт — состояние живёт, пока
+/// жива лента в памяти.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Reaction {
+    pub emoji: char,
+    pub count: u32,
+    pub mine: bool,
+}
+
 /// Честный статус отправки — жизненный цикл моего сообщения
 /// по модели доставки ядра (CORE-API.md §6).
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -69,6 +79,9 @@ pub struct Msg {
     pub body: String,
     /// Разметка тела (S14, API 2.0+): байтовые offset/len в body.
     pub entities: Vec<Entity>,
+    /// Реакции (S15): событийные, в истории ядра их нет — после
+    /// перезапуска пусто (честный предел контракта).
+    pub reactions: Vec<Reaction>,
     pub send: SendState,
     /// msg_id ядра, если известен; по нему приходит MESSAGE_DELIVERED.
     pub core_id: Option<CoreMsgId>,
@@ -89,6 +102,7 @@ impl Msg {
             ts_ms,
             body,
             entities,
+            reactions: Vec::new(),
             send: SendState::Sent,
             core_id,
         }
@@ -101,6 +115,7 @@ impl Msg {
             ts_ms,
             body,
             entities,
+            reactions: Vec::new(),
             send: SendState::Sending,
             core_id: None,
         }
@@ -113,6 +128,7 @@ impl Msg {
             ts_ms,
             body,
             entities: Vec::new(),
+            reactions: Vec::new(),
             send: SendState::Sent,
             core_id: None,
         }
@@ -126,6 +142,7 @@ impl Msg {
             ts_ms,
             body: name,
             entities: Vec::new(),
+            reactions: Vec::new(),
             send: SendState::Sent,
             core_id: None,
         }

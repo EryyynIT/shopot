@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use crate::core_link::{Entity, HistoryMsg};
 use crate::model::cid::Cid;
 use crate::model::feed::{self, FeedItem};
-use crate::model::msg::{CoreMsgId, Dir, Msg, MsgId, SendState};
+use crate::model::msg::{CoreMsgId, Dir, Msg, MsgId, Reaction, SendState};
 use crate::model::settings::Settings;
 
 /// Контакт.
@@ -257,6 +257,54 @@ impl Store {
     }
 
     /// Событие MESSAGE_DELIVERED: пир подтвердил получение по msg_id ядра.
+    /// Применить реакцию к сообщению (S15): mine=false — событие
+    /// REACTION от собеседника, mine=true — свой SET/REMOVE после OK.
+    /// Незнакомый msg_id (сообщение не загружено) — игнор: истории
+    /// реакций у ядра нет, восстанавливать нечего. Возвращает, нашлось
+    /// ли сообщение.
+    pub fn apply_reaction(
+        &mut self,
+        cid: Cid,
+        core_id: CoreMsgId,
+        add: bool,
+        mine: bool,
+        emoji: char,
+    ) -> bool {
+        let Some(thread) = self.threads.get_mut(&cid) else {
+            return false;
+        };
+        let Some(msg) = thread
+            .msgs
+            .iter_mut()
+            .rev()
+            .find(|m| m.core_id == Some(core_id))
+        else {
+            return false;
+        };
+        if add {
+            match msg.reactions.iter_mut().find(|r| r.emoji == emoji) {
+                Some(r) => {
+                    r.count += 1;
+                    r.mine |= mine;
+                }
+                None => msg.reactions.push(Reaction {
+                    emoji,
+                    count: 1,
+                    mine,
+                }),
+            }
+        } else {
+            if let Some(r) = msg.reactions.iter_mut().find(|r| r.emoji == emoji) {
+                r.count = r.count.saturating_sub(1);
+                if mine {
+                    r.mine = false;
+                }
+            }
+            msg.reactions.retain(|r| r.count > 0);
+        }
+        true
+    }
+
     pub fn mark_delivered(&mut self, cid: Cid, core_id: CoreMsgId) {
         let Some(thread) = self.threads.get_mut(&cid) else {
             return;
@@ -992,5 +1040,54 @@ mod tests {
         store.delete_chat(Cid(1));
         store.delete_chat(Cid(99));
         assert_eq!(store.selected(), None);
+    }
+
+    /// Реакции (S15): peer add → счётчик; своя — mine; снятие убывает,
+    /// ноль — строка исчезает; незнакомый msg_id — игнор.
+    #[test]
+    fn reactions_apply_and_fade() {
+        let mut store = Store::new();
+        let cid = Cid(1);
+        store.replace_contacts(vec![contact(1, "Аня", false)]);
+        let core = CoreMsgId([0x77; 16]);
+        store.push_incoming_core(cid, "Аня", core, 1000, "привет".into(), Vec::new());
+
+        // Два события от пира.
+        assert!(store.apply_reaction(cid, core, true, false, '👍'));
+        assert!(store.apply_reaction(cid, core, true, false, '👍'));
+        // Своя поверх.
+        assert!(store.apply_reaction(cid, core, true, true, '👍'));
+        let reactions = &store.thread(cid).expect("чат есть").msgs[0].reactions;
+        assert_eq!(
+            reactions,
+            &[Reaction {
+                emoji: '👍',
+                count: 3,
+                mine: true
+            }]
+        );
+
+        // Снял свою: mine=false, счётчик 2, строка жива.
+        assert!(store.apply_reaction(cid, core, false, true, '👍'));
+        let reactions = &store.thread(cid).expect("чат есть").msgs[0].reactions;
+        assert_eq!(
+            reactions,
+            &[Reaction {
+                emoji: '👍',
+                count: 2,
+                mine: false
+            }]
+        );
+
+        // Пир снял обе: строки нет.
+        assert!(store.apply_reaction(cid, core, false, false, '👍'));
+        assert!(store.apply_reaction(cid, core, false, false, '👍'));
+        assert!(store.thread(cid).expect("чат есть").msgs[0]
+            .reactions
+            .is_empty());
+
+        // Снятие без постановки — не уходит в минус; чужой msg_id — игнор.
+        assert!(store.apply_reaction(cid, core, false, false, '🔥'));
+        assert!(!store.apply_reaction(cid, CoreMsgId([0xEE; 16]), true, false, '🔥'));
     }
 }

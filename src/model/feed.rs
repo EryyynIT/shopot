@@ -27,7 +27,12 @@ pub enum FeedItem {
         name: String,
         ts_ms: i64,
         /// Тела сообщений группы с разметкой (S14).
-        bodies: Vec<(MsgId, String, Vec<crate::core_link::Entity>)>,
+        bodies: Vec<(
+            MsgId,
+            String,
+            Vec<crate::core_link::Entity>,
+            Vec<crate::model::msg::Reaction>,
+        )>,
         /// Статус отправки — у моей группы, по последнему сообщению.
         send: SendState,
     },
@@ -81,8 +86,12 @@ pub fn group(msgs: &[Msg], day_of: impl Fn(i64) -> i64) -> Vec<FeedItem> {
                 if continue_group {
                     let acc = group.as_mut().expect("группа существует");
                     acc.last_ts = msg.ts_ms;
-                    acc.bodies
-                        .push((msg.id, msg.body.clone(), msg.entities.clone()));
+                    acc.bodies.push((
+                        msg.id,
+                        msg.body.clone(),
+                        msg.entities.clone(),
+                        msg.reactions.clone(),
+                    ));
                     if mine {
                         acc.last_send = msg.send.clone();
                     }
@@ -99,7 +108,12 @@ pub fn group(msgs: &[Msg], day_of: impl Fn(i64) -> i64) -> Vec<FeedItem> {
                         name: String::new(),
                         first: msg,
                         last_ts: msg.ts_ms,
-                        bodies: vec![(msg.id, msg.body.clone(), msg.entities.clone())],
+                        bodies: vec![(
+                            msg.id,
+                            msg.body.clone(),
+                            msg.entities.clone(),
+                            msg.reactions.clone(),
+                        )],
                         last_send: msg.send.clone(),
                     });
                 }
@@ -119,7 +133,12 @@ struct GroupAcc<'a> {
     name: String,
     first: &'a Msg,
     last_ts: i64,
-    bodies: Vec<(MsgId, String, Vec<crate::core_link::Entity>)>,
+    bodies: Vec<(
+        MsgId,
+        String,
+        Vec<crate::core_link::Entity>,
+        Vec<crate::model::msg::Reaction>,
+    )>,
     last_send: SendState,
 }
 
@@ -212,7 +231,7 @@ mod tests {
                     author: Some(Cid(1)),
                     name: String::new(),
                     ts_ms: 0,
-                    bodies: vec![(MsgId(1), "раз".into(), Vec::new())],
+                    bodies: vec![(MsgId(1), "раз".into(), Vec::new(), Vec::new())],
                     send: SendState::Sent,
                 },
                 FeedItem::Sys {
@@ -223,7 +242,7 @@ mod tests {
                     author: Some(Cid(1)),
                     name: String::new(),
                     ts_ms: 2,
-                    bodies: vec![(MsgId(2), "два".into(), Vec::new())],
+                    bodies: vec![(MsgId(2), "два".into(), Vec::new(), Vec::new())],
                     send: SendState::Sent,
                 },
             ]
