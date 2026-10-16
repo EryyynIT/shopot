@@ -136,6 +136,11 @@ pub enum ChatIn {
     /// Реакция на сообщение (S15): из меню (ПКМ) или по пилюле под
     /// пузырём. Моя реакция с тем же эмодзи снимается (переключатель).
     React(MsgId, char),
+    /// «📎» в композере — выбрать файл (S10). Диалог нативный,
+    /// асинхронный (xdg-portal): update не ждёт.
+    PickFile,
+    /// Диалог выбора файла закрылся: Some — путь, None — отмена.
+    FilePicked(Option<std::path::PathBuf>),
     /// Клик по ссылке в пузыре — открыть в браузере (S14).
     OpenLink(String),
 }
@@ -667,8 +672,51 @@ fn on_link<L: CoreLink>(state: &mut State<L>, link: LinkIn) -> Task<Message> {
                 state.store.mark_delivered(cid, msg_id);
                 Task::none()
             }
-            // Склейка: файлы войдут в ленту в ui-коммите спринта (S10).
-            LinkEvent::FileReceived { .. } | LinkEvent::FileSent { .. } => Task::none(),
+            // Входящий файл (S10): ядро сохранил в ~/.shopot/files/<hex>;
+            // пузырь с кнопкой открытия, уведомление как у сообщения.
+            LinkEvent::FileReceived {
+                cid,
+                file_id,
+                size,
+                name,
+            } => {
+                let opened = state.store.selected() == Some(cid);
+                let contact_name = state
+                    .store
+                    .contact(cid)
+                    .map(|c| c.name.clone())
+                    .unwrap_or_else(|| cid.0.to_string());
+                state.store.push_incoming_file(
+                    cid,
+                    &contact_name,
+                    now_ms(),
+                    crate::model::msg::FileRef {
+                        name: name.clone(),
+                        size,
+                        file_id,
+                        path: Some(files_path(&file_id)),
+                    },
+                );
+                let mut task = if opened {
+                    scroll_feed(state)
+                } else {
+                    Task::none()
+                };
+                if notify::should_notify(state.store.selected(), state.window_focused, cid) {
+                    task = Task::batch([
+                        task,
+                        notify::os_notify(
+                            contact_name,
+                            format!("📎 {name} · {}", human_size(size)),
+                        ),
+                    ]);
+                }
+                task
+            }
+            LinkEvent::FileSent { cid, file_id } => {
+                state.store.mark_file_sent(cid, file_id);
+                Task::none()
+            }
             // Реакция собеседника (S15): применить к ленте. Своих
             // ядро событием не шлёт — своя применена по ответу (S15).
             LinkEvent::Reaction {
@@ -1025,6 +1073,20 @@ fn on_link<L: CoreLink>(state: &mut State<L>, link: LinkIn) -> Task<Message> {
                 }
                 Task::none()
             }
+            // Файл (S10): ядро приняло — пузырь получает file_id/size
+            // (до FILE_SENT статус остаётся «отправляется»).
+            (Request::SendFile { cid, .. }, Ok(OkReply::FileQueued { file_id, size, .. })) => {
+                if let Some(tag) = tag {
+                    state.store.set_file_meta(cid, tag, file_id, size);
+                }
+                Task::none()
+            }
+            (Request::SendFile { cid, .. }, Err(err)) => {
+                if let Some(tag) = tag {
+                    state.store.mark_failed(cid, tag, err.user_text());
+                }
+                Task::none()
+            }
             // Реакции (S15): своя применяется по OK; ошибка — честная
             // sys-строка в чате (Нет соединения, Контакт не найден…).
             (Request::SetReaction { cid, msg_id, emoji }, Ok(OkReply::Done)) => {
@@ -1137,6 +1199,59 @@ fn on_chat<L: CoreLink>(state: &mut State<L>, chat: ChatIn) -> Task<Message> {
             } else {
                 Task::none()
             }
+        }
+        ChatIn::PickFile => {
+            // Оверлей модален: выбор файла поверх диалога не открываем.
+            if !matches!(state.overlay, Overlay::None) || state.store.selected().is_none() {
+                return Task::none();
+            }
+            Task::perform(
+                async { rfd::AsyncFileDialog::new().pick_file().await },
+                |handle| Message::Chat(ChatIn::FilePicked(handle.map(|h| h.path().to_path_buf()))),
+            )
+        }
+        ChatIn::FilePicked(picked) => {
+            let Some(path) = picked else {
+                return Task::none(); // отмена диалога — молча
+            };
+            let Some(cid) = state.store.selected() else {
+                return Task::none();
+            };
+            let name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let size = std::fs::metadata(&path)
+                .map(|m| m.len() as u32)
+                .unwrap_or(0);
+            let path_string = path.to_string_lossy().into_owned();
+            // Пузырь сразу, Sending; file_id/size уточнит ответ ядра.
+            let msg_id = state.store.push_outgoing_file(
+                cid,
+                now_ms(),
+                crate::model::msg::FileRef {
+                    name,
+                    size,
+                    file_id: [0; 16],
+                    path: Some(path_string.clone()),
+                },
+            );
+            let request = Request::SendFile {
+                cid,
+                path: path_string,
+            };
+            let reply_request = request.clone();
+            let link = Arc::clone(&state.link);
+            Task::batch([
+                Task::perform(link.execute(request), move |reply| {
+                    Message::Link(LinkIn::Replied {
+                        request: reply_request.clone(),
+                        reply,
+                        tag: Some(msg_id),
+                    })
+                }),
+                scroll_feed(state),
+            ])
         }
         ChatIn::ToggleSpoiler(id) => {
             // Клик по пузырю со спойлером: раскрыть/спрятать (S14).
@@ -1546,6 +1661,24 @@ fn send_current<L: CoreLink>(state: &mut State<L>) -> Task<Message> {
         }),
         scroll_feed(state),
     ])
+}
+
+/// Путь входящего файла: ядро кладёт в ~/.shopot/files/<hex file_id>.
+fn files_path(file_id: &[u8; 16]) -> String {
+    let hex: String = file_id.iter().map(|b| format!("{b:02x}")).collect();
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+    format!("{home}/.shopot/files/{hex}")
+}
+
+/// Человеческий размер: «900 Б», «248 КБ», «3.2 МБ».
+pub fn human_size(size: u32) -> String {
+    if size < 1024 {
+        format!("{size} Б")
+    } else if size < 1024 * 1024 {
+        format!("{} КБ", size.div_ceil(1024))
+    } else {
+        format!("{:.1} МБ", size as f64 / 1024.0 / 1024.0)
+    }
 }
 
 /// Лента всегда прокручивается к самому свежему сообщению.
@@ -2187,6 +2320,17 @@ fn composer<L: CoreLink>(state: &State<L>) -> Element<'_, Message> {
         .key_binding(key_binding)
         .style(palette::editor);
 
+    // Вложение (S10): выбор файла — нативный диалог, ядро читает путь.
+    let attach = button(text("📎").size(16.0 * scale))
+        .padding(Padding {
+            top: 8.0,
+            right: 11.0,
+            bottom: 8.0,
+            left: 11.0,
+        })
+        .style(palette::button_dim)
+        .on_press(Message::Chat(ChatIn::PickFile));
+
     let send = button(text("↑").size(16.0 * scale).font(palette::bold()))
         .padding(Padding {
             top: 8.0,
@@ -2200,6 +2344,7 @@ fn composer<L: CoreLink>(state: &State<L>) -> Element<'_, Message> {
     container(
         iced::widget::Row::new()
             .push(container(editor).width(Length::Fill))
+            .push(attach)
             .push(send)
             .spacing(10)
             .align_y(Vertical::Bottom),
@@ -3672,7 +3817,8 @@ mod tests {
         let FeedItem::Group { bodies, .. } = &msgs[1] else {
             panic!("ожидали группу после разделителя дня: {msgs:?}");
         };
-        let (_, body, entities, _) = &bodies[0];
+        let body_ref = &bodies[0];
+        let (body, entities) = (&body_ref.body, &body_ref.entities);
         assert_eq!(body, "жирно и тайна");
         assert_eq!(
             entities,
@@ -3692,8 +3838,8 @@ mod tests {
         };
         // То же окно группировки — второе тело той же группы.
         let last = bodies.last().expect("тело есть");
-        assert_eq!(last.1, "**жирно**");
-        assert!(last.2.is_empty());
+        assert_eq!(last.body, "**жирно**");
+        assert!(last.entities.is_empty());
     }
 
     /// Спойлер: клик раскрывает, повторный — прячет; переключение живёт
@@ -3710,7 +3856,7 @@ mod tests {
         let FeedItem::Group { bodies, .. } = &msgs[1] else {
             panic!("группа после разделителя дня: {msgs:?}");
         };
-        let id = bodies[0].0;
+        let id = bodies[0].id;
         assert!(!state.revealed_spoilers.contains(&id), "по умолчанию скрыт");
         let _ = update(&mut state, Message::Chat(ChatIn::ToggleSpoiler(id)));
         assert!(state.revealed_spoilers.contains(&id), "клик раскрыл");
@@ -3731,5 +3877,115 @@ mod tests {
         let _ = update(&mut state, Message::Chat(ChatIn::Send));
         let mut ui = render(&state);
         assert!(ui.find("Аня").is_ok(), "чат на месте");
+    }
+
+    // ---------- S10: файлы ----------
+
+    /// Выбранный файл → пузырь Sending; ответ ядра ставит настоящие
+    /// file_id/size; FILE_SENT — честный «отправлен». Отмена диалога
+    /// молчит. Ошибка (файл не читается) — Failed с текстом.
+    #[test]
+    fn file_send_flow_honest_status() {
+        let mut state = state();
+        state.store.replace_contacts(vec![contact(1, "Аня")]);
+        let _ = update(&mut state, Message::Chat(ChatIn::Select(Cid(1))));
+
+        // Отмена — ничего.
+        let _ = update(&mut state, Message::Chat(ChatIn::FilePicked(None)));
+        assert!(
+            state
+                .store
+                .thread(Cid(1))
+                .map(|t| t.msgs.is_empty())
+                .unwrap_or(true),
+            "отмена молчит"
+        );
+
+        // Выбор → пузырь Sending с локальным именем/размером.
+        let tmp = std::env::temp_dir().join(format!("shopot-ui-file-{}", std::process::id()));
+        std::fs::write(&tmp, b"demo").expect("файл записан");
+        let _ = update(
+            &mut state,
+            Message::Chat(ChatIn::FilePicked(Some(tmp.clone()))),
+        );
+        let msgs = &state.store.thread(Cid(1)).unwrap().msgs;
+        let msg = msgs[0].id;
+        assert_eq!(msgs[0].send, crate::model::msg::SendState::Sending);
+        assert_eq!(
+            msgs[0].file.as_ref().map(|f| f.name.as_str()),
+            Some(tmp.file_name().unwrap().to_str().unwrap())
+        );
+
+        // Ответ ядра: настоящий file_id, статус ещё Sending.
+        let core = [0xF1; 16];
+        let _ = update(
+            &mut state,
+            Message::Link(LinkIn::Replied {
+                request: Request::SendFile {
+                    cid: Cid(1),
+                    path: tmp.to_string_lossy().into_owned(),
+                },
+                reply: Ok(OkReply::FileQueued {
+                    file_id: core,
+                    size: 4,
+                    chunks: 1,
+                }),
+                tag: Some(msg),
+            }),
+        );
+        let msgs = &state.store.thread(Cid(1)).unwrap().msgs;
+        assert_eq!(msgs[0].file.as_ref().map(|f| f.file_id), Some(core));
+        assert_eq!(msgs[0].send, crate::model::msg::SendState::Sending);
+
+        // FILE_SENT — «отправлен».
+        let _ = update(
+            &mut state,
+            Message::Link(LinkIn::Event(LinkEvent::FileSent {
+                cid: Cid(1),
+                file_id: core,
+            })),
+        );
+        assert_eq!(
+            state.store.thread(Cid(1)).unwrap().msgs[0].send,
+            crate::model::msg::SendState::Sent
+        );
+        std::fs::remove_file(&tmp).ok();
+        let _ = msg;
+    }
+
+    /// Входящий файл: пузырь с именем/размером, непрочитанное, путь
+    /// ~/.shopot/files/<hex> для открытия.
+    #[test]
+    fn incoming_file_lands_in_feed() {
+        let mut state = state();
+        state.store.replace_contacts(vec![contact(1, "Аня")]);
+        let _ = update(
+            &mut state,
+            Message::Link(LinkIn::Event(LinkEvent::FileReceived {
+                cid: Cid(1),
+                file_id: [0xF1; 16],
+                size: 254_000,
+                name: "макет.pdf".into(),
+            })),
+        );
+        let thread = state.store.thread(Cid(1)).expect("чат есть");
+        assert_eq!(thread.unread, 1);
+        let file = thread.msgs[0].file.as_ref().expect("файл");
+        assert_eq!(file.name, "макет.pdf");
+        assert!(
+            file.path
+                .as_ref()
+                .is_some_and(|p| p.contains("/.shopot/files/f1f1")),
+            "путь для открытия: {:?}",
+            file.path
+        );
+    }
+
+    /// human_size: Б/КБ/МБ.
+    #[test]
+    fn human_size_units() {
+        assert_eq!(human_size(900), "900 Б");
+        assert_eq!(human_size(254_000), "249 КБ");
+        assert_eq!(human_size(3 * 1024 * 1024), "3.0 МБ");
     }
 }

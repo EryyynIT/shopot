@@ -221,19 +221,25 @@ pub fn message_group(
     let mut pending: Option<iced::widget::Column<'static, Message>> = None;
     let count = bodies.len();
 
-    for (index, body) in bodies.iter().enumerate() {
-        let (msg_id, body, entities, reactions) =
-            (&body.id, &body.body, &body.entities, &body.reactions);
+    for (index, fb) in bodies.iter().enumerate() {
+        let (msg_id, body, entities, reactions) = (&fb.id, &fb.body, &fb.entities, &fb.reactions);
         let last = index + 1 == count;
         // ПКМ по строке тела — меню сообщения (закрепить/открепить, S12);
         // в слитом пузыре каждая строка адресует своё сообщение. Клик по
         // строке со спойлером раскрывает его (S14).
-        let mut area = mouse_area(rich_body(body, entities, revealed.contains(msg_id), scale))
-            .on_right_press(Message::Chat(ChatIn::OpenMsgMenu(*msg_id)));
-        if entities.iter().any(|e| e.kind == EntityKind::Spoiler) {
-            area = area.on_press(Message::Chat(ChatIn::ToggleSpoiler(*msg_id)));
-        }
-        let body_text = area;
+        // Файл (S10) рендерится своей строкой; текст — разметкой (S14).
+        let body_text: Element<'static, Message> = match &fb.file {
+            Some(file) => file_row(fb.id, file, scale),
+            None => {
+                let mut area =
+                    mouse_area(rich_body(body, entities, revealed.contains(msg_id), scale))
+                        .on_right_press(Message::Chat(ChatIn::OpenMsgMenu(*msg_id)));
+                if entities.iter().any(|e| e.kind == EntityKind::Spoiler) {
+                    area = area.on_press(Message::Chat(ChatIn::ToggleSpoiler(*msg_id)));
+                }
+                area.into()
+            }
+        };
 
         // Длинные тексты — без пузыря, на всю ширину (GUI_STYLE.md §2).
         if body.len() > 300 {
@@ -319,12 +325,19 @@ pub fn compact_group(
         let (msg_id, body, entities, reactions) = (&b.id, &b.body, &b.entities, &b.reactions);
         // ПКМ по строке — меню сообщения (закрепить/открепить, S12);
         // клик по спойлеру раскрывает (S14).
-        let mut area = mouse_area(rich_body(body, entities, revealed.contains(msg_id), scale))
-            .on_right_press(Message::Chat(ChatIn::OpenMsgMenu(*msg_id)));
-        if entities.iter().any(|e| e.kind == EntityKind::Spoiler) {
-            area = area.on_press(Message::Chat(ChatIn::ToggleSpoiler(*msg_id)));
-        }
-        col = col.push(container(area).padding(Padding {
+        let content: Element<'static, Message> = match &b.file {
+            Some(file) => file_row(b.id, file, scale),
+            None => {
+                let mut area =
+                    mouse_area(rich_body(body, entities, revealed.contains(msg_id), scale))
+                        .on_right_press(Message::Chat(ChatIn::OpenMsgMenu(*msg_id)));
+                if entities.iter().any(|e| e.kind == EntityKind::Spoiler) {
+                    area = area.on_press(Message::Chat(ChatIn::ToggleSpoiler(*msg_id)));
+                }
+                area.into()
+            }
+        };
+        col = col.push(container(content).padding(Padding {
             left: indent,
             ..Padding::default()
         }));
@@ -1311,6 +1324,36 @@ pub fn search_panel<'a>(
         .padding(16)
         .style(palette::dialog)
         .into()
+}
+
+// ---------- файлы (S10) ----------
+
+/// Строка файла в пузыре (S10): «📎 имя» + размер; клик открывает
+/// сохранённый файл (xdg-open), ПКМ — меню сообщения. Без пути
+/// (входящий на ядре без файла?) клика нет.
+fn file_row(
+    msg_id: MsgId,
+    file: &crate::model::msg::FileRef,
+    scale: f32,
+) -> Element<'static, Message> {
+    let content = iced::widget::Column::new()
+        .push(
+            text(format!("📎 {}", file.name))
+                .size(14.0 * scale)
+                .font(palette::bold())
+                .color(palette::TEXT),
+        )
+        .push(
+            text(crate::ui::human_size(file.size))
+                .size(11.0 * scale)
+                .color(palette::DIM),
+        )
+        .spacing(2);
+    let mut area = mouse_area(content).on_right_press(Message::Chat(ChatIn::OpenMsgMenu(msg_id)));
+    if let Some(path) = &file.path {
+        area = area.on_press(Message::Chat(ChatIn::OpenLink(path.clone())));
+    }
+    area.into()
 }
 
 // ---------- реакции (S15) ----------
