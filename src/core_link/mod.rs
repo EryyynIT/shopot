@@ -65,6 +65,10 @@ pub enum Request {
     /// локальной сети (ядро ждёт LAN-анонс); с адресом — ядро дозванивается
     /// сразу; relay — адрес трактуется как релей, peer IP не видит.
     Invite { relay: bool, addr: String },
+    /// Отправить файл (SEND_FILE, §4.5): путь в ФС пользователя демона
+    /// (демон тот же хост — читает сам). Имя — basename, ≤ 64 байт;
+    /// лимит 64 МБ. Офлайн — не ошибка: outbox, уйдёт с сессией.
+    SendFile { cid: Cid, path: String },
     /// Заблокировать контакт (BLOCK_CONTACT).
     Block { cid: Cid },
     /// Разблокировать контакт (UNBLOCK_CONTACT).
@@ -306,6 +310,9 @@ impl LinkError {
             Self::Kernel(api::Status::TooManyInvites) => {
                 "Живых приглашений уже четыре — больше нельзя. Дождитесь, пока кто-то воспользуется кодом.".into()
             }
+            Self::Kernel(api::Status::FileNotFound) => {
+                "Файл не найден или не читается.".into()
+            }
             Self::Kernel(api::Status::TooBig) => {
                 "Сообщение слишком длинное — лимит 4096 байт.".into()
             }
@@ -352,6 +359,13 @@ pub enum OkReply {
     Added { cid: Cid },
     /// CREATE_INVITE: односторонний инвайт-код.
     Code(String),
+    /// SEND_FILE принят: file_id = SHA-256[0..16], size/chunks —
+    /// раскладка передачи. Доставка подтверждается событием FILE_SENT.
+    FileQueued {
+        file_id: [u8; 16],
+        size: u32,
+        chunks: u32,
+    },
     /// GET_VERSION: версия API демона, semver.
     Version { major: u16, minor: u16, patch: u16 },
     /// GET_HISTORY: всего записей у ядра + окно новейших (старые → новые).
@@ -443,6 +457,17 @@ pub enum LinkEvent {
         bundle: [u8; 64],
         addr: String,
     },
+    /// Входящий файл (FILE_RECEIVED, §4.5): ядро уже проверило хэш и
+    /// сохранило в ~/.shopot/files/<hex file_id> (0600).
+    FileReceived {
+        cid: Cid,
+        file_id: [u8; 16],
+        size: u32,
+        name: String,
+    },
+    /// Все чанки моего файла подтверждены (FILE_SENT): честный статус
+    /// «отправлен» для пузыря файла. До события — «отправляется».
+    FileSent { cid: Cid, file_id: [u8; 16] },
     /// Реакция собеседника на сообщение (REACTION, §5). add=false —
     /// снятие. Своя реакция событием не приходит — применяется по
     /// ответу SET_REACTION.

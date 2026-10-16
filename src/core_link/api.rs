@@ -239,6 +239,8 @@ pub enum Event {
     BlockedByPeer = 10,
     /// API 2.2+: пир переслал визитку третьего лица (SEND_CONTACT).
     ContactCard = 12,
+    /// Все чанки файла подтверждены пиром — честный «отправлен» (S10).
+    FileSent = 11,
 }
 
 impl Event {
@@ -254,7 +256,7 @@ impl Event {
             8 => Self::ContactJoined,
             9 => Self::ContactProfile,
             10 => Self::BlockedByPeer,
-            // 11 (FILE_SENT) — спринт S10.
+            11 => Self::FileSent,
             12 => Self::ContactCard,
             _ => return None,
         })
@@ -586,7 +588,7 @@ mod tests {
         assert_eq!(Status::from_u16(4), Status::NoContact);
         assert_eq!(Status::from_u16(600), Status::Unknown(600));
         assert_eq!(Event::from_u16(10), Some(Event::BlockedByPeer));
-        assert_eq!(Event::from_u16(11), None, "FILE_SENT — спринт S10");
+        assert_eq!(Event::from_u16(11), Some(Event::FileSent));
         assert_eq!(Event::from_u16(12), Some(Event::ContactCard));
     }
 

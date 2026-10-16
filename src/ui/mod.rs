@@ -667,6 +667,8 @@ fn on_link<L: CoreLink>(state: &mut State<L>, link: LinkIn) -> Task<Message> {
                 state.store.mark_delivered(cid, msg_id);
                 Task::none()
             }
+            // Склейка: файлы войдут в ленту в ui-коммите спринта (S10).
+            LinkEvent::FileReceived { .. } | LinkEvent::FileSent { .. } => Task::none(),
             // Реакция собеседника (S15): применить к ленте. Своих
             // ядро событием не шлёт — своя применена по ответу (S15).
             LinkEvent::Reaction {

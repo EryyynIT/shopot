@@ -26,6 +26,9 @@ futures-core = "0.3"
 # Звук звонков (S7): захват/вывод устройств; ядро получает/отдаёт PCM
 # через fifo ~/.shopot/pcm (CORE-API §4.6, PROTOCOL §10).
 cpal = "0.17"
+# Файловый диалог (S10): нативный через xdg-portal (D-Bus, без gtk),
+# асинхронный — update не блокируется.
+rfd = { version = "0.17", default-features = false, features = ["xdg-portal"] }
 
 [dev-dependencies]
 futures-util = "0.3"

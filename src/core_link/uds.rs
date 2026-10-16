@@ -382,6 +382,12 @@ fn encode_request(request: &Request, api2: bool) -> (Method, Vec<u8>) {
             api::put::str16(&mut payload, addr).expect("адрес короче 65535");
             Method::CreateInvite
         }
+        // SEND_FILE (§4.5): [cid u32][path str16] — путь читает демон.
+        Request::SendFile { cid, path } => {
+            api::put::u32(&mut payload, cid.0 as u32);
+            api::put::str16(&mut payload, path).expect("путь короче 65535");
+            Method::SendFile
+        }
         // SET/REMOVE_REACTION (§4.4): [cid u32][msg_id 16][codepoint u32].
         Request::SetReaction { cid, msg_id, emoji }
         | Request::RemoveReaction { cid, msg_id, emoji } => {
@@ -606,6 +612,22 @@ fn decode_reply(method: Method, raw: RawReply, api2: bool) -> Reply {
                     .map_err(|_| LinkError::BadFrame("call_id"))?,
             );
             OkReply::CallStarted { call_id }
+        }
+        // SEND_FILE (§4.5): [file_id 16][size u32][chunks u32].
+        Method::SendFile => {
+            let mut r = api::Reader::new(&raw.payload);
+            let mut file_id = [0u8; 16];
+            file_id.copy_from_slice(
+                r.read_bytes(16)
+                    .map_err(|_| LinkError::BadFrame("file_id"))?,
+            );
+            let size = r.read_u32().map_err(|_| LinkError::BadFrame("size"))?;
+            let chunks = r.read_u32().map_err(|_| LinkError::BadFrame("chunks"))?;
+            OkReply::FileQueued {
+                file_id,
+                size,
+                chunks,
+            }
         }
         // GET_PINNED_CHAT (2.2+): [cid u32], 0 = закрепа нет.
         Method::GetPinnedChat => {
@@ -867,7 +889,36 @@ fn decode_event(header: &Header, payload: &[u8]) -> Option<LinkEvent> {
                 ts_ms,
             })
         }
-        api::Event::AvatarReceived | api::Event::FileReceived => None,
+        // FILE_RECEIVED (7, §4.5): [cid u32][file_id 16][size u32]
+        // [name str16]. Файл уже на диске ядра (~/.shopot/files/<hex>).
+        api::Event::FileReceived => {
+            let cid = r.read_u32().ok()?;
+            let mut file_id = [0u8; 16];
+            file_id.copy_from_slice(r.read_bytes(16).ok()?);
+            let size = r.read_u32().ok()?;
+            let name = r.read_str16().ok()?;
+            Some(LinkEvent::FileReceived {
+                cid: Cid(i64::from(cid)),
+                file_id,
+                size,
+                name: String::from_utf8_lossy(name).into_owned(),
+            })
+        }
+        // FILE_SENT (11, §4.5): [cid u32][file_id 16][size u32][name
+        // str16] — все чанки подтверждены; size/name уже известны из
+        // ответа SEND_FILE, не дублируем в событии модели.
+        api::Event::FileSent => {
+            let cid = r.read_u32().ok()?;
+            let mut file_id = [0u8; 16];
+            file_id.copy_from_slice(r.read_bytes(16).ok()?);
+            let _size = r.read_u32().ok()?;
+            let _name = r.read_str16().ok()?;
+            Some(LinkEvent::FileSent {
+                cid: Cid(i64::from(cid)),
+                file_id,
+            })
+        }
+        api::Event::AvatarReceived => None,
     }
 }
 
@@ -2204,5 +2255,83 @@ mod tests {
         let mut bad = payload;
         bad[21..25].copy_from_slice(&0xD800u32.to_le_bytes());
         assert_eq!(decode_event(&header, &bad), None);
+    }
+
+    /// S10: SEND_FILE — раскладка кадра и ответа; FILE_RECEIVED/FILE_SENT
+    /// разбираются.
+    #[test]
+    fn file_wire_roundtrip() {
+        let (method, payload) = encode_request(
+            &Request::SendFile {
+                cid: Cid(7),
+                path: "/tmp/макет.pdf".into(),
+            },
+            true,
+        );
+        assert_eq!(method, Method::SendFile);
+        let mut r = api::Reader::new(&payload);
+        assert_eq!(r.read_u32(), Ok(7));
+        assert_eq!(
+            r.read_str16().map(|b| std::str::from_utf8(b).unwrap()),
+            Ok("/tmp/макет.pdf")
+        );
+        assert!(!r.has_more());
+
+        let mut raw = Vec::new();
+        raw.extend_from_slice(&[0xF1; 16]);
+        api::put::u32(&mut raw, 254_000);
+        api::put::u32(&mut raw, 16);
+        let reply = decode_reply(
+            Method::SendFile,
+            RawReply {
+                status: Status::Ok,
+                payload: raw,
+            },
+            true,
+        );
+        assert_eq!(
+            reply,
+            Ok(OkReply::FileQueued {
+                file_id: [0xF1; 16],
+                size: 254_000,
+                chunks: 16,
+            })
+        );
+
+        // FILE_RECEIVED.
+        let mut payload = Vec::new();
+        api::put::u32(&mut payload, 7);
+        payload.extend_from_slice(&[0xF1; 16]);
+        api::put::u32(&mut payload, 254_000);
+        api::put::str16(&mut payload, "макет.pdf").expect("str16");
+        let header = Header {
+            kind: Kind::Event,
+            id: api::Event::FileReceived as u16,
+            request_id: 0,
+            status: Status::Ok,
+            payload_len: payload.len() as u32,
+        };
+        assert_eq!(
+            decode_event(&header, &payload),
+            Some(LinkEvent::FileReceived {
+                cid: Cid(7),
+                file_id: [0xF1; 16],
+                size: 254_000,
+                name: "макет.pdf".into(),
+            })
+        );
+
+        // FILE_SENT.
+        let header = Header {
+            id: api::Event::FileSent as u16,
+            ..header
+        };
+        assert_eq!(
+            decode_event(&header, &payload),
+            Some(LinkEvent::FileSent {
+                cid: Cid(7),
+                file_id: [0xF1; 16],
+            })
+        );
     }
 }

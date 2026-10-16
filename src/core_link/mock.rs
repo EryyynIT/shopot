@@ -131,6 +131,17 @@ impl Scene {
                         ],
                     },
                 ),
+                // Входящий файл (S10): «макет.pdf» — пузырь с кнопкой
+                // открытия на скриншоте демо.
+                (
+                    Duration::from_millis(700),
+                    LinkEvent::FileReceived {
+                        cid: Cid(1),
+                        file_id: [0xF1; 16],
+                        size: 254_000,
+                        name: "макет.pdf".into(),
+                    },
+                ),
                 // Реакция собеседника (S15): 👍 на размеченное сообщение —
                 // скриншот демо показывает пилюлю под пузырём.
                 (
@@ -475,6 +486,49 @@ impl MockLink {
                 };
                 let head = if relay { "shopot1r." } else { "shopot1." };
                 Ok(OkReply::Code(format!("{head}{code}@{host}")))
+            }
+            // Семантика ядра (§4.5): путь читается с диска, лимит 64 МБ,
+            // basename ≤ 64 байт; контакт онлайн — через паузу событие
+            // FILE_SENT (честный «отправлен»), офлайн — тихий outbox.
+            Request::SendFile { cid, path } => {
+                let known = {
+                    let state = inner.state.lock().expect("стейт не отравлен");
+                    state
+                        .contacts
+                        .iter()
+                        .find(|c| c.cid == cid)
+                        .map(|c| c.online)
+                };
+                let Some(online) = known else {
+                    return Err(LinkError::Kernel(Status::NoContact));
+                };
+                let name = std::path::Path::new(&path)
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                if name.is_empty() || name.len() > 64 {
+                    return Err(LinkError::Kernel(Status::BadArgs));
+                }
+                let Ok(meta) = std::fs::metadata(&path) else {
+                    return Err(LinkError::Kernel(Status::FileNotFound));
+                };
+                let size = meta.len();
+                if size > 64 * 1024 * 1024 {
+                    return Err(LinkError::Kernel(Status::TooBig));
+                }
+                let file_id = core_id(inner.msg_seq.fetch_add(1, Ordering::Relaxed)).0;
+                if online {
+                    let tx = inner.tx.clone();
+                    tokio::spawn(async move {
+                        tokio::time::sleep(Duration::from_millis(reply_delay_ms)).await;
+                        let _ = tx.send(LinkEvent::FileSent { cid, file_id }).await;
+                    });
+                }
+                Ok(OkReply::FileQueued {
+                    file_id,
+                    size: size as u32,
+                    chunks: (size.div_ceil(16000)) as u32,
+                })
             }
             // Семантика ядра: реакция требует известного контакта; msg_id
             // ядро не проверяет в контракте — заглушка тоже (Done).
@@ -1457,5 +1511,67 @@ mod tests {
             })
             .await;
         assert_eq!(reply, Err(LinkError::Kernel(Status::BadArgs)));
+    }
+
+    /// S10: SEND_FILE в заглушке повторяет ядро — путь с диска, честные
+    /// FILE_NOT_FOUND/TOO_BIG/BAD_ARGS, FILE_SENT после паузы.
+    #[tokio::test(start_paused = true)]
+    async fn send_file_mock_semantics() {
+        let link = Arc::new(MockLink::new(scene()));
+        let events = CoreLink::events(Arc::clone(&link));
+        tokio::pin!(events);
+
+        let tmp = std::env::temp_dir().join(format!("shopot-mock-file-{}", std::process::id()));
+        std::fs::write(&tmp, b"demo").expect("файл записан");
+        let reply = link
+            .execute(Request::SendFile {
+                cid: Cid(1),
+                path: tmp.to_string_lossy().into_owned(),
+            })
+            .await;
+        let Ok(OkReply::FileQueued {
+            file_id,
+            size,
+            chunks,
+        }) = reply
+        else {
+            panic!("ожидали FileQueued: {reply:?}")
+        };
+        assert_eq!(size, 4);
+        assert_eq!(chunks, 1);
+
+        // FILE_SENT приходит после паузы ответа (контакт онлайн).
+        use futures_core::Stream;
+        let event = tokio::time::timeout(
+            Duration::from_secs(5),
+            std::future::poll_fn(|cx| events.as_mut().poll_next(cx)),
+        )
+        .await
+        .expect("событие есть")
+        .expect("поток жив");
+        assert_eq!(
+            event,
+            LinkEvent::FileSent {
+                cid: Cid(1),
+                file_id
+            }
+        );
+
+        // Нет файла — FILE_NOT_FOUND; неизвестный контакт — NO_CONTACT.
+        let reply = link
+            .execute(Request::SendFile {
+                cid: Cid(1),
+                path: "/нет/такого.bin".into(),
+            })
+            .await;
+        assert_eq!(reply, Err(LinkError::Kernel(Status::FileNotFound)));
+        let reply = link
+            .execute(Request::SendFile {
+                cid: Cid(99),
+                path: tmp.to_string_lossy().into_owned(),
+            })
+            .await;
+        assert_eq!(reply, Err(LinkError::Kernel(Status::NoContact)));
+        std::fs::remove_file(&tmp).ok();
     }
 }
