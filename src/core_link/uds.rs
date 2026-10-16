@@ -24,7 +24,8 @@ use tokio::time::timeout;
 
 use super::api::{self, Header, Kind, Method, Status};
 use super::{
-    CoreLink, HistoryMsg, LinkError, LinkEvent, OkReply, RecvStream, Reply, Request, SearchHit,
+    CallSignal, CoreLink, HistoryMsg, LinkError, LinkEvent, OkReply, RecvStream, Reply, Request,
+    SearchHit,
 };
 use crate::model::cid::Cid;
 use crate::model::msg::CoreMsgId;
@@ -449,6 +450,14 @@ fn encode_request(request: &Request, api2: bool) -> (Method, Vec<u8>) {
             api::put::str16(&mut payload, name).expect("имя короче 65535");
             Method::SetName
         }
+        // Звонки (§4.6): START_CALL — [cid u32], ответ [call_id 16];
+        // ANSWER/END — пустые.
+        Request::StartCall { cid } => {
+            api::put::u32(&mut payload, cid.0 as u32);
+            Method::StartCall
+        }
+        Request::AnswerCall => Method::AnswerCall,
+        Request::EndCall => Method::EndCall,
     };
     (method, payload)
 }
@@ -563,6 +572,16 @@ fn decode_reply(method: Method, raw: RawReply, api2: bool) -> Reply {
                 });
             }
             OkReply::Search { total, hits }
+        }
+        // START_CALL (§4.6): [call_id 16].
+        Method::StartCall => {
+            let mut r = api::Reader::new(&raw.payload);
+            let mut call_id = [0u8; 16];
+            call_id.copy_from_slice(
+                r.read_bytes(16)
+                    .map_err(|_| LinkError::BadFrame("call_id"))?,
+            );
+            OkReply::CallStarted { call_id }
         }
         // GET_PINNED_CHAT (2.2+): [cid u32], 0 = закрепа нет.
         Method::GetPinnedChat => {
@@ -738,10 +757,26 @@ fn decode_event(header: &Header, payload: &[u8]) -> Option<LinkEvent> {
                 addr: String::from_utf8_lossy(addr).into_owned(),
             })
         }
-        api::Event::Reaction
-        | api::Event::CallState
-        | api::Event::AvatarReceived
-        | api::Event::FileReceived => None,
+        // CALL_STATE (5, §4.6/§5): [cid u32][call_id 16][state u8].
+        api::Event::CallState => {
+            let cid = r.read_u32().ok()?;
+            let mut call_id = [0u8; 16];
+            call_id.copy_from_slice(r.read_bytes(16).ok()?);
+            let state = match r.read_u8().ok()? {
+                1 => CallSignal::Offer,
+                2 => CallSignal::Accept,
+                3 => CallSignal::Reject,
+                4 => CallSignal::End,
+                // Код из будущего ядра — событие выбрасываем, поток не рвём.
+                _ => return None,
+            };
+            Some(LinkEvent::CallState {
+                cid: Cid(i64::from(cid)),
+                call_id,
+                state,
+            })
+        }
+        api::Event::Reaction | api::Event::AvatarReceived | api::Event::FileReceived => None,
     }
 }
 
@@ -1782,11 +1817,93 @@ mod tests {
     /// SET_NAME (§4.4): [name str16].
     #[test]
     fn set_name_codec_matches_contract() {
-        let (method, payload) =
-            encode_request(&Request::SetName { name: "Михаил".into() }, true);
+        let (method, payload) = encode_request(
+            &Request::SetName {
+                name: "Михаил".into(),
+            },
+            true,
+        );
         assert_eq!(method, Method::SetName);
         let mut expect = Vec::new();
         api::put::str16(&mut expect, "Михаил").expect("str16");
         assert_eq!(payload, expect);
+    }
+
+    /// Звонки (S7, §4.6): раскладки запросов, ответ START_CALL с call_id,
+    /// событие CALL_STATE со всеми стадиями.
+    #[test]
+    fn calls_codec_matches_contract() {
+        let (method, payload) = encode_request(&Request::StartCall { cid: Cid(7) }, true);
+        assert_eq!(method, Method::StartCall);
+        assert_eq!(payload, 7u32.to_le_bytes());
+        let (method, payload) = encode_request(&Request::AnswerCall, true);
+        assert_eq!((method, payload.len()), (Method::AnswerCall, 0));
+        let (method, payload) = encode_request(&Request::EndCall, true);
+        assert_eq!((method, payload.len()), (Method::EndCall, 0));
+
+        // Ответ START_CALL: [call_id 16].
+        let raw = RawReply {
+            status: Status::Ok,
+            payload: vec![0xAB; 16],
+        };
+        let reply = decode_reply(Method::StartCall, raw, true);
+        assert_eq!(
+            reply,
+            Ok(OkReply::CallStarted {
+                call_id: [0xAB; 16]
+            })
+        );
+        // Короткий ответ — BadFrame, не паника.
+        let raw = RawReply {
+            status: Status::Ok,
+            payload: vec![0xAB; 8],
+        };
+        assert!(matches!(
+            decode_reply(Method::StartCall, raw, true),
+            Err(LinkError::BadFrame(_))
+        ));
+
+        // CALL_STATE: [cid u32][call_id 16][state u8].
+        for (code, signal) in [
+            (1u8, CallSignal::Offer),
+            (2, CallSignal::Accept),
+            (3, CallSignal::Reject),
+            (4, CallSignal::End),
+        ] {
+            let mut payload = Vec::new();
+            api::put::u32(&mut payload, 5);
+            payload.extend_from_slice(&[0x77; 16]);
+            payload.push(code);
+            let header = Header {
+                kind: Kind::Event,
+                id: api::Event::CallState as u16,
+                request_id: 0,
+                status: Status::Ok,
+                payload_len: payload.len() as u32,
+            };
+            let Some(LinkEvent::CallState {
+                cid,
+                call_id,
+                state,
+            }) = decode_event(&header, &payload)
+            else {
+                panic!("событие не разобрано")
+            };
+            assert_eq!((cid, call_id, state), (Cid(5), [0x77; 16], signal));
+        }
+
+        // Код стадии из будущего ядра — событие выбрасывается.
+        let mut payload = Vec::new();
+        api::put::u32(&mut payload, 5);
+        payload.extend_from_slice(&[0x77; 16]);
+        payload.push(9);
+        let header = Header {
+            kind: Kind::Event,
+            id: api::Event::CallState as u16,
+            request_id: 0,
+            status: Status::Ok,
+            payload_len: payload.len() as u32,
+        };
+        assert_eq!(decode_event(&header, &payload), None);
     }
 }

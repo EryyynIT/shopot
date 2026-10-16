@@ -99,6 +99,15 @@ pub enum Request {
     /// его пирам в PROFILE и кладёт в свою визитку (SEND_CONTACT со своей
     /// карточкой); обратно прочитать имя нельзя — запроса GET_NAME нет.
     SetName { name: String },
+    /// Начать звонок (START_CALL, §4.6): линия одна на демон — занято
+    /// (BUSY), нет контакта (NO_CONTACT) или живого соединения
+    /// (NO_SESSION) — честная ошибка.
+    StartCall { cid: Cid },
+    /// Принять входящий звонок (ANSWER_CALL, §4.6). Без звонка — NO_CALL.
+    AnswerCall,
+    /// Завершить или отклонить звонок (END_CALL, §4.6). Без звонка —
+    /// NO_CALL.
+    EndCall,
 }
 
 /// Совпадение поиска ядра (SEARCH_MESSAGE/GLOBAL_SEARCH_MESSAGE, §4.3).
@@ -163,6 +172,8 @@ impl LinkError {
             Self::Kernel(api::Status::NoSession) => {
                 "Контакт не в сети. Напишите, когда он появится.".into()
             }
+            Self::Kernel(api::Status::Busy) => "Уже идёт другой звонок.".into(),
+            Self::Kernel(api::Status::NoCall) => "Звонок уже завершён.".into(),
             Self::Kernel(api::Status::Internal) => {
                 "Внутренний сбой. Перезапустите приложение.".into()
             }
@@ -219,6 +230,9 @@ pub enum OkReply {
         ts_ms: i64,
         text: String,
     },
+    /// START_CALL: идентификатор звонка — им же помечены события
+    /// CALL_STATE этого разговора.
+    CallStarted { call_id: [u8; 16] },
     /// У команды нет содержательного ответа (block/unblock).
     Done,
 }
@@ -226,6 +240,21 @@ pub enum OkReply {
 /// Ответ на [`Request`]. Ошибки команды — данные, не паника: они едут
 /// в Store как статус отправки и показываются пользователю.
 pub type Reply = Result<OkReply, LinkError>;
+
+/// Стадия звонка из события CALL_STATE (§4.6/§5): 1 offer, 2 accept,
+/// 3 reject, 4 end. Reject ядро шлёт вместе с end — клиенту достаточно
+/// end для закрытия, reject — для честной причины.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CallSignal {
+    /// Входящий или исходящий вызов создан.
+    Offer,
+    /// Звонок принят — разговор начался (звук пошёл).
+    Accept,
+    /// Пир отклонил вызов.
+    Reject,
+    /// Звонок завершён (любой стороной, любой стадии).
+    End,
+}
 
 /// События ядра (рассылка всем клиентам, CORE-API.md §5).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -266,6 +295,14 @@ pub enum LinkEvent {
         name: String,
         bundle: [u8; 64],
         addr: String,
+    },
+    /// Смена стадии звонка (CALL_STATE, §4.6/§5): `cid` — собеседник,
+    /// `call_id` — какой звонок (их может смениться несколько за сессию,
+    /// одна линия на демон).
+    CallState {
+        cid: Cid,
+        call_id: [u8; 16],
+        state: CallSignal,
     },
     /// Соединение с демоном потеряно (транспорт; заглушка не присылает).
     Down,
@@ -359,6 +396,8 @@ mod tests {
             LinkError::Disconnected.user_text(),
             LinkError::Kernel(api::Status::Internal).user_text(),
             LinkError::Kernel(api::Status::NoSession).user_text(),
+            LinkError::Kernel(api::Status::Busy).user_text(),
+            LinkError::Kernel(api::Status::NoCall).user_text(),
             LinkError::BadFrame("тест").user_text(),
         ];
         for text in &texts {

@@ -17,7 +17,7 @@ use tokio::time;
 
 use crate::core_link::api::Status;
 use crate::core_link::{
-    CoreLink, HistoryMsg, LinkError, LinkEvent, OkReply, Reply, Request, SearchHit,
+    CallSignal, CoreLink, HistoryMsg, LinkError, LinkEvent, OkReply, Reply, Request, SearchHit,
 };
 use crate::model::cid::Cid;
 use crate::model::msg::CoreMsgId;
@@ -221,6 +221,15 @@ struct State {
     pinned_chat: Option<Cid>,
     /// Закреплённые сообщения по чатам (≤16, порядок закрепления).
     pinned_msgs: HashMap<Cid, Vec<CoreMsgId>>,
+    /// Текущий звонок (§4.6: одна линия на демон).
+    call: Option<MockCall>,
+}
+
+struct MockCall {
+    cid: Cid,
+    call_id: [u8; 16],
+    /// true — разговор идёт (accept прошёл).
+    up: bool,
 }
 
 struct MockContact {
@@ -271,6 +280,7 @@ impl MockLink {
                     guest_seq: 0,
                     pinned_chat: None,
                     pinned_msgs: HashMap::new(),
+                    call: None,
                 }),
                 tx,
                 rx: Mutex::new(Some(rx)),
@@ -642,6 +652,116 @@ impl MockLink {
                 if !(1..=32).contains(&len) {
                     return Err(LinkError::Kernel(Status::BadArgs));
                 }
+                Ok(OkReply::Done)
+            }
+            Request::StartCall { cid } => {
+                // Семантика ядра (§4.6): одна линия — BUSY; звонок только
+                // по живому соединению (NO_SESSION). Ядро шлёт локальный
+                // offer сразу; онлайн-пир «принимает» через задержку
+                // автоответа сцены.
+                let call_id = core_id(inner.msg_seq.fetch_add(1, Ordering::Relaxed)).0;
+                {
+                    // Guard мьютекса не Send: вся работа со стейтом — в
+                    // своём скоупе, до первого await.
+                    let mut state = inner.state.lock().expect("стейт не отравлен");
+                    if state.call.is_some() {
+                        return Err(LinkError::Kernel(Status::Busy));
+                    }
+                    let (blocked, online) = match state.contacts.iter().find(|c| c.cid == cid) {
+                        None => return Err(LinkError::Kernel(Status::NoContact)),
+                        Some(contact) => (contact.blocked, contact.online),
+                    };
+                    if blocked {
+                        return Err(LinkError::Kernel(Status::ContactBlocked));
+                    }
+                    if !online {
+                        return Err(LinkError::Kernel(Status::NoSession));
+                    }
+                    state.call = Some(MockCall {
+                        cid,
+                        call_id,
+                        up: false,
+                    });
+                }
+                let _ = inner
+                    .tx
+                    .send(LinkEvent::CallState {
+                        cid,
+                        call_id,
+                        state: CallSignal::Offer,
+                    })
+                    .await;
+                let inner2 = Arc::clone(inner);
+                let delay = Duration::from_millis(scene.reply_delay_ms);
+                tokio::spawn(async move {
+                    time::sleep(delay).await;
+                    let up = {
+                        let mut state = inner2.state.lock().expect("стейт не отравлен");
+                        match &mut state.call {
+                            Some(call) if call.call_id == call_id => {
+                                call.up = true;
+                                true
+                            }
+                            // Звонок уже завершён/сменился — accept не шлём.
+                            _ => false,
+                        }
+                    };
+                    if !up {
+                        return;
+                    }
+                    let _ = inner2
+                        .tx
+                        .send(LinkEvent::CallState {
+                            cid,
+                            call_id,
+                            state: CallSignal::Accept,
+                        })
+                        .await;
+                });
+                Ok(OkReply::CallStarted { call_id })
+            }
+            Request::AnswerCall => {
+                // Семантика ядра: без звонка — NO_CALL, повтор — OK
+                // (идемпотентно); accept — локальное событие.
+                let target = {
+                    let mut state = inner.state.lock().expect("стейт не отравлен");
+                    match &mut state.call {
+                        None => return Err(LinkError::Kernel(Status::NoCall)),
+                        Some(call) if call.up => None, // уже в разговоре
+                        Some(call) => {
+                            call.up = true;
+                            Some((call.cid, call.call_id))
+                        }
+                    }
+                };
+                let Some((cid, call_id)) = target else {
+                    return Ok(OkReply::Done);
+                };
+                let _ = inner
+                    .tx
+                    .send(LinkEvent::CallState {
+                        cid,
+                        call_id,
+                        state: CallSignal::Accept,
+                    })
+                    .await;
+                Ok(OkReply::Done)
+            }
+            Request::EndCall => {
+                // Семантика ядра: без звонка — NO_CALL; завершение —
+                // локальное событие end (пиру ядро шлёт hangup).
+                let call = inner.state.lock().expect("стейт не отравлен").call.take();
+                let Some(call) = call else {
+                    return Err(LinkError::Kernel(Status::NoCall));
+                };
+                let _ = inner
+                    .tx
+                    .send(LinkEvent::CallState {
+                        cid: call.cid,
+                        call_id: call.call_id,
+                        state: CallSignal::End,
+                    })
+                    .await;
                 Ok(OkReply::Done)
             }
         }
@@ -1185,9 +1305,17 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn set_name_validates_length() {
         let link = MockLink::new(scene());
-        let reply = link.execute(Request::SetName { name: "Михаил".into() }).await;
+        let reply = link
+            .execute(Request::SetName {
+                name: "Михаил".into(),
+            })
+            .await;
         assert_eq!(reply, Ok(OkReply::Done));
-        let reply = link.execute(Request::SetName { name: String::new() }).await;
+        let reply = link
+            .execute(Request::SetName {
+                name: String::new(),
+            })
+            .await;
         assert_eq!(reply, Err(LinkError::Kernel(Status::BadArgs)));
         let reply = link
             .execute(Request::SetName {
@@ -1195,5 +1323,67 @@ mod tests {
             })
             .await;
         assert_eq!(reply, Err(LinkError::Kernel(Status::BadArgs)));
+    }
+
+    /// Звонки (S7): одна линия — BUSY, офлайн — NO_SESSION; исходящий
+    /// принимается «пиром» через задержку сцены; завершение — end.
+    #[tokio::test(start_paused = true)]
+    async fn calls_match_kernel_semantics() {
+        let link = Arc::new(MockLink::new(scene()));
+        let events = link.clone().events();
+
+        // Офлайн-контакт (2) — NO_SESSION, неизвестный — NO_CONTACT.
+        let reply = link.execute(Request::StartCall { cid: Cid(2) }).await;
+        assert_eq!(reply, Err(LinkError::Kernel(Status::NoSession)));
+        let reply = link.execute(Request::StartCall { cid: Cid(99) }).await;
+        assert_eq!(reply, Err(LinkError::Kernel(Status::NoContact)));
+
+        // Исходящий: ответ с call_id, события offer → accept → end.
+        let reply = link.execute(Request::StartCall { cid: Cid(1) }).await;
+        let Ok(OkReply::CallStarted { call_id }) = reply else {
+            panic!("START_CALL: {reply:?}")
+        };
+        // Линия занята, пока звонок жив.
+        let reply = link.execute(Request::StartCall { cid: Cid(1) }).await;
+        assert_eq!(reply, Err(LinkError::Kernel(Status::Busy)));
+
+        // Accept по таймеру сцены (50 мс), затем завершение — события
+        // копятся в канале, забираем пачкой.
+        time::sleep(Duration::from_millis(100)).await;
+        let reply = link.execute(Request::EndCall).await;
+        assert_eq!(reply, Ok(OkReply::Done));
+
+        let mut got = crate::core_link::take_events(events, 3).await;
+        let offer = got.pop_front().expect("offer");
+        assert_eq!(
+            offer,
+            LinkEvent::CallState {
+                cid: Cid(1),
+                call_id,
+                state: CallSignal::Offer,
+            }
+        );
+        let accept = got.pop_front().expect("accept");
+        assert_eq!(
+            accept,
+            LinkEvent::CallState {
+                cid: Cid(1),
+                call_id,
+                state: CallSignal::Accept,
+            }
+        );
+        let end = got.pop_front().expect("end");
+        assert_eq!(
+            end,
+            LinkEvent::CallState {
+                cid: Cid(1),
+                call_id,
+                state: CallSignal::End,
+            }
+        );
+        let reply = link.execute(Request::EndCall).await;
+        assert_eq!(reply, Err(LinkError::Kernel(Status::NoCall)));
+        let reply = link.execute(Request::AnswerCall).await;
+        assert_eq!(reply, Err(LinkError::Kernel(Status::NoCall)));
     }
 }

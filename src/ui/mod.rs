@@ -452,6 +452,9 @@ fn on_link<L: CoreLink>(state: &mut State<L>, link: LinkIn) -> Task<Message> {
                 }
                 task
             }
+            // Обработчик появится в ui-коммите S7; без руки событие
+            // просто игнорируется, как незнакомые события кодека.
+            LinkEvent::CallState { .. } => Task::none(),
             LinkEvent::Down => {
                 state.link_up = false;
                 Task::none()
@@ -2854,7 +2857,8 @@ mod tests {
         {
             let mut ui = render(&state);
             assert!(
-                ui.find("Без имени визитка уходит с именем «shopot».").is_ok(),
+                ui.find("Без имени визитка уходит с именем «shopot».")
+                    .is_ok(),
                 "подсказка, зачем имя"
             );
         }
@@ -2884,7 +2888,10 @@ mod tests {
         let _ = update(&mut state, Message::Meet(MeetIn::CloseOverlay));
         let _ = update(&mut state, Message::Settings(SettingsIn::Open));
         let mut ui = render(&state);
-        assert!(ui.find("Сейчас задано: Михаил").is_ok(), "сессионная запись");
+        assert!(
+            ui.find("Сейчас задано: Михаил").is_ok(),
+            "сессионная запись"
+        );
     }
 
     /// Ошибка SET_NAME — честная строка в панели, имя не запоминается.
