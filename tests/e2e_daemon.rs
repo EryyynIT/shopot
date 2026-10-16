@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 use futures_util::StreamExt;
 use shopot_gui::core_link::api::Status;
 use shopot_gui::core_link::uds::UdsLink;
-use shopot_gui::core_link::{CoreLink, LinkError, LinkEvent, OkReply, Reply, Request};
+use shopot_gui::core_link::{CallSignal, CoreLink, LinkError, LinkEvent, OkReply, Reply, Request};
 
 struct Daemon(Child, PathBuf);
 
@@ -1410,5 +1410,138 @@ async fn own_card_carries_set_name() {
     assert_eq!(
         card_name, "Михаил e2e",
         "своя визитка несёт заданное имя, а не дефолт ядра"
+    );
+}
+
+/// Два демона: звонок A → B (S7). START_CALL → offer у обоих, ANSWER
+/// у B → accept у обоих, END у A → end у обоих; стадии по call_id.
+/// Звонки есть с API 1.0 — гейта по версии нет; нужна живая сессия.
+#[tokio::test]
+async fn call_offer_answer_end_two_daemons() {
+    if std::env::var("SHOPOT_BIN").is_err() {
+        eprintln!("SHOPOT_BIN не задан — e2e против демона пропущен");
+        return;
+    }
+
+    let a = spawn_daemon("la");
+    let b = spawn_daemon("lb");
+    let sock_a = wait_socket(&a.1).await;
+    let sock_b = wait_socket(&b.1).await;
+    let link_a = std::sync::Arc::new(UdsLink::with_config(
+        sock_a,
+        Duration::from_millis(100),
+        false,
+    ));
+    let link_b = std::sync::Arc::new(UdsLink::with_config(
+        sock_b,
+        Duration::from_millis(100),
+        false,
+    ));
+    let mut events_a = Box::pin(CoreLink::events(std::sync::Arc::clone(&link_a)));
+    let mut events_b = Box::pin(CoreLink::events(std::sync::Arc::clone(&link_b)));
+    for events in [&mut events_a, &mut events_b] {
+        wait_event(events, Duration::from_secs(10), |e| {
+            matches!(e, LinkEvent::Resync)
+        })
+        .await;
+    }
+
+    // Знакомство A↔B по LAN-коду, ждём живую сессию (без неё NO_SESSION).
+    let code = match execute_retry(
+        &link_a,
+        Request::Invite {
+            relay: false,
+            addr: String::new(),
+        },
+    )
+    .await
+    {
+        Ok(OkReply::Code(code)) => code,
+        other => panic!("CREATE_INVITE не удался: {other:?}"),
+    };
+    let cid_a_at_b = match execute_retry(&link_b, Request::Add { code }).await {
+        Ok(OkReply::Added { cid }) => cid,
+        other => panic!("ACCEPT_INVITE не удался: {other:?}"),
+    };
+    let joined = wait_event(&mut events_a, Duration::from_secs(20), |e| {
+        matches!(e, LinkEvent::ContactJoined { .. })
+    })
+    .await;
+    let LinkEvent::ContactJoined { cid: cid_b, .. } = joined else {
+        unreachable!()
+    };
+    wait_event(&mut events_b, Duration::from_secs(20), |e| {
+        matches!(e, LinkEvent::Presence { online: true, .. })
+    })
+    .await;
+    wait_event(&mut events_a, Duration::from_secs(20), |e| {
+        matches!(e, LinkEvent::Presence { online: true, .. })
+    })
+    .await;
+
+    // A звонит B: ответ несёт call_id, оба получают offer.
+    let reply = execute_retry(&link_a, Request::StartCall { cid: cid_b }).await;
+    let Ok(OkReply::CallStarted { call_id }) = reply else {
+        panic!("START_CALL не удался: {reply:?}")
+    };
+    let offer_at_b = wait_event(&mut events_b, Duration::from_secs(10), |e| {
+        matches!(
+            e,
+            LinkEvent::CallState {
+                state: CallSignal::Offer,
+                ..
+            }
+        )
+    })
+    .await;
+    let LinkEvent::CallState {
+        cid: offer_cid,
+        call_id: offer_id,
+        ..
+    } = offer_at_b
+    else {
+        unreachable!()
+    };
+    assert_eq!(offer_cid, cid_a_at_b, "offer от A");
+    assert_eq!(offer_id, call_id, "call_id стабилен между сторонами");
+
+    // B принимает: оба получают accept (у B ядро поднимает звук —
+    // fifo живут в его доме, GUI-концов в тесте нет, ядро читает пустое
+    // молчание и не падает).
+    let reply = execute_retry(&link_b, Request::AnswerCall).await;
+    assert_eq!(reply, Ok(OkReply::Done), "ANSWER_CALL: {reply:?}");
+    for events in [&mut events_a, &mut events_b] {
+        wait_event(events, Duration::from_secs(10), |e| {
+            matches!(
+                e,
+                LinkEvent::CallState {
+                    state: CallSignal::Accept,
+                    ..
+                }
+            )
+        })
+        .await;
+    }
+
+    // A завершает: оба получают end, повторный END — NO_CALL.
+    let reply = execute_retry(&link_a, Request::EndCall).await;
+    assert_eq!(reply, Ok(OkReply::Done), "END_CALL: {reply:?}");
+    for events in [&mut events_a, &mut events_b] {
+        wait_event(events, Duration::from_secs(10), |e| {
+            matches!(
+                e,
+                LinkEvent::CallState {
+                    state: CallSignal::End,
+                    ..
+                }
+            )
+        })
+        .await;
+    }
+    let reply = CoreLink::execute(&*link_a, Request::EndCall).await;
+    assert_eq!(
+        reply,
+        Err(LinkError::Kernel(Status::NoCall)),
+        "повторный END_CALL — NO_CALL: {reply:?}"
     );
 }
