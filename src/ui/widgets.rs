@@ -351,7 +351,7 @@ pub fn invite_panel(view: &InviteView, scale: f32) -> Element<'_, Message> {
     // Форма выдачи: адрес опционален; relay только с адресом (CORE-API §4.2).
     body = body.push(text("Адрес").size(11.0 * scale).color(palette::DIM));
     body = body.push(
-        text_input("host:7777 — необязательно", &view.addr)
+        text_input("192.168.1.5:7777 — необязательно", &view.addr)
             .on_input(|value| Message::Meet(MeetIn::AddrInput(value)))
             .size(12.0 * scale)
             .padding(8)
@@ -359,7 +359,7 @@ pub fn invite_panel(view: &InviteView, scale: f32) -> Element<'_, Message> {
     );
     body = body.push(
         iced::widget::checkbox(view.relay)
-            .label("через relay — собеседник не увидит ваш IP")
+            .label("через посредника — собеседник не увидит ваш IP")
             .on_toggle(|on| Message::Meet(MeetIn::RelayToggled(on)))
             .text_size(11.0 * scale)
             .style(palette::checkbox_style),

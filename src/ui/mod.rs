@@ -20,7 +20,6 @@ use crate::core_link::{now_ms, CoreLink, LinkEvent, OkReply, Reply, Request};
 use crate::model::cid::Cid;
 use crate::model::feed::FeedItem;
 use crate::model::msg::MsgId;
-use crate::model::store::Session;
 use crate::model::store::Store;
 
 /// Лимит тела SEND_MESSAGE (str16 ≤ 4096, CORE-API.md §4.3).
@@ -716,13 +715,15 @@ fn qr_of(code: &str) -> Option<qr_code::Data> {
 
 /// Вид: окно целиком, оверлей поверх (GUI_UI.md §1).
 pub fn view<L: CoreLink>(state: &State<L>) -> Element<'_, Message> {
-    let window = column![
+    let mut window = column![
         title_bar(state),
         row![sidebar(state), main_pane(state)].height(Length::Fill),
-        status_bar(state),
     ]
     .width(Length::Fill)
     .height(Length::Fill);
+    if let Some(bar) = status_bar(state) {
+        window = window.push(bar);
+    }
 
     let layered: Element<'_, Message> = match &state.overlay {
         Overlay::None => window.into(),
@@ -837,13 +838,6 @@ fn overlay_layer<'a, L: CoreLink>(
 
 fn title_bar<L: CoreLink>(state: &State<L>) -> Element<'static, Message> {
     let scale = state.store.settings.font_scale;
-    let (label, color) = if state.link.is_stub() {
-        ("режим: заглушка", palette::DIM)
-    } else if state.link_up {
-        ("ядро: UDS", palette::DIM)
-    } else {
-        ("ядро: нет связи", palette::ERR)
-    };
     container(
         row![
             text("shopot")
@@ -860,7 +854,6 @@ fn title_bar<L: CoreLink>(state: &State<L>) -> Element<'static, Message> {
                 })
                 .style(palette::button_plain)
                 .on_press(Message::Settings(SettingsIn::Open)),
-            text(label).size(11.0 * scale).color(color),
         ]
         .spacing(10)
         .align_y(Vertical::Center),
@@ -1023,10 +1016,13 @@ fn main_pane<L: CoreLink>(state: &State<L>) -> Element<'_, Message> {
                         .font(palette::bold())
                         .color(palette::TEXT),
                     {
-                        let (label, color) = match state.store.session(cid) {
-                            Session::Up => ("защищённая сессия", palette::OK),
-                            Session::Down => ("сессия не установлена", palette::WARN),
-                            Session::Unknown => ("состояние сессии неизвестно", palette::MUTED),
+                        // Presence и сессия здесь одно и то же: ядро не
+                        // шлёт сессию отдельно, она выводится из PRESENCE
+                        // (store.rs). Пользователю — простые слова.
+                        let (label, color) = if online {
+                            ("в сети", palette::OK)
+                        } else {
+                            ("не в сети", palette::DIM)
                         };
                         text(label).size(10.0 * scale).color(color)
                     },
@@ -1043,9 +1039,6 @@ fn main_pane<L: CoreLink>(state: &State<L>) -> Element<'_, Message> {
             .style(palette::button_plain)
             .on_press(Message::Meet(MeetIn::OpenCard(cid))),
             space::Space::new().width(Length::Fill),
-            text(if online { "●" } else { "○" })
-                .size(12.0 * scale)
-                .color(if online { palette::OK } else { palette::DIM }),
         ]
         .spacing(8)
         .align_y(Vertical::Center),
@@ -1132,7 +1125,7 @@ fn composer<L: CoreLink>(state: &State<L>) -> Element<'_, Message> {
         .id(state.composer_id.clone())
         .height(Length::Fixed(editor_height))
         .size(14.0 * scale)
-        .placeholder("Сообщение… · Enter — отправить, Shift+Enter — перенос строки")
+        .placeholder("Сообщение")
         .padding(Padding {
             top: 10.0,
             right: 12.0,
@@ -1238,27 +1231,20 @@ fn ctrl_binding(event: text_editor::KeyPress) -> Option<text_editor::Binding<Mes
     }
 }
 
-fn status_bar<L: CoreLink>(state: &State<L>) -> Element<'static, Message> {
+/// Статус-строка существует только ради проблемы: нормальная работа не
+/// занимает место на экране. Заглушка (демо без ядра) проблемой не
+/// считается — там и показывать нечего.
+fn status_bar<L: CoreLink>(state: &State<L>) -> Option<Element<'static, Message>> {
     let scale = state.store.settings.font_scale;
-    let total = state.store.contacts().count();
-    let online = state.store.online_count();
-    let (line, color) = if !state.link.is_stub() && !state.link_up {
-        (
-            format!("ядро: нет связи · сессий: {online} из {total}"),
-            palette::ERR,
+    if state.link.is_stub() || state.link_up {
+        return None;
+    }
+    Some(
+        container(
+            text("Нет соединения. Сообщения не отправляются.")
+                .size(11.0 * scale)
+                .color(palette::ERR),
         )
-    } else {
-        let mode = if state.link.is_stub() {
-            "заглушка"
-        } else {
-            "UDS"
-        };
-        (
-            format!("ядро: {mode} · сессий: {online} из {total}"),
-            palette::DIM,
-        )
-    };
-    container(text(line).size(11.0 * scale).color(color))
         .width(Length::Fill)
         .height(Length::Fixed(24.0))
         .padding(Padding {
@@ -1269,7 +1255,8 @@ fn status_bar<L: CoreLink>(state: &State<L>) -> Element<'static, Message> {
         })
         .align_y(Vertical::Center)
         .style(palette::panel)
-        .into()
+        .into(),
+    )
 }
 
 // ---------- время и локальные подписи (TEXT_STYLE.md §3) ----------

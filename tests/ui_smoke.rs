@@ -251,7 +251,7 @@ fn invite_with_address_and_relay() {
     );
 
     // Адрес и relay-галка.
-    let [press, release] = click("host:7777 — необязательно");
+    let [press, release] = click("192.168.1.5:7777 — необязательно");
     run_instruction(&mut emu, &program, &mut receiver, press);
     run_instruction(&mut emu, &program, &mut receiver, release);
     run_instruction(
@@ -262,7 +262,7 @@ fn invite_with_address_and_relay() {
             "192.168.1.5:7777".into(),
         ))),
     );
-    let [press, release] = click("через relay — собеседник не увидит ваш IP");
+    let [press, release] = click("через посредника — собеседник не увидит ваш IP");
     run_instruction(&mut emu, &program, &mut receiver, press);
     run_instruction(&mut emu, &program, &mut receiver, release);
 
