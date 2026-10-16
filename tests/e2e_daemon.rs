@@ -874,3 +874,164 @@ async fn search_finds_messages_two_daemons() {
         "промах — пусто: {reply:?}"
     );
 }
+
+/// Закрепы (S12, API 2.2+): закреп чата и сообщения живут в БД ядра
+/// и переживают рестарт демона (§4.8). Два демона, LAN-знакомство.
+#[tokio::test]
+async fn pins_survive_daemon_restart() {
+    if std::env::var("SHOPOT_BIN").is_err() {
+        eprintln!("SHOPOT_BIN не задан — e2e против демона пропущен");
+        return;
+    }
+
+    let mut a = spawn_daemon("pa");
+    let b = spawn_daemon("pb");
+    let sock_a = wait_socket(&a.1).await;
+    let sock_b = wait_socket(&b.1).await;
+    let link_a = std::sync::Arc::new(UdsLink::with_config(
+        sock_a,
+        Duration::from_millis(100),
+        false,
+    ));
+    let link_b = std::sync::Arc::new(UdsLink::with_config(
+        sock_b,
+        Duration::from_millis(100),
+        false,
+    ));
+    let mut events_a = Box::pin(CoreLink::events(std::sync::Arc::clone(&link_a)));
+    let mut events_b = Box::pin(CoreLink::events(std::sync::Arc::clone(&link_b)));
+    wait_event(&mut events_a, Duration::from_secs(10), |e| {
+        matches!(e, LinkEvent::Resync)
+    })
+    .await;
+    wait_event(&mut events_b, Duration::from_secs(10), |e| {
+        matches!(e, LinkEvent::Resync)
+    })
+    .await;
+
+    // Гейт: закрепы появились в API 2.2; моложе — тест не о чём говорить.
+    let reply = CoreLink::execute(&*link_a, Request::Version).await;
+    let Ok(OkReply::Version { major, minor, .. }) = reply else {
+        panic!("GET_VERSION не удался: {reply:?}")
+    };
+    if (major, minor) < (2, 2) {
+        eprintln!("ядро {major}.{minor} < 2.2 — закрепы не поддержаны, пропуск");
+        return;
+    }
+
+    // Знакомство по LAN-коду.
+    let code = match CoreLink::execute(
+        &*link_a,
+        Request::Invite {
+            relay: false,
+            addr: String::new(),
+        },
+    )
+    .await
+    {
+        Ok(OkReply::Code(code)) => code,
+        other => panic!("CREATE_INVITE не удался: {other:?}"),
+    };
+    let cid_b = match CoreLink::execute(&*link_b, Request::Add { code }).await {
+        Ok(OkReply::Added { cid }) => cid,
+        other => panic!("ACCEPT_INVITE не удался: {other:?}"),
+    };
+    let joined = wait_event(&mut events_a, Duration::from_secs(20), |e| {
+        matches!(e, LinkEvent::ContactJoined { .. })
+    })
+    .await;
+    let LinkEvent::ContactJoined { cid: cid_a, .. } = joined else {
+        unreachable!()
+    };
+    wait_event(&mut events_b, Duration::from_secs(20), |e| {
+        matches!(e, LinkEvent::Presence { online: true, .. })
+    })
+    .await;
+
+    // B пишет A; A закрепляет чат и это сообщение.
+    let reply = CoreLink::execute(
+        &*link_b,
+        Request::SendMsg {
+            cid: cid_b,
+            text: "закрепи меня".into(),
+        },
+    )
+    .await;
+    assert!(matches!(reply, Ok(OkReply::Sent { .. })), "{reply:?}");
+    let received = wait_event(&mut events_a, Duration::from_secs(20), |e| {
+        matches!(e, LinkEvent::MessageReceived { .. })
+    })
+    .await;
+    let LinkEvent::MessageReceived { msg_id, .. } = received else {
+        unreachable!()
+    };
+
+    let reply = CoreLink::execute(&*link_a, Request::PinChat { cid: cid_a }).await;
+    assert_eq!(reply, Ok(OkReply::Done), "PIN_CHAT: {reply:?}");
+    let reply = CoreLink::execute(&*link_a, Request::PinMessage { cid: cid_a, msg_id }).await;
+    assert_eq!(reply, Ok(OkReply::Done), "PIN_MESSAGE: {reply:?}");
+
+    // До рестарта: чат закреплён, сообщение в списке, тело по GET_MESSAGE.
+    let reply = CoreLink::execute(&*link_a, Request::PinnedChat).await;
+    assert_eq!(reply, Ok(OkReply::PinnedChat { cid: Some(cid_a) }));
+    let reply = CoreLink::execute(&*link_a, Request::PinnedMessages { cid: cid_a }).await;
+    assert_eq!(reply, Ok(OkReply::PinnedMessages { ids: vec![msg_id] }));
+    let reply = CoreLink::execute(&*link_a, Request::GetMessage { msg_id }).await;
+    assert!(
+        matches!(&reply, Ok(OkReply::Message { cid, text, .. })
+            if *cid == cid_a && text == "закрепи меня"),
+        "GET_MESSAGE: {reply:?}"
+    );
+
+    // Рестарт демона A: тот же $HOME (та же БД), новый процесс serve.
+    drop(events_a);
+    drop(link_a);
+    a.0.kill().expect("демон убит");
+    let _ = a.0.wait();
+    let bin = std::env::var("SHOPOT_BIN").expect("SHOPOT_BIN задан");
+    a.0 = Command::new(&bin)
+        .arg("serve")
+        .env("HOME", &a.1)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("демон перезапущен");
+    // Старый api.sock может остаться лежать: ждём, пока новый отвечает.
+    let sock_a = wait_socket(&a.1).await;
+    let link_a = std::sync::Arc::new(UdsLink::with_config(
+        sock_a,
+        Duration::from_millis(100),
+        false,
+    ));
+    let mut events_a = Box::pin(CoreLink::events(std::sync::Arc::clone(&link_a)));
+    wait_event(&mut events_a, Duration::from_secs(10), |e| {
+        matches!(e, LinkEvent::Resync)
+    })
+    .await;
+
+    // После рестарта закрепы на месте (§4.8: «переживает рестарт»).
+    let reply = CoreLink::execute(&*link_a, Request::PinnedChat).await;
+    assert_eq!(
+        reply,
+        Ok(OkReply::PinnedChat { cid: Some(cid_a) }),
+        "закреп чата пережил рестарт: {reply:?}"
+    );
+    let reply = CoreLink::execute(&*link_a, Request::PinnedMessages { cid: cid_a }).await;
+    assert_eq!(
+        reply,
+        Ok(OkReply::PinnedMessages { ids: vec![msg_id] }),
+        "закреп сообщения пережил рестарт: {reply:?}"
+    );
+
+    // Откреп: чат и сообщение снимаются, повтор идемпотентен.
+    let reply = CoreLink::execute(&*link_a, Request::UnpinChat).await;
+    assert_eq!(reply, Ok(OkReply::Done));
+    let reply = CoreLink::execute(&*link_a, Request::PinnedChat).await;
+    assert_eq!(reply, Ok(OkReply::PinnedChat { cid: None }));
+    for _ in 0..2 {
+        let reply = CoreLink::execute(&*link_a, Request::UnpinMessage { cid: cid_a, msg_id }).await;
+        assert_eq!(reply, Ok(OkReply::Done), "UNPIN идемпотентен: {reply:?}");
+    }
+    let reply = CoreLink::execute(&*link_a, Request::PinnedMessages { cid: cid_a }).await;
+    assert_eq!(reply, Ok(OkReply::PinnedMessages { ids: vec![] }));
+}
