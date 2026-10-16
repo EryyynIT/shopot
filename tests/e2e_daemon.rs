@@ -1835,3 +1835,138 @@ async fn reactions_two_daemons() {
     assert!(!add);
     assert_eq!(emoji, '👍');
 }
+
+/// Два демона: файл доезжает (S10). A шлёт реальный файл с диска; B
+/// получает FILE_RECEIVED, файл лежит в его ~/.shopot/files/<hex> с тем
+/// же содержимым; A получает FILE_SENT — честный «отправлен».
+#[tokio::test]
+async fn file_transfer_two_daemons() {
+    if std::env::var("SHOPOT_BIN").is_err() {
+        eprintln!("SHOPOT_BIN не задан — e2e против демона пропущен");
+        return;
+    }
+
+    let a = spawn_daemon("fa");
+    let b = spawn_daemon("fb");
+    let sock_a = wait_socket(&a.1).await;
+    let sock_b = wait_socket(&b.1).await;
+    let link_a = std::sync::Arc::new(UdsLink::with_config(
+        sock_a,
+        Duration::from_millis(100),
+        false,
+    ));
+    let link_b = std::sync::Arc::new(UdsLink::with_config(
+        sock_b,
+        Duration::from_millis(100),
+        false,
+    ));
+    let mut events_a = Box::pin(CoreLink::events(std::sync::Arc::clone(&link_a)));
+    let mut events_b = Box::pin(CoreLink::events(std::sync::Arc::clone(&link_b)));
+    for events in [&mut events_a, &mut events_b] {
+        wait_event(events, Duration::from_secs(10), |e| {
+            matches!(e, LinkEvent::Resync)
+        })
+        .await;
+    }
+
+    // Знакомство A↔B.
+    let code = match execute_retry(
+        &link_a,
+        Request::Invite {
+            relay: false,
+            addr: String::new(),
+        },
+    )
+    .await
+    {
+        Ok(OkReply::Code(code)) => code,
+        other => panic!("CREATE_INVITE не удался: {other:?}"),
+    };
+    let cid_a_at_b = match execute_retry(&link_b, Request::Add { code }).await {
+        Ok(OkReply::Added { cid }) => cid,
+        other => panic!("ACCEPT_INVITE не удался: {other:?}"),
+    };
+    let joined = wait_event(&mut events_a, Duration::from_secs(20), |e| {
+        matches!(e, LinkEvent::ContactJoined { .. })
+    })
+    .await;
+    let LinkEvent::ContactJoined { cid: cid_b, .. } = joined else {
+        unreachable!()
+    };
+    // Сессия обеих сторон (файл можно и в outbox, но так быстрее).
+    for (events, cid) in [(&mut events_a, cid_b), (&mut events_b, cid_a_at_b)] {
+        wait_event(
+            events,
+            Duration::from_secs(20),
+            |e| matches!(e, LinkEvent::Presence { cid: c, online: true, .. } if *c == cid),
+        )
+        .await;
+    }
+
+    // Файл на диске A (демон читает сам — путь его ФС).
+    let payload: Vec<u8> = (0..50_000u32).map(|i| (i % 251) as u8).collect();
+    let src = std::env::temp_dir().join(format!("shopot-e2e-file-{}.bin", std::process::id()));
+    std::fs::write(&src, &payload).expect("файл записан");
+
+    let reply = CoreLink::execute(
+        &*link_a,
+        Request::SendFile {
+            cid: cid_b,
+            path: src.to_string_lossy().into_owned(),
+        },
+    )
+    .await;
+    let Ok(OkReply::FileQueued { file_id, size, .. }) = reply else {
+        panic!("SEND_FILE не удался: {reply:?}")
+    };
+    assert_eq!(size as usize, payload.len());
+
+    // B: FILE_RECEIVED + файл на диске с тем же содержимым.
+    let event = wait_event(&mut events_b, Duration::from_secs(30), |e| {
+        matches!(e, LinkEvent::FileReceived { .. })
+    })
+    .await;
+    let LinkEvent::FileReceived {
+        cid,
+        file_id: got,
+        size: got_size,
+        name,
+    } = event
+    else {
+        unreachable!()
+    };
+    assert_eq!(cid, cid_a_at_b);
+    assert_eq!(got, file_id, "file_id = SHA-256[0..16], у обеих один");
+    assert_eq!(got_size as usize, payload.len());
+    assert_eq!(name, src.file_name().unwrap().to_string_lossy());
+
+    let hex: String = file_id.iter().map(|b| format!("{b:02x}")).collect();
+    let stored = b.1.join(".shopot/files").join(&hex);
+    let stored_bytes =
+        std::fs::read(&stored).unwrap_or_else(|e| panic!("файл у B на диске ({:?}): {e}", stored));
+    assert_eq!(stored_bytes, payload, "содержимое доехало без искажений");
+
+    // A: FILE_SENT — все чанки подтверждены.
+    let event = wait_event(&mut events_a, Duration::from_secs(30), |e| {
+        matches!(e, LinkEvent::FileSent { .. })
+    })
+    .await;
+    let LinkEvent::FileSent { cid, file_id: got } = event else {
+        unreachable!()
+    };
+    assert_eq!(cid, cid_b);
+    assert_eq!(got, file_id);
+
+    // Нет файла — честный FILE_NOT_FOUND.
+    let reply = CoreLink::execute(
+        &*link_a,
+        Request::SendFile {
+            cid: cid_b,
+            path: "/нет/такого.bin".into(),
+        },
+    )
+    .await;
+    assert_eq!(reply, Err(LinkError::Kernel(Status::FileNotFound)));
+
+    std::fs::remove_file(&src).ok();
+}
