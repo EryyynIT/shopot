@@ -95,6 +95,10 @@ pub struct Msg {
     pub reactions: Vec<Reaction>,
     /// Файл (S10): сообщение-вложение; body дублирует имя для поиска.
     pub file: Option<FileRef>,
+    /// Ответ на сообщение (будущее): msg_id исходного. Контракта ядра
+    /// (SEND_REPLY_MESSAGE) пока нет — поле модели подготовлено, UI и
+    /// провод не подключены; всегда None.
+    pub reply_to: Option<CoreMsgId>,
     pub send: SendState,
     /// msg_id ядра, если известен; по нему приходит MESSAGE_DELIVERED.
     pub core_id: Option<CoreMsgId>,
@@ -117,6 +121,7 @@ impl Msg {
             entities,
             reactions: Vec::new(),
             file: None,
+            reply_to: None,
             send: SendState::Sent,
             core_id,
         }
@@ -131,6 +136,7 @@ impl Msg {
             entities,
             reactions: Vec::new(),
             file: None,
+            reply_to: None,
             send: SendState::Sending,
             core_id: None,
         }
@@ -145,6 +151,7 @@ impl Msg {
             entities: Vec::new(),
             reactions: Vec::new(),
             file: None,
+            reply_to: None,
             send: SendState::Sent,
             core_id: None,
         }
@@ -160,6 +167,7 @@ impl Msg {
             entities: Vec::new(),
             reactions: Vec::new(),
             file: None,
+            reply_to: None,
             send: SendState::Sent,
             core_id: None,
         }
@@ -175,6 +183,7 @@ impl Msg {
             entities: Vec::new(),
             reactions: Vec::new(),
             file: Some(file),
+            reply_to: None,
             send: SendState::Sending,
             core_id: None,
         }
@@ -190,6 +199,7 @@ impl Msg {
             entities: Vec::new(),
             reactions: Vec::new(),
             file: Some(file),
+            reply_to: None,
             send: SendState::Sent,
             core_id: None,
         }
