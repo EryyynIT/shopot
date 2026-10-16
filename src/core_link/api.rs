@@ -69,6 +69,14 @@ pub enum Method {
     /// API 2.1+: поиск по истории чата / по всем чатам (§4.3).
     SearchMessage = 23,
     GlobalSearchMessage = 24,
+    /// API 2.2+: закреп чата (один на демон) (§4.8).
+    PinChat = 25,
+    GetPinnedChat = 26,
+    UnpinChat = 27,
+    /// API 2.2+: закрепы сообщений (≤16 на чат) (§4.8).
+    PinMessage = 30,
+    UnpinMessage = 31,
+    GetPinnedMessages = 32,
 }
 
 impl Method {
@@ -98,6 +106,12 @@ impl Method {
             22 => Self::Listen,
             23 => Self::SearchMessage,
             24 => Self::GlobalSearchMessage,
+            25 => Self::PinChat,
+            26 => Self::GetPinnedChat,
+            27 => Self::UnpinChat,
+            30 => Self::PinMessage,
+            31 => Self::UnpinMessage,
+            32 => Self::GetPinnedMessages,
             _ => return None,
         })
     }
@@ -554,7 +568,10 @@ mod tests {
         assert_eq!(Method::from_u16(0), None);
         assert_eq!(Method::from_u16(23), Some(Method::SearchMessage));
         assert_eq!(Method::from_u16(24), Some(Method::GlobalSearchMessage));
-        assert_eq!(Method::from_u16(25), None);
+        assert_eq!(Method::from_u16(25), Some(Method::PinChat));
+        assert_eq!(Method::from_u16(32), Some(Method::GetPinnedMessages));
+        assert_eq!(Method::from_u16(28), None, "DELETE_CHAT — спринт S13");
+        assert_eq!(Method::from_u16(33), None);
         assert_eq!(Status::from_u16(4), Status::NoContact);
         assert_eq!(Status::from_u16(600), Status::Unknown(600));
         assert_eq!(Event::from_u16(10), Some(Event::BlockedByPeer));

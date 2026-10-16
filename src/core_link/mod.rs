@@ -67,6 +67,24 @@ pub enum Request {
         limit: u32,
         offset: u32,
     },
+    /// Закрепить чат (PIN_CHAT, API 2.2+): закреп один на демон,
+    /// повторное закрепление идемпотентно (§4.8).
+    PinChat { cid: Cid },
+    /// Открепить чат (UNPIN_CHAT).
+    UnpinChat,
+    /// Какой чат закреплён (GET_PINNED_CHAT).
+    PinnedChat,
+    /// Закреплённые сообщения чата (GET_PINNED_MESSAGES): ≤16 msg_id
+    /// в порядке закрепления (§4.8).
+    PinnedMessages { cid: Cid },
+    /// Закрепить сообщение (PIN_MESSAGE): сообщение обязано быть
+    /// в истории чата, иначе NOT_FOUND.
+    PinMessage { cid: Cid, msg_id: CoreMsgId },
+    /// Открепить сообщение (UNPIN_MESSAGE, идемпотентен).
+    UnpinMessage { cid: Cid, msg_id: CoreMsgId },
+    /// Запись истории по msg_id (GET_MESSAGE) — тела закреплённых
+    /// (GET_PINNED_MESSAGES отдаёт только идентификаторы).
+    GetMessage { msg_id: CoreMsgId },
 }
 
 /// Совпадение поиска ядра (SEARCH_MESSAGE/GLOBAL_SEARCH_MESSAGE, §4.3).
@@ -175,6 +193,18 @@ pub enum OkReply {
     /// SEARCH_MESSAGE/GLOBAL_SEARCH_MESSAGE: всего совпадений + страница
     /// (точные новые → старые, затем нечёткие).
     Search { total: u32, hits: Vec<SearchHit> },
+    /// GET_PINNED_CHAT: закреплённый чат (None — закрепа нет).
+    PinnedChat { cid: Option<Cid> },
+    /// GET_PINNED_MESSAGES: msg_id в порядке закрепления.
+    PinnedMessages { ids: Vec<CoreMsgId> },
+    /// GET_MESSAGE: запись истории (реакции пропущены до своего спринта).
+    Message {
+        cid: Cid,
+        mine: bool,
+        delivered: bool,
+        ts_ms: i64,
+        text: String,
+    },
     /// У команды нет содержательного ответа (block/unblock).
     Done,
 }

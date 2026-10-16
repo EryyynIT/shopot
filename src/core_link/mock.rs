@@ -217,6 +217,10 @@ struct State {
     contacts: Vec<MockContact>,
     lcg: Lcg,
     guest_seq: u64,
+    /// Закреплённый чат (семантика 2.2: один на демон, идемпотентно).
+    pinned_chat: Option<Cid>,
+    /// Закреплённые сообщения по чатам (≤16, порядок закрепления).
+    pinned_msgs: HashMap<Cid, Vec<CoreMsgId>>,
 }
 
 struct MockContact {
@@ -265,6 +269,8 @@ impl MockLink {
                     contacts,
                     lcg: Lcg(0x5e0f),
                     guest_seq: 0,
+                    pinned_chat: None,
+                    pinned_msgs: HashMap::new(),
                 }),
                 tx,
                 rx: Mutex::new(Some(rx)),
@@ -530,6 +536,70 @@ impl MockLink {
                     .take(limit as usize)
                     .collect();
                 Ok(OkReply::Search { total, hits: page })
+            }
+            Request::PinChat { cid } => {
+                let mut state = inner.state.lock().expect("стейт не отравлен");
+                if !state.contacts.iter().any(|c| c.cid == cid) {
+                    return Err(LinkError::Kernel(Status::NoContact));
+                }
+                state.pinned_chat = Some(cid);
+                Ok(OkReply::Done)
+            }
+            Request::UnpinChat => {
+                inner.state.lock().expect("стейт не отравлен").pinned_chat = None;
+                Ok(OkReply::Done)
+            }
+            Request::PinnedChat => {
+                let cid = inner.state.lock().expect("стейт не отравлен").pinned_chat;
+                Ok(OkReply::PinnedChat { cid })
+            }
+            Request::PinnedMessages { cid } => {
+                let state = inner.state.lock().expect("стейт не отравлен");
+                let ids = state.pinned_msgs.get(&cid).cloned().unwrap_or_default();
+                Ok(OkReply::PinnedMessages { ids })
+            }
+            Request::PinMessage { cid, msg_id } => {
+                // Семантика ядра: сообщение обязано быть в истории чата,
+                // лимит — 16 закрепов на чат (§4.8).
+                let known = scene
+                    .history
+                    .get(&cid.0)
+                    .is_some_and(|recs| recs.iter().any(|r| r.msg_id == msg_id));
+                if !known {
+                    return Err(LinkError::Kernel(Status::NotFound));
+                }
+                let mut state = inner.state.lock().expect("стейт не отравлен");
+                let pins = state.pinned_msgs.entry(cid).or_default();
+                if pins.contains(&msg_id) {
+                    return Ok(OkReply::Done);
+                }
+                if pins.len() >= 16 {
+                    return Err(LinkError::Kernel(Status::TooBig));
+                }
+                pins.push(msg_id);
+                Ok(OkReply::Done)
+            }
+            Request::UnpinMessage { cid, msg_id } => {
+                let mut state = inner.state.lock().expect("стейт не отравлен");
+                if let Some(pins) = state.pinned_msgs.get_mut(&cid) {
+                    pins.retain(|id| *id != msg_id);
+                }
+                Ok(OkReply::Done)
+            }
+            Request::GetMessage { msg_id } => {
+                // Заглушка знает записи сценарной истории.
+                for (cid, records) in &scene.history {
+                    if let Some(record) = records.iter().find(|r| r.msg_id == msg_id) {
+                        return Ok(OkReply::Message {
+                            cid: Cid(*cid),
+                            mine: record.mine,
+                            delivered: record.delivered,
+                            ts_ms: record.ts_ms,
+                            text: record.text.clone(),
+                        });
+                    }
+                }
+                Err(LinkError::Kernel(Status::NotFound))
             }
         }
     }
@@ -920,5 +990,80 @@ mod tests {
             })
             .await;
         assert_eq!(reply, Err(LinkError::Kernel(Status::BadArgs)));
+    }
+
+    /// Закрепы заглушки (S12): семантика §4.8 — чат один, закрепление
+    /// идемпотентно, неизвестное сообщение — NOT_FOUND.
+    #[tokio::test(start_paused = true)]
+    async fn pins_match_kernel_semantics() {
+        let mut scene = scene();
+        scene
+            .history
+            .insert(1, vec![record(1, "важное"), record(2, "обычное")]);
+        let link = MockLink::new(scene);
+
+        // Чат: закреп → перезакреп на другой → чужой контакт.
+        let reply = link.execute(Request::PinChat { cid: Cid(1) }).await;
+        assert_eq!(reply, Ok(OkReply::Done));
+        let reply = link.execute(Request::PinnedChat).await;
+        assert_eq!(reply, Ok(OkReply::PinnedChat { cid: Some(Cid(1)) }));
+        let _ = link.execute(Request::PinChat { cid: Cid(2) }).await;
+        let reply = link.execute(Request::PinnedChat).await;
+        assert_eq!(
+            reply,
+            Ok(OkReply::PinnedChat { cid: Some(Cid(2)) }),
+            "закреп один на демон"
+        );
+        let reply = link.execute(Request::PinChat { cid: Cid(99) }).await;
+        assert_eq!(reply, Err(LinkError::Kernel(Status::NoContact)));
+
+        // Сообщения: порядок закрепления, идемпотентность, NOT_FOUND.
+        let first = core_id(1);
+        let second = core_id(2);
+        for msg_id in [first, second, first] {
+            let reply = link
+                .execute(Request::PinMessage {
+                    cid: Cid(1),
+                    msg_id,
+                })
+                .await;
+            assert_eq!(reply, Ok(OkReply::Done));
+        }
+        let reply = link.execute(Request::PinnedMessages { cid: Cid(1) }).await;
+        assert_eq!(
+            reply,
+            Ok(OkReply::PinnedMessages {
+                ids: vec![first, second]
+            }),
+            "повтор не дублирует"
+        );
+        let reply = link
+            .execute(Request::PinMessage {
+                cid: Cid(1),
+                msg_id: core_id(77),
+            })
+            .await;
+        assert_eq!(
+            reply,
+            Err(LinkError::Kernel(Status::NotFound)),
+            "сообщение должно быть в истории"
+        );
+
+        // GetMessage достаёт запись; откреп идемпотентен.
+        let reply = link.execute(Request::GetMessage { msg_id: first }).await;
+        let Ok(OkReply::Message { cid, text, .. }) = reply else {
+            panic!("{reply:?}");
+        };
+        assert_eq!((cid, text.as_str()), (Cid(1), "важное"));
+        for _ in 0..2 {
+            let _ = link
+                .execute(Request::UnpinMessage {
+                    cid: Cid(1),
+                    msg_id: first,
+                })
+                .await;
+        }
+        let reply = link.execute(Request::PinnedMessages { cid: Cid(1) }).await;
+        assert_eq!(reply, Ok(OkReply::PinnedMessages { ids: vec![second] }));
     }
 }

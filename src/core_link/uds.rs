@@ -408,6 +408,31 @@ fn encode_request(request: &Request, api2: bool) -> (Method, Vec<u8>) {
                 Method::GlobalSearchMessage
             }
         }
+        // Закрепы (API 2.2+, §4.8): раскладки тривиальны.
+        Request::PinChat { cid } => {
+            api::put::u32(&mut payload, cid.0 as u32);
+            Method::PinChat
+        }
+        Request::UnpinChat => Method::UnpinChat,
+        Request::PinnedChat => Method::GetPinnedChat,
+        Request::PinnedMessages { cid } => {
+            api::put::u32(&mut payload, cid.0 as u32);
+            Method::GetPinnedMessages
+        }
+        Request::PinMessage { cid, msg_id } => {
+            api::put::u32(&mut payload, cid.0 as u32);
+            payload.extend_from_slice(&msg_id.0);
+            Method::PinMessage
+        }
+        Request::UnpinMessage { cid, msg_id } => {
+            api::put::u32(&mut payload, cid.0 as u32);
+            payload.extend_from_slice(&msg_id.0);
+            Method::UnpinMessage
+        }
+        Request::GetMessage { msg_id } => {
+            payload.extend_from_slice(&msg_id.0);
+            Method::GetMessage
+        }
     };
     (method, payload)
 }
@@ -522,6 +547,57 @@ fn decode_reply(method: Method, raw: RawReply, api2: bool) -> Reply {
                 });
             }
             OkReply::Search { total, hits }
+        }
+        // GET_PINNED_CHAT (2.2+): [cid u32], 0 = закрепа нет.
+        Method::GetPinnedChat => {
+            let mut r = api::Reader::new(&raw.payload);
+            let cid = r.read_u32().map_err(|_| LinkError::BadFrame("cid"))?;
+            OkReply::PinnedChat {
+                cid: (cid != 0).then_some(Cid(i64::from(cid))),
+            }
+        }
+        // GET_PINNED_MESSAGES (2.2+): [count u32] × [msg_id 16].
+        Method::GetPinnedMessages => {
+            let mut r = api::Reader::new(&raw.payload);
+            let count = r.read_u32().map_err(|_| LinkError::BadFrame("count"))?;
+            let mut ids = Vec::with_capacity(count as usize);
+            for _ in 0..count {
+                let mut msg_id = [0u8; 16];
+                msg_id.copy_from_slice(
+                    r.read_bytes(16)
+                        .map_err(|_| LinkError::BadFrame("msg_id"))?,
+                );
+                ids.push(CoreMsgId(msg_id));
+            }
+            OkReply::PinnedMessages { ids }
+        }
+        // GET_MESSAGE: [cid u32][flags u8][ts u64][body str16]; у API 2.x
+        // далее entity tail и список реакций — пропускаем до своих спринтов.
+        Method::GetMessage => {
+            let mut r = api::Reader::new(&raw.payload);
+            let cid = r.read_u32().map_err(|_| LinkError::BadFrame("cid"))?;
+            let flags = r.read_u8().map_err(|_| LinkError::BadFrame("flags"))?;
+            let ts_ms = r.read_u64().map_err(|_| LinkError::BadFrame("ts"))? as i64;
+            let body = r.read_str16().map_err(|_| LinkError::BadFrame("body"))?;
+            if api2 {
+                skip_entity_tail(&mut r)?;
+                // Реакции: [react_count u32] × {[flags u8][codepoint u32][ts u64]}.
+                let reacts = r.read_u32().map_err(|_| LinkError::BadFrame("reacts"))?;
+                for _ in 0..reacts {
+                    r.read_u8()
+                        .map_err(|_| LinkError::BadFrame("react_flags"))?;
+                    r.read_u32()
+                        .map_err(|_| LinkError::BadFrame("react_codepoint"))?;
+                    r.read_u64().map_err(|_| LinkError::BadFrame("react_ts"))?;
+                }
+            }
+            OkReply::Message {
+                cid: Cid(i64::from(cid)),
+                mine: flags & 0b01 != 0,
+                delivered: flags & 0b10 != 0,
+                ts_ms,
+                text: String::from_utf8_lossy(body).into_owned(),
+            }
         }
         _ => OkReply::Done,
     };
@@ -1472,5 +1548,123 @@ mod tests {
             true,
         );
         assert!(matches!(reply, Err(LinkError::BadFrame(_))));
+    }
+
+    /// Закрепы (S12, §4.8): раскладки запросов и ответов по контракту.
+    #[test]
+    fn pins_codec_matches_contract() {
+        // PIN_CHAT: [cid u32].
+        let (method, payload) = encode_request(&Request::PinChat { cid: Cid(7) }, true);
+        assert_eq!(method, Method::PinChat);
+        assert_eq!(payload, 7u32.to_le_bytes());
+
+        // PIN_MESSAGE: [cid u32][msg_id 16].
+        let msg_id = CoreMsgId([0xAA; 16]);
+        let (method, payload) = encode_request(
+            &Request::PinMessage {
+                cid: Cid(7),
+                msg_id,
+            },
+            true,
+        );
+        assert_eq!(method, Method::PinMessage);
+        assert_eq!(&payload[..4], 7u32.to_le_bytes());
+        assert_eq!(&payload[4..], [0xAA; 16]);
+
+        // UNPIN_CHAT / GET_PINNED_CHAT: пустые.
+        assert_eq!(
+            encode_request(&Request::UnpinChat, true).1,
+            Vec::<u8>::new()
+        );
+        assert_eq!(
+            encode_request(&Request::PinnedChat, true).1,
+            Vec::<u8>::new()
+        );
+
+        // GET_MESSAGE: [msg_id 16].
+        let (method, payload) = encode_request(&Request::GetMessage { msg_id }, true);
+        assert_eq!(method, Method::GetMessage);
+        assert_eq!(payload, [0xAA; 16]);
+    }
+
+    #[test]
+    fn pinned_chat_reply_none_and_some() {
+        let decode = |cid: u32| {
+            decode_reply(
+                Method::GetPinnedChat,
+                RawReply {
+                    status: Status::Ok,
+                    payload: cid.to_le_bytes().to_vec(),
+                },
+                true,
+            )
+        };
+        assert_eq!(
+            decode(0).expect("ноль"),
+            OkReply::PinnedChat { cid: None },
+            "0 = закрепа нет"
+        );
+        assert_eq!(
+            decode(7).expect("cid"),
+            OkReply::PinnedChat { cid: Some(Cid(7)) }
+        );
+    }
+
+    #[test]
+    fn pinned_messages_reply_decodes_id_list() {
+        let mut payload = Vec::new();
+        api::put::u32(&mut payload, 2);
+        payload.extend_from_slice(&[1u8; 16]);
+        payload.extend_from_slice(&[2u8; 16]);
+        let reply = decode_reply(
+            Method::GetPinnedMessages,
+            RawReply {
+                status: Status::Ok,
+                payload,
+            },
+            true,
+        );
+        let Ok(OkReply::PinnedMessages { ids }) = reply else {
+            panic!("{reply:?}");
+        };
+        assert_eq!(ids, vec![CoreMsgId([1; 16]), CoreMsgId([2; 16])]);
+    }
+
+    /// GET_MESSAGE: флаги + обязательные entity tail и список реакций
+    /// (API 2.x) пропускаются, тело и сторона доезжают.
+    #[test]
+    fn get_message_reply_skips_entities_and_reactions() {
+        let mut payload = Vec::new();
+        api::put::u32(&mut payload, 7); // cid
+        payload.push(0b11); // mine + delivered
+        api::put::u64(&mut payload, 1_700_000_000_000);
+        api::put::str16(&mut payload, "тело закрепа").expect("str16");
+        payload.push(0); // ent_count: разметки нет
+        api::put::u32(&mut payload, 1); // одна реакция
+        payload.push(1); // react flags: моя
+        api::put::u32(&mut payload, 0x2764); // ❤
+        api::put::u64(&mut payload, 1_700_000_000_100);
+
+        let reply = decode_reply(
+            Method::GetMessage,
+            RawReply {
+                status: Status::Ok,
+                payload,
+            },
+            true,
+        );
+        let Ok(OkReply::Message {
+            cid,
+            mine,
+            delivered,
+            text,
+            ..
+        }) = reply
+        else {
+            panic!("{reply:?}");
+        };
+        assert_eq!(cid, Cid(7));
+        assert!(mine && delivered);
+        assert_eq!(text, "тело закрепа");
     }
 }
