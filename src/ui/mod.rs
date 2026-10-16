@@ -38,6 +38,54 @@ pub enum Message {
     Meet(MeetIn),
     Settings(SettingsIn),
     Window(WindowIn),
+    Call(CallIn),
+}
+
+/// Действия звонка (S7, GUI_UI.md §3): кнопки оверлея и шапки, тик
+/// таймера, готовность аудио-моста.
+#[derive(Debug, Clone)]
+pub enum CallIn {
+    /// «Позвонить» в шапке чата (START_CALL).
+    Start(Cid),
+    /// «Принять» входящий (ANSWER_CALL).
+    Answer,
+    /// «Отклонить» входящий / «Отменить» исходящий (END_CALL).
+    Decline,
+    /// «Завершить» активный (END_CALL).
+    Hangup,
+    /// Mute-тумблер: микрофон выключается нулями в fifo (DTX ядра).
+    ToggleMute,
+    /// Секундный тик таймера разговора (подписка в app.rs).
+    Tick,
+    /// Аудио-мост поднят в фоне (fifo + устройства); CallAudio не Clone,
+    /// поэтому едет в Arc<Mutex<Option>> — забирается один раз.
+    AudioReady(
+        std::sync::Arc<std::sync::Mutex<Option<crate::audio::CallAudio>>>,
+        Vec<crate::audio::AudioGap>,
+    ),
+}
+
+/// Стадия звонка (GUI_UI.md §3). Ended фазой нет: конец звонка —
+/// sys-строка в чате, оверлей закрывается.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CallPhase {
+    /// Входящий: ждём «Принять»/«Отклонить».
+    Incoming,
+    /// Исходящий: ждём accept пира.
+    Outgoing,
+    /// Разговор идёт: таймер, mute, «Завершить».
+    Active,
+}
+
+/// Живой звонок (оверлей). `call_id` отсекает события прошлых звонков.
+#[derive(Debug, Clone)]
+pub struct CallView {
+    pub cid: Cid,
+    pub call_id: [u8; 16],
+    pub phase: CallPhase,
+    /// Начало разговора (accept) — для таймера.
+    pub started_ms: i64,
+    pub muted: bool,
 }
 
 /// Ответы и события core_link. Не протекают в виджеты: update пишет
@@ -172,6 +220,9 @@ pub enum Overlay {
     SendCard(Cid),
     /// Подтверждение удаления чата (S13): действие необратимо.
     ConfirmDelete(Cid),
+    /// Звонок (S7): не закрывается ни Esc, ни кликом мимо — только
+    /// кнопками («Завершить» у активного, GUI_UI.md §3).
+    Call(CallView),
 }
 
 /// Стейт панели настроек: черновик имени профиля (S13.1) и итог
@@ -260,6 +311,8 @@ pub struct State<L: CoreLink> {
     /// Имя профиля, сохранённое в этом запуске (SET_NAME, §4.4). Ядро
     /// имя обратно не отдаёт (GET_NAME нет) — помним только свою запись.
     pub profile_name: Option<String>,
+    /// Аудио-мост активного звонка (S7); живёт, пока фаза Active.
+    pub call_audio: Option<crate::audio::CallAudio>,
 }
 
 impl<L: CoreLink> State<L> {
@@ -278,6 +331,7 @@ impl<L: CoreLink> State<L> {
             history_in_flight: false,
             kernel_api: (0, 0),
             profile_name: None,
+            call_audio: None,
         }
     }
 
@@ -293,6 +347,20 @@ impl<L: CoreLink> State<L> {
         self.kernel_api >= (2, 2)
     }
 
+    /// Живой звонок (S7), если оверлей звонка открыт.
+    pub fn call_view(&self) -> Option<&CallView> {
+        match &self.overlay {
+            Overlay::Call(view) => Some(view),
+            _ => None,
+        }
+    }
+
+    /// Идёт разговор (фаза Active) — для секундной подписки таймера.
+    pub fn call_active(&self) -> bool {
+        self.call_view()
+            .is_some_and(|view| view.phase == CallPhase::Active)
+    }
+
     /// Оверлей закрыт — инвариант для тестов и сценариев.
     pub fn overlay_closed(&self) -> bool {
         matches!(self.overlay, Overlay::None)
@@ -306,7 +374,189 @@ pub fn update<L: CoreLink>(state: &mut State<L>, message: Message) -> Task<Messa
         Message::Meet(meet) => on_meet(state, meet),
         Message::Settings(settings) => on_settings(state, settings),
         Message::Window(window) => on_window(state, window),
+        Message::Call(call) => on_call(state, call),
     }
+}
+
+/// Звонки (S7): кнопки оверлея/шапки, mute, тик таймера, готовность
+/// аудио-моста. Ядро держит одну линию на демон — состояние звонка у
+/// нас одно (Overlay::Call).
+fn on_call<L: CoreLink>(state: &mut State<L>, call: CallIn) -> Task<Message> {
+    match call {
+        CallIn::Start(cid) => {
+            // Линия одна: в звонке кнопка недоступна, прямой вызов гасим.
+            if state.call_view().is_some() {
+                return Task::none();
+            }
+            request_task(state, Request::StartCall { cid })
+        }
+        CallIn::Answer => {
+            if !matches!(
+                state.call_view().map(|v| v.phase),
+                Some(CallPhase::Incoming)
+            ) {
+                return Task::none();
+            }
+            request_task(state, Request::AnswerCall)
+        }
+        // Отклонить/отменить: звонок ещё не начался, аудио не поднимали.
+        // End-событие ядра придёт уже к закрытому оверлею и будет
+        // проигнорировано — это нормально.
+        CallIn::Decline => {
+            if state.call_view().is_none() {
+                return Task::none();
+            }
+            state.overlay = Overlay::None;
+            request_task(state, Request::EndCall)
+        }
+        CallIn::Hangup => {
+            if state.call_view().is_none() {
+                return Task::none();
+            }
+            state.overlay = Overlay::None;
+            state.call_audio = None; // Drop останавливает потоки
+            request_task(state, Request::EndCall)
+        }
+        CallIn::ToggleMute => {
+            let Some(muted) = state.call_view().map(|v| !v.muted) else {
+                return Task::none();
+            };
+            if let Overlay::Call(view) = &mut state.overlay {
+                view.muted = muted;
+            }
+            if let Some(audio) = &state.call_audio {
+                audio.set_muted(muted);
+            }
+            Task::none()
+        }
+        // Перерисовка таймера; время считает view от started_ms.
+        CallIn::Tick => Task::none(),
+        CallIn::AudioReady(slot, gaps) => {
+            let audio = slot.lock().expect("слот не отравлен").take();
+            state.call_audio = audio;
+            // Честно про неполный звук (микрофон/динамик не нашлись).
+            let Some(view) = state.call_view() else {
+                return Task::none();
+            };
+            let cid = view.cid;
+            for gap in gaps {
+                state
+                    .store
+                    .push_sys(cid, now_ms(), format!("звонок: {}", gap.user_text()));
+            }
+            Task::none()
+        }
+    }
+}
+
+/// Событие CALL_STATE (S7): offer без живого звонка — входящий, с ним —
+/// эхо нашего START_CALL (уже Outgoing, пропуск). Accept переводит в
+/// разговор и поднимает звук; reject/end — sys-строки и закрытие.
+fn on_call_state<L: CoreLink>(
+    state: &mut State<L>,
+    cid: Cid,
+    call_id: [u8; 16],
+    signal: crate::core_link::CallSignal,
+) -> Task<Message> {
+    use crate::core_link::CallSignal;
+    match signal {
+        CallSignal::Offer => {
+            if state.call_view().is_some() {
+                return Task::none(); // эхо нашего START_CALL
+            }
+            state.overlay = Overlay::Call(CallView {
+                cid,
+                call_id,
+                phase: CallPhase::Incoming,
+                started_ms: 0,
+                muted: false,
+            });
+            // Входящий — как входящее сообщение: уведомление по правилам.
+            if notify::should_notify(state.store.selected(), state.window_focused, cid) {
+                let title = state
+                    .store
+                    .contact(cid)
+                    .map(|c| c.name.clone())
+                    .unwrap_or_else(|| cid.to_string());
+                return notify::os_notify(title, "входящий звонок".to_owned());
+            }
+            Task::none()
+        }
+        CallSignal::Accept => {
+            let Some(view) = state.call_view() else {
+                return Task::none(); // чужой/протухший accept
+            };
+            if view.call_id != call_id || view.phase == CallPhase::Active {
+                return Task::none();
+            }
+            if let Overlay::Call(view) = &mut state.overlay {
+                view.phase = CallPhase::Active;
+                view.started_ms = now_ms();
+            }
+            start_call_audio(state)
+        }
+        CallSignal::Reject => {
+            let Some(view) = state.call_view() else {
+                return Task::none();
+            };
+            if view.call_id != call_id {
+                return Task::none();
+            }
+            // Ядро вслед за reject шлёт end — закрываем здесь, чтобы не
+            // было двух sys-строк («отклонён» + «без ответа»).
+            state.overlay = Overlay::None;
+            state.call_audio = None;
+            state
+                .store
+                .push_sys(cid, now_ms(), "звонок отклонён".into());
+            Task::none()
+        }
+        CallSignal::End => {
+            let Some(view) = state.call_view().cloned() else {
+                return Task::none(); // уже закрыли своей кнопкой
+            };
+            if view.call_id != call_id {
+                return Task::none();
+            }
+            state.overlay = Overlay::None;
+            state.call_audio = None; // Drop останавливает потоки и потоки cpal
+            let line = match view.phase {
+                CallPhase::Active => {
+                    let secs = ((now_ms() - view.started_ms) / 1000).max(0);
+                    format!("звонок завершён — {}:{:02}", secs / 60, secs % 60)
+                }
+                CallPhase::Outgoing => "без ответа".to_owned(),
+                CallPhase::Incoming => "входящий звонок отменён".to_owned(),
+            };
+            state.store.push_sys(cid, now_ms(), line);
+            Task::none()
+        }
+    }
+}
+
+/// Поднять аудио-мост в фоне (открытие fifo и устройств блокирует —
+/// в update нельзя, GUI_DEV §3). На заглушке звука нет вовсе.
+fn start_call_audio<L: CoreLink>(state: &State<L>) -> Task<Message> {
+    if state.link.is_stub() {
+        return Task::none();
+    }
+    let home = std::env::var("HOME").unwrap_or_default();
+    let dir = crate::audio::pcm_dir(std::path::Path::new(&home));
+    Task::perform(
+        async move {
+            tokio::task::spawn_blocking(move || {
+                let audio = crate::audio::CallAudio::start(&dir);
+                let gaps = audio.gaps().to_vec();
+                (
+                    std::sync::Arc::new(std::sync::Mutex::new(Some(audio))),
+                    gaps,
+                )
+            })
+            .await
+            .expect("аудио-поток не паникует")
+        },
+        |(slot, gaps)| Message::Call(CallIn::AudioReady(slot, gaps)),
+    )
 }
 
 /// События окна: фокус — данные для правила уведомлений, выход —
@@ -452,9 +702,14 @@ fn on_link<L: CoreLink>(state: &mut State<L>, link: LinkIn) -> Task<Message> {
                 }
                 task
             }
-            // Обработчик появится в ui-коммите S7; без руки событие
-            // просто игнорируется, как незнакомые события кодека.
-            LinkEvent::CallState { .. } => Task::none(),
+            // Звонок (S7, §4.6): стадии по call_id — события прошлых
+            // звонков игнорируются. Reject всегда следом несёт end —
+            // он и закрывает.
+            LinkEvent::CallState {
+                cid,
+                call_id,
+                state: signal,
+            } => on_call_state(state, cid, call_id, signal),
             LinkEvent::Down => {
                 state.link_up = false;
                 Task::none()
@@ -677,6 +932,31 @@ fn on_link<L: CoreLink>(state: &mut State<L>, link: LinkIn) -> Task<Message> {
                 }
                 Task::none()
             }
+            // Звонки (S7): ответ START_CALL открывает исходящий оверлей
+            // (offer-эхо ядра придёт следом и будет пропущено); ошибка —
+            // честная sys-строка в чате.
+            (Request::StartCall { cid }, Ok(OkReply::CallStarted { call_id })) => {
+                state.overlay = Overlay::Call(CallView {
+                    cid,
+                    call_id,
+                    phase: CallPhase::Outgoing,
+                    started_ms: 0,
+                    muted: false,
+                });
+                Task::none()
+            }
+            (Request::StartCall { .. }, Ok(_)) => Task::none(),
+            (Request::StartCall { cid }, Err(err)) => {
+                state.store.push_sys(
+                    cid,
+                    now_ms(),
+                    format!("звонок не начался: {}", err.user_text()),
+                );
+                Task::none()
+            }
+            // ANSWER/END: состояние двигают события CALL_STATE; ошибка
+            // «уже завершён» не страшна — оверлей и так закроется end'ом.
+            (Request::AnswerCall, _) | (Request::EndCall, _) => Task::none(),
             (
                 Request::Search {
                     cid, query, offset, ..
@@ -1081,6 +1361,17 @@ fn on_meet<L: CoreLink>(state: &mut State<L>, meet: MeetIn) -> Task<Message> {
             Task::none()
         }
         MeetIn::CloseOverlay => {
+            // Оверлей звонка (GUI_UI.md §3): активный не закрывается
+            // ни Esc, ни кликом мимо — только «Завершить»; входящий и
+            // исходящий закрытие = отклонить/отменить (END_CALL).
+            match state.call_view().map(|v| v.phase) {
+                Some(CallPhase::Active) => return Task::none(),
+                Some(_) => {
+                    state.overlay = Overlay::None;
+                    return request_task(state, Request::EndCall);
+                }
+                None => {}
+            }
             state.overlay = Overlay::None;
             Task::none()
         }
@@ -1344,6 +1635,25 @@ fn overlay_layer<'a, L: CoreLink>(
                 centered(widgets::confirm_delete_panel(
                     *cid,
                     &name,
+                    state.store.settings.font_scale
+                ))
+            ]
+            .into()
+        }
+        // Звонок (S7): клик мимо не закрывает (GUI_UI.md §3), поэтому
+        // подложка глухая — dim без on_press.
+        Overlay::Call(view) => {
+            let name = state
+                .store
+                .contact(view.cid)
+                .map(|c| c.name.clone())
+                .unwrap_or_else(|| view.cid.to_string());
+            stack![
+                widgets::backdrop_dim(),
+                centered(widgets::call_panel(
+                    view,
+                    &name,
+                    now_ms(),
                     state.store.settings.font_scale
                 ))
             ]
@@ -1623,6 +1933,20 @@ fn main_pane<L: CoreLink>(state: &State<L>) -> Element<'_, Message> {
             .style(palette::button_plain)
             .on_press(Message::Meet(MeetIn::OpenCard(cid))),
             space::Space::new().width(Length::Fill),
+            // Звонок (S7): ядру нужно живое соединение — офлайн-кнопка
+            // выключена, а не ругается. В звонке линия занята — выключена.
+            button(text("Позвонить").size(12.0 * scale).color(palette::TEXT))
+                .padding(Padding {
+                    top: 6.0,
+                    right: 12.0,
+                    bottom: 6.0,
+                    left: 12.0,
+                })
+                .style(palette::button_dim)
+                .on_press_maybe(
+                    (online && state.call_view().is_none())
+                        .then_some(Message::Call(CallIn::Start(cid))),
+                ),
         ]
         .spacing(8)
         .align_y(Vertical::Center),
@@ -2921,5 +3245,150 @@ mod tests {
                 .is_ok(),
             "причина в панели"
         );
+    }
+
+    // ---------- S7: звонки ----------
+
+    fn call_event(
+        state: &mut State<MockLink>,
+        cid: i64,
+        call_id: [u8; 16],
+        signal: crate::core_link::CallSignal,
+    ) {
+        let _ = update(
+            state,
+            Message::Link(LinkIn::Event(LinkEvent::CallState {
+                cid: Cid(cid),
+                call_id,
+                state: signal,
+            })),
+        );
+    }
+
+    /// Исходящий: «Позвонить» → START_CALL → «звоним…»; accept → разговор
+    /// с таймером и mute; Esc активный звонок не закрывает; end от пира —
+    /// sys-строка с длительностью.
+    #[test]
+    fn outgoing_call_flow() {
+        use crate::core_link::CallSignal;
+        let mut state = state();
+        state.store.replace_contacts(vec![contact(1, "Аня")]);
+        let _ = update(&mut state, Message::Chat(ChatIn::Select(Cid(1))));
+
+        let _ = update(&mut state, Message::Call(CallIn::Start(Cid(1))));
+        let call_id = [0x42; 16];
+        replied(
+            &mut state,
+            Request::StartCall { cid: Cid(1) },
+            OkReply::CallStarted { call_id },
+        );
+        assert!(
+            matches!(
+                state.call_view().map(|v| v.phase),
+                Some(CallPhase::Outgoing)
+            ),
+            "исходящий оверлей"
+        );
+        {
+            let mut ui = render(&state);
+            assert!(ui.find("звоним…").is_ok());
+            assert!(ui.find("Отменить").is_ok());
+        }
+
+        // Offer-эхо ядра по нашему call_id — пропуск, фаза не меняется.
+        call_event(&mut state, 1, call_id, CallSignal::Offer);
+        assert!(matches!(
+            state.call_view().map(|v| v.phase),
+            Some(CallPhase::Outgoing)
+        ));
+
+        // Accept → разговор: таймер, mute, «Завершить».
+        call_event(&mut state, 1, call_id, CallSignal::Accept);
+        assert!(state.call_active());
+        {
+            let mut ui = render(&state);
+            assert!(ui.find("0:00").is_ok(), "таймер");
+            assert!(ui.find("Выключить микрофон").is_ok());
+            assert!(ui.find("Завершить").is_ok());
+        }
+
+        // Esc активный звонок не закрывает (GUI_UI.md §3).
+        let _ = update(&mut state, Message::Meet(MeetIn::CloseOverlay));
+        assert!(state.call_active(), "Esc не рвёт разговор");
+
+        // Mute-тумблер.
+        let _ = update(&mut state, Message::Call(CallIn::ToggleMute));
+        {
+            let mut ui = render(&state);
+            assert!(ui.find("Включить микрофон").is_ok(), "подпись mute");
+        }
+
+        // Пир завершил: оверлей закрыт, в чате — длительность.
+        call_event(&mut state, 1, call_id, CallSignal::End);
+        assert!(state.call_view().is_none());
+        let mut ui = render(&state);
+        assert!(ui.find("звонок завершён — 0:00").is_ok(), "sys-строка");
+    }
+
+    /// Входящий: offer → «входящий звонок» с «Принять»/«Отклонить»;
+    /// отклонение — END_CALL и закрытие. Ошибка START_CALL — sys-строка.
+    #[test]
+    fn incoming_call_answer_and_decline() {
+        use crate::core_link::CallSignal;
+        let mut state = state();
+        state.store.replace_contacts(vec![contact(1, "Аня")]);
+
+        // Входящий offer: оверлей с кнопками.
+        call_event(&mut state, 1, [0x11; 16], CallSignal::Offer);
+        assert!(matches!(
+            state.call_view().map(|v| v.phase),
+            Some(CallPhase::Incoming)
+        ));
+        {
+            let mut ui = render(&state);
+            assert!(ui.find("входящий звонок").is_ok());
+            assert!(ui.find("Принять").is_ok());
+            assert!(ui.find("Отклонить").is_ok());
+        }
+
+        // Приняли: ответ ядра пуст, accept-событие переводит в разговор.
+        let _ = update(&mut state, Message::Call(CallIn::Answer));
+        replied(&mut state, Request::AnswerCall, OkReply::Done);
+        call_event(&mut state, 1, [0x11; 16], CallSignal::Accept);
+        assert!(state.call_active());
+
+        // Второй звонок на занятой линии не открывается.
+        let _ = update(&mut state, Message::Call(CallIn::Start(Cid(2))));
+        assert_eq!(state.call_view().map(|v| v.cid), Some(Cid(1)), "линия одна");
+    }
+
+    /// Отклонение входящего: END_CALL + закрытие оверлея. Ошибка
+    /// START_CALL (контакт офлайн) — честная sys-строка.
+    #[test]
+    fn decline_and_failed_start_are_honest() {
+        use crate::core_link::CallSignal;
+        let mut state = state();
+        state.store.replace_contacts(vec![contact(1, "Аня")]);
+        call_event(&mut state, 1, [0x22; 16], CallSignal::Offer);
+        let _ = update(&mut state, Message::Call(CallIn::Decline));
+        assert!(state.call_view().is_none(), "отклонён — оверлей закрыт");
+
+        // sys-строка видна в открытом чате.
+        let _ = update(&mut state, Message::Chat(ChatIn::Select(Cid(1))));
+        let _ = update(&mut state, Message::Call(CallIn::Start(Cid(1))));
+        let _ = update(
+            &mut state,
+            Message::Link(LinkIn::Replied {
+                request: Request::StartCall { cid: Cid(1) },
+                reply: Err(crate::core_link::LinkError::Kernel(
+                    crate::core_link::api::Status::NoSession,
+                )),
+                tag: None,
+            }),
+        );
+        let mut ui = render(&state);
+        assert!(ui
+            .find("звонок не начался: Контакт не в сети. Напишите, когда он появится.")
+            .is_ok());
     }
 }

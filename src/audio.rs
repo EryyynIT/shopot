@@ -287,6 +287,16 @@ impl CallAudio {
     }
 }
 
+impl std::fmt::Debug for CallAudio {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Потоки и cpal-стримы в Debug не выводим — нечего там смотреть.
+        f.debug_struct("CallAudio")
+            .field("muted", &self.is_muted())
+            .field("gaps", &self.gaps)
+            .finish()
+    }
+}
+
 impl Drop for CallAudio {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);

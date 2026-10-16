@@ -15,7 +15,8 @@ use crate::model::settings::Settings;
 use crate::model::store::PinEntry;
 use crate::ui::palette;
 use crate::ui::{
-    time_hm, ChatIn, InviteView, MeetIn, MenuView, Message, SearchView, SettingsIn, SettingsView,
+    time_hm, CallIn, CallPhase, CallView, ChatIn, InviteView, MeetIn, MenuView, Message,
+    SearchView, SettingsIn, SettingsView,
 };
 
 /// Строка сайдбара: точка presence, имя, бейдж непрочитанных. Выбор —
@@ -328,6 +329,20 @@ fn group_with_footer(
 }
 
 // ---------- оверлеи (GUI_UI.md §1, спринт S2) ----------
+
+/// Глухая подложка без on_press (оверлей звонка, S7): клик мимо не
+/// закрывает — Esc и крест во время активного звонка запрещены.
+pub fn backdrop_dim() -> Element<'static, Message> {
+    container(
+        iced::widget::space::Space::new()
+            .width(Length::Fill)
+            .height(Length::Fill),
+    )
+    .width(Length::Fill)
+    .height(Length::Fill)
+    .style(palette::backdrop)
+    .into()
+}
 
 /// Подложка оверлея: клик мимо панели закрывает её.
 pub fn backdrop(on_close: Message) -> Element<'static, Message> {
@@ -756,6 +771,90 @@ pub fn confirm_delete_panel(cid: Cid, name: &str, scale: f32) -> Element<'static
     .padding(16)
     .style(palette::dialog)
     .into()
+}
+
+/// Панель звонка (S7, GUI_UI.md §1, 420×260): входящий — принять/
+/// отклонить; исходящий — отменить; активный — таймер, mute, завершить.
+/// Кнопки — глаголы (TEXT_STYLE §3).
+pub fn call_panel(
+    view: &CallView,
+    name: &str,
+    now_ms: i64,
+    scale: f32,
+) -> Element<'static, Message> {
+    let action = |label: &'static str, msg: Message, accent: bool| {
+        let label = text(label).size(13.0 * scale);
+        // У акцентной кнопки свой контрастный текст из стиля палитры.
+        let label = if accent {
+            label
+        } else {
+            label.color(palette::TEXT)
+        };
+        button(label)
+            .padding(Padding {
+                top: 8.0,
+                right: 16.0,
+                bottom: 8.0,
+                left: 16.0,
+            })
+            .style(if accent {
+                palette::button_accent
+            } else {
+                palette::button_dim
+            })
+            .on_press(msg)
+    };
+
+    let title = text(name.to_owned())
+        .size(16.0 * scale)
+        .font(palette::bold())
+        .color(palette::TEXT);
+    let body: iced::widget::Column<'_, Message> = match view.phase {
+        CallPhase::Incoming => column![
+            title,
+            text("входящий звонок")
+                .size(12.0 * scale)
+                .color(palette::DIM),
+            row![
+                action("Принять", Message::Call(CallIn::Answer), true),
+                action("Отклонить", Message::Call(CallIn::Decline), false),
+            ]
+            .spacing(8),
+        ]
+        .spacing(12),
+        CallPhase::Outgoing => column![
+            title,
+            text("звоним…").size(12.0 * scale).color(palette::DIM),
+            action("Отменить", Message::Call(CallIn::Decline), false),
+        ]
+        .spacing(12),
+        CallPhase::Active => {
+            let secs = ((now_ms - view.started_ms) / 1000).max(0);
+            let timer = format!("{}:{:02}", secs / 60, secs % 60);
+            let mute = if view.muted {
+                "Включить микрофон"
+            } else {
+                "Выключить микрофон"
+            };
+            column![
+                title,
+                text(timer).size(20.0 * scale).color(palette::TEXT),
+                row![
+                    action(mute, Message::Call(CallIn::ToggleMute), false),
+                    action("Завершить", Message::Call(CallIn::Hangup), false),
+                ]
+                .spacing(8),
+            ]
+            .spacing(12)
+        }
+    };
+
+    container(body)
+        .width(Length::Fixed(420.0))
+        .height(Length::Fixed(260.0))
+        .padding(20)
+        .style(palette::dialog)
+        .into()
 }
 
 /// Плашка закрепов под шапкой чата (S12): число и последнее тело;
